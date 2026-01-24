@@ -14,6 +14,9 @@ import (
 	"time"
 
 	"github.com/chhoumann/uca/internal/agents"
+	"github.com/mattn/go-runewidth"
+	"golang.org/x/term"
+	"strconv"
 )
 
 type options struct {
@@ -338,6 +341,7 @@ type uiRenderer struct {
 	lastLines  int
 	useColor   bool
 	useUnicode bool
+	width      int
 }
 
 func newRenderer(out *os.File) *uiRenderer {
@@ -345,6 +349,7 @@ func newRenderer(out *os.File) *uiRenderer {
 		out:        out,
 		useColor:   shouldUseColor(),
 		useUnicode: shouldUseUnicode(),
+		width:      termWidth(out),
 	}
 }
 
@@ -352,7 +357,7 @@ func (r *uiRenderer) Draw(content string) {
 	if r.lastLines > 0 {
 		fmt.Fprintf(r.out, "\x1b[%dA", r.lastLines)
 	}
-	fmt.Fprint(r.out, "\x1b[0J")
+	fmt.Fprint(r.out, "\x1b[0G\x1b[0J")
 	fmt.Fprint(r.out, content)
 	r.lastLines = countLines(content)
 }
@@ -366,6 +371,18 @@ func countLines(s string) int {
 		lines++
 	}
 	return lines
+}
+
+func hideCursor(out *os.File) {
+	if out != nil {
+		fmt.Fprint(out, "\x1b[?25l")
+	}
+}
+
+func showCursor(out *os.File) {
+	if out != nil {
+		fmt.Fprint(out, "\x1b[?25h")
+	}
 }
 
 func shouldUseColor() bool {
@@ -384,6 +401,22 @@ func shouldUseUnicode() bool {
 	return strings.Contains(locale, "UTF-8")
 }
 
+func termWidth(out *os.File) int {
+	if out == nil {
+		return 80
+	}
+	width, _, err := term.GetSize(int(out.Fd()))
+	if err == nil && width > 0 {
+		return width
+	}
+	if cols := strings.TrimSpace(os.Getenv("COLUMNS")); cols != "" {
+		if val, err := strconv.Atoi(cols); err == nil && val > 0 {
+			return val
+		}
+	}
+	return 80
+}
+
 func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result {
 	results := make([]result, len(selected))
 	events := make(chan updateEvent, len(selected))
@@ -400,9 +433,10 @@ func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result
 
 	renderer := newRenderer(os.Stdout)
 	start := time.Now()
+	hideCursor(renderer.out)
 	renderer.Draw(renderDashboard(rows, nameWidth, start, opts, renderer))
 
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	go func() {
 		defer close(done)
 		for {
@@ -433,6 +467,7 @@ func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result
 	wg.Wait()
 	close(events)
 	<-done
+	showCursor(renderer.out)
 	return results
 }
 
@@ -462,36 +497,22 @@ func renderDashboard(rows []uiRow, nameWidth int, start time.Time, opts options,
 			completed++
 		}
 	}
-	header := fmt.Sprintf("uca  • %s %d/%d • elapsed %s", progressBar(completed, total, 18, r.useUnicode), completed, total, fmtDuration(time.Since(start)))
+	header := fmt.Sprintf("uca  %s %d/%d  elapsed %s", spinnerGlyph(time.Since(start), r.useUnicode), completed, total, fmtDuration(time.Since(start)))
 	lines := make([]string, 0, total+2)
-	lines = append(lines, header, "")
+	lines = append(lines, fitLine(header, r.width, r.useUnicode), "")
 	for _, row := range rows {
 		lines = append(lines, formatRow(row, nameWidth, opts, r))
 	}
 	return strings.Join(lines, "\n") + "\n"
 }
 
-func progressBar(completed, total, width int, unicode bool) string {
-	if total == 0 {
-		return ""
-	}
-	if width < 5 {
-		width = 5
-	}
-	filled := int(float64(completed) / float64(total) * float64(width))
-	if filled > width {
-		filled = width
-	}
-	empty := width - filled
-	var fillChar, emptyChar string
+func spinnerGlyph(elapsed time.Duration, unicode bool) string {
+	frames := []string{"-", "\\", "|", "/"}
 	if unicode {
-		fillChar = "█"
-		emptyChar = "░"
-	} else {
-		fillChar = "#"
-		emptyChar = "-"
+		frames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	}
-	return "[" + strings.Repeat(fillChar, filled) + strings.Repeat(emptyChar, empty) + "]"
+	index := int(elapsed/(200*time.Millisecond)) % len(frames)
+	return frames[index]
 }
 
 func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
@@ -500,8 +521,8 @@ func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
 		statusLabel = "dry-run"
 	}
 
-	icon := statusIcon(statusLabel, r.useUnicode)
-	icon = colorize(icon, statusLabel, r.useColor)
+	iconPlain := statusIcon(statusLabel, r.useUnicode)
+	iconColored := colorize(iconPlain, statusLabel, r.useColor)
 
 	version := "--"
 	elapsed := "--"
@@ -542,7 +563,48 @@ func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
 		info = " (" + info + ")"
 	}
 
-	return fmt.Sprintf("%-*s %s %-9s %s %6s%s", nameWidth, row.name, icon, statusLabel, version, elapsed, info)
+	line := fmt.Sprintf("%-*s %s %-9s %s %6s%s", nameWidth, row.name, iconPlain, statusLabel, version, elapsed, info)
+	line = fitLine(line, r.width, r.useUnicode)
+	if iconPlain != iconColored {
+		line = strings.Replace(line, iconPlain, iconColored, 1)
+	}
+	return line
+}
+
+func fitLine(line string, width int, unicode bool) string {
+	if width <= 0 {
+		return line
+	}
+	line = strings.TrimRight(line, "\n")
+	if runewidth.StringWidth(line) == width {
+		return line
+	}
+	if runewidth.StringWidth(line) > width {
+		ellipsis := "..."
+		if unicode {
+			ellipsis = "…"
+		}
+		target := width - runewidth.StringWidth(ellipsis)
+		if target < 0 {
+			target = 0
+		}
+		var b strings.Builder
+		current := 0
+		for _, r := range line {
+			rw := runewidth.RuneWidth(r)
+			if current+rw > target {
+				break
+			}
+			b.WriteRune(r)
+			current += rw
+		}
+		line = b.String() + ellipsis
+	}
+	pad := width - runewidth.StringWidth(line)
+	if pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
 }
 
 func statusIcon(status string, unicode bool) string {
