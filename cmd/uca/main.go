@@ -29,6 +29,7 @@ type options struct {
 	Only     string
 	Skip     string
 	Help     bool
+	Version  bool
 }
 
 type result struct {
@@ -51,6 +52,8 @@ const (
 	statusFailed    = "failed"
 )
 
+var version = "dev"
+
 const (
 	reasonMissing       = "missing"
 	reasonMissingBun    = "missing bun"
@@ -62,6 +65,10 @@ func main() {
 	opts := parseFlags()
 	if opts.Help {
 		usage()
+		return
+	}
+	if opts.Version {
+		fmt.Fprintln(os.Stdout, version)
 		return
 	}
 
@@ -104,6 +111,7 @@ func parseFlags() options {
 	flag.StringVar(&opts.Skip, "skip", "", "comma-separated agent list to exclude")
 	flag.BoolVar(&opts.Help, "h", false, "show help")
 	flag.BoolVar(&opts.Help, "help", false, "show help")
+	flag.BoolVar(&opts.Version, "version", false, "show version")
 	flag.Parse()
 	return opts
 }
@@ -123,6 +131,7 @@ Options:
       --explain     show detection details and chosen update method
       --only LIST   comma-separated agent list to include
       --skip LIST   comma-separated agent list to exclude
+      --version     show version
   -h, --help        show usage
 `)
 }

@@ -8,6 +8,8 @@ before:
 builds:
   - main: ./cmd/uca
     binary: uca
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
     env:
       - CGO_ENABLED=0
     goos:
