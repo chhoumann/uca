@@ -52,8 +52,24 @@ uca --only claude,codex --dry-run
 - claude (`claude update`)
 - codex (`bun update -g @openai/codex --latest`)
 - opencode (`bun update -g opencode-ai --latest`)
+- cursor (`cursor-agent update`)
+- copilot (Homebrew `copilot-cli` or npm `@github/copilot`)
+- cline (npm `cline` or VS Code extension `saoudrizwan.claude-dev`)
+- roocode (VS Code extension `RooVeterinaryInc.roo-cline`)
+- aider (uv tool `aider-chat` or pip `aider-chat`)
+- pi (npm `@mariozechner/pi-coding-agent`)
 
-Missing binaries are skipped and reported in the summary.
+## Detection strategy
+
+`uca` only updates agents it can confidently detect. It checks:
+- built-in update commands for native CLIs
+- Homebrew formulas
+- npm global packages
+- uv tool installs
+- pip packages
+- VS Code extensions (via `code`, `codium`, or `code-insiders`)
+
+If a tool is installed but managed by an unknown method, it is marked as a manual install and skipped.
 
 ## Output (default)
 ```

@@ -1,48 +1,112 @@
 package agents
 
+type UpdateStrategy struct {
+	Kind        string
+	Command     []string
+	Package     string
+	ExtensionID string
+}
+
 // Agent defines how to update and version a CLI tool.
 type Agent struct {
 	Name        string
-	UpdateCmd   []string
-	VersionCmd  []string
-	RequiresBun bool
 	Binary      string
+	VersionCmd  []string
+	ExtensionID string
+	Strategies  []UpdateStrategy
 }
+
+const (
+	KindNative = "native"
+	KindBun    = "bun"
+	KindBrew   = "brew"
+	KindNpm    = "npm"
+	KindPip    = "pip"
+	KindUv     = "uv"
+	KindVSCode = "vscode"
+)
 
 // Default returns the built-in supported agents.
 func Default() []Agent {
 	return []Agent{
 		{
 			Name:       "amp",
-			UpdateCmd:  []string{"amp", "update"},
-			VersionCmd: []string{"amp", "--version"},
 			Binary:     "amp",
+			VersionCmd: []string{"amp", "--version"},
+			Strategies: []UpdateStrategy{{Kind: KindNative, Command: []string{"amp", "update"}}},
 		},
 		{
 			Name:       "gemini",
-			UpdateCmd:  []string{"gemini", "update"},
-			VersionCmd: []string{"gemini", "--version"},
 			Binary:     "gemini",
+			VersionCmd: []string{"gemini", "--version"},
+			Strategies: []UpdateStrategy{{Kind: KindNative, Command: []string{"gemini", "update"}}},
 		},
 		{
 			Name:       "claude",
-			UpdateCmd:  []string{"claude", "update"},
-			VersionCmd: []string{"claude", "--version"},
 			Binary:     "claude",
+			VersionCmd: []string{"claude", "--version"},
+			Strategies: []UpdateStrategy{{Kind: KindNative, Command: []string{"claude", "update"}}},
 		},
 		{
-			Name:        "codex",
-			UpdateCmd:   []string{"bun", "update", "-g", "@openai/codex", "--latest"},
-			VersionCmd:  []string{"codex", "--version"},
-			Binary:      "codex",
-			RequiresBun: true,
+			Name:       "codex",
+			Binary:     "codex",
+			VersionCmd: []string{"codex", "--version"},
+			Strategies: []UpdateStrategy{{Kind: KindBun, Command: []string{"bun", "update", "-g", "@openai/codex", "--latest"}}},
 		},
 		{
-			Name:        "opencode",
-			UpdateCmd:   []string{"bun", "update", "-g", "opencode-ai", "--latest"},
-			VersionCmd:  []string{"opencode", "--version"},
-			Binary:      "opencode",
-			RequiresBun: true,
+			Name:       "opencode",
+			Binary:     "opencode",
+			VersionCmd: []string{"opencode", "--version"},
+			Strategies: []UpdateStrategy{{Kind: KindBun, Command: []string{"bun", "update", "-g", "opencode-ai", "--latest"}}},
+		},
+		{
+			Name:       "cursor",
+			Binary:     "cursor-agent",
+			VersionCmd: []string{"cursor-agent", "--version"},
+			Strategies: []UpdateStrategy{{Kind: KindNative, Command: []string{"cursor-agent", "update"}}},
+		},
+		{
+			Name:       "copilot",
+			Binary:     "copilot",
+			VersionCmd: []string{"copilot", "--version"},
+			Strategies: []UpdateStrategy{
+				{Kind: KindBrew, Package: "copilot-cli"},
+				{Kind: KindNpm, Package: "@github/copilot"},
+			},
+		},
+		{
+			Name:        "cline",
+			Binary:      "cline",
+			VersionCmd:  []string{"cline", "--version"},
+			ExtensionID: "saoudrizwan.claude-dev",
+			Strategies: []UpdateStrategy{
+				{Kind: KindNpm, Package: "cline"},
+				{Kind: KindVSCode, ExtensionID: "saoudrizwan.claude-dev"},
+			},
+		},
+		{
+			Name:        "roocode",
+			ExtensionID: "RooVeterinaryInc.roo-cline",
+			Strategies: []UpdateStrategy{
+				{Kind: KindVSCode, ExtensionID: "RooVeterinaryInc.roo-cline"},
+			},
+		},
+		{
+			Name:       "aider",
+			Binary:     "aider",
+			VersionCmd: []string{"aider", "--version"},
+			Strategies: []UpdateStrategy{
+				{Kind: KindUv, Package: "aider-chat"},
+				{Kind: KindPip, Package: "aider-chat"},
+			},
+		},
+		{
+			Name:       "pi",
+			Binary:     "pi",
+			VersionCmd: []string{"pi", "--version"},
+			Strategies: []UpdateStrategy{
+				{Kind: KindNpm, Package: "@mariozechner/pi-coding-agent"},
+			},
 		},
 	}
 }

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -41,6 +43,13 @@ const (
 	statusFailed  = "failed"
 )
 
+const (
+	reasonMissing       = "missing"
+	reasonMissingBun    = "missing bun"
+	reasonMissingCode   = "missing vscode"
+	reasonManualInstall = "manual install"
+)
+
 func main() {
 	opts := parseFlags()
 	if opts.Help {
@@ -51,8 +60,8 @@ func main() {
 	all := agents.Default()
 	selected, unknown := filterAgents(all, opts.Only, opts.Skip)
 
-	bunAvailable := hasBinary("bun")
-	results := runAll(selected, bunAvailable, opts)
+	env := newEnv()
+	results := runAll(selected, env, opts)
 
 	printResults(results, opts)
 	printLogs(results, opts)
@@ -155,7 +164,7 @@ func parseList(raw string) map[string]bool {
 	return items
 }
 
-func runAll(selected []agents.Agent, bunAvailable bool, opts options) []result {
+func runAll(selected []agents.Agent, env *envState, opts options) []result {
 	results := make([]result, len(selected))
 	if opts.Parallel {
 		var wg sync.WaitGroup
@@ -164,7 +173,7 @@ func runAll(selected []agents.Agent, bunAvailable bool, opts options) []result {
 			i := i
 			go func() {
 				defer wg.Done()
-				results[i] = runAgent(selected[i], bunAvailable, opts)
+				results[i] = runAgent(selected[i], env, opts)
 			}()
 		}
 		wg.Wait()
@@ -172,36 +181,37 @@ func runAll(selected []agents.Agent, bunAvailable bool, opts options) []result {
 	}
 
 	for i, agent := range selected {
-		results[i] = runAgent(agent, bunAvailable, opts)
+		results[i] = runAgent(agent, env, opts)
 	}
 	return results
 }
 
-func runAgent(agent agents.Agent, bunAvailable bool, opts options) result {
-	res := result{Agent: agent, UpdateCmd: cmdString(agent.UpdateCmd)}
+func runAgent(agent agents.Agent, env *envState, opts options) result {
+	res := result{Agent: agent}
 
-	if !hasBinary(agent.Binary) {
+	updateCmd, reason := resolveUpdate(agent, env)
+	if updateCmd == nil {
 		res.Status = statusSkipped
-		res.Reason = "missing"
+		if reason == "" {
+			res.Reason = reasonMissing
+		} else {
+			res.Reason = reason
+		}
 		return res
 	}
-	if agent.RequiresBun && !bunAvailable {
-		res.Status = statusSkipped
-		res.Reason = "missing bun"
-		return res
-	}
 
+	res.UpdateCmd = cmdString(updateCmd)
 	if opts.DryRun {
 		res.Status = statusUpdated
 		res.Reason = "dry-run"
 		return res
 	}
 
-	res.Before = getVersion(agent.VersionCmd)
-	out, exitCode, duration, _ := runCmd(agent.UpdateCmd)
+	res.Before = getVersion(agent, env)
+	out, exitCode, duration, _ := runCmd(updateCmd)
 	res.Duration = duration
 	res.Log = out
-	res.After = getVersion(agent.VersionCmd)
+	res.After = getVersion(agent, env)
 
 	if exitCode != 0 {
 		res.Status = statusFailed
@@ -211,9 +221,103 @@ func runAgent(agent agents.Agent, bunAvailable bool, opts options) result {
 	return res
 }
 
-func hasBinary(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
+func resolveUpdate(agent agents.Agent, env *envState) ([]string, string) {
+	bunMissing := false
+	codeMissing := false
+
+	for _, strat := range agent.Strategies {
+		switch strat.Kind {
+		case agents.KindNative:
+			if agent.Binary != "" && !env.hasBinary(agent.Binary) {
+				continue
+			}
+			return strat.Command, ""
+		case agents.KindBun:
+			if !env.hasBun {
+				bunMissing = true
+				continue
+			}
+			if agent.Binary != "" && !env.hasBinary(agent.Binary) {
+				continue
+			}
+			return strat.Command, ""
+		case agents.KindBrew:
+			if !env.hasBrew {
+				continue
+			}
+			if env.brewHas(strat.Package) {
+				return []string{"brew", "upgrade", strat.Package}, ""
+			}
+		case agents.KindNpm:
+			if !env.hasNpm {
+				continue
+			}
+			if env.npmHas(strat.Package) {
+				return []string{"npm", "install", "-g", strat.Package}, ""
+			}
+		case agents.KindPip:
+			if !env.hasPython {
+				continue
+			}
+			if env.pipHas(strat.Package) {
+				return []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", strat.Package}, ""
+			}
+		case agents.KindUv:
+			if !env.hasUv {
+				continue
+			}
+			if env.uvHas(strat.Package) {
+				return []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@latest"}, ""
+			}
+		case agents.KindVSCode:
+			if env.codeCmd == "" {
+				codeMissing = true
+				continue
+			}
+			if env.vscodeHas(strat.ExtensionID) {
+				return []string{env.codeCmd, "--install-extension", strat.ExtensionID, "--force"}, ""
+			}
+		}
+	}
+
+	if bunMissing {
+		return nil, reasonMissingBun
+	}
+	if codeMissing {
+		return nil, reasonMissingCode
+	}
+	if agent.Binary != "" && env.hasBinary(agent.Binary) {
+		return nil, reasonManualInstall
+	}
+	return nil, reasonMissing
+}
+
+func getVersion(agent agents.Agent, env *envState) string {
+	if len(agent.VersionCmd) > 0 {
+		if agent.Binary == "" || env.hasBinary(agent.Binary) {
+			return runVersionCmd(agent.VersionCmd)
+		}
+	}
+	if agent.ExtensionID != "" {
+		if version := env.vscodeVersion(agent.ExtensionID); version != "" {
+			return version
+		}
+	}
+	return "unknown"
+}
+
+func runVersionCmd(args []string) string {
+	cmd := exec.Command(args[0], args[1:]...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "unknown"
+	}
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		return "unknown"
+	}
+	lines := strings.Split(trimmed, "\n")
+	return strings.TrimSpace(lines[0])
 }
 
 func runCmd(args []string) (string, int, time.Duration, error) {
@@ -234,18 +338,20 @@ func runCmd(args []string) (string, int, time.Duration, error) {
 	return buf.String(), 1, duration, err
 }
 
-func getVersion(args []string) string {
+func runCmdStdout(args []string) (string, int, time.Duration, error) {
+	start := time.Now()
 	cmd := exec.Command(args[0], args[1:]...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "unknown"
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	duration := time.Since(start)
+	if err == nil {
+		return string(out), 0, duration, nil
 	}
-	trimmed := strings.TrimSpace(string(out))
-	if trimmed == "" {
-		return "unknown"
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return string(out), exitErr.ExitCode(), duration, err
 	}
-	lines := strings.Split(trimmed, "\n")
-	return strings.TrimSpace(lines[0])
+	return string(out), 1, duration, err
 }
 
 func cmdString(args []string) string {
@@ -276,9 +382,6 @@ func formatResult(res result, opts options) string {
 	name := res.Agent.Name
 	switch res.Status {
 	case statusSkipped:
-		if res.Reason == "" {
-			return fmt.Sprintf("%s: skipped", name)
-		}
 		return fmt.Sprintf("%s: skipped (%s)", name, res.Reason)
 	case statusFailed:
 		return fmt.Sprintf("%s: failed (%s -> %s (%s))", name, safeVersion(res.Before), safeVersion(res.After), fmtDuration(res.Duration))
@@ -333,6 +436,8 @@ func printSummary(results []result, unknown []string) {
 	updated := []string{}
 	skippedMissing := []string{}
 	skippedBun := []string{}
+	skippedCode := []string{}
+	skippedManual := []string{}
 	failed := []string{}
 
 	for _, res := range results {
@@ -341,8 +446,12 @@ func printSummary(results []result, unknown []string) {
 			updated = append(updated, res.Agent.Name)
 		case statusSkipped:
 			switch res.Reason {
-			case "missing bun":
+			case reasonMissingBun:
 				skippedBun = append(skippedBun, res.Agent.Name)
+			case reasonMissingCode:
+				skippedCode = append(skippedCode, res.Agent.Name)
+			case reasonManualInstall:
+				skippedManual = append(skippedManual, res.Agent.Name)
 			default:
 				skippedMissing = append(skippedMissing, res.Agent.Name)
 			}
@@ -354,6 +463,8 @@ func printSummary(results []result, unknown []string) {
 	printSummaryLine("updated", updated)
 	printSummaryLine("skipped (missing)", skippedMissing)
 	printSummaryLine("skipped (missing bun)", skippedBun)
+	printSummaryLine("skipped (missing vscode)", skippedCode)
+	printSummaryLine("skipped (manual install)", skippedManual)
 	if len(unknown) > 0 {
 		printSummaryLine("skipped (unknown)", unknown)
 	}
@@ -376,4 +487,157 @@ func hasFailures(results []result) bool {
 		}
 	}
 	return false
+}
+
+type envState struct {
+	hasBun    bool
+	hasBrew   bool
+	hasNpm    bool
+	hasUv     bool
+	hasPython bool
+	codeCmd   string
+
+	mu         sync.Mutex
+	binCache   map[string]bool
+	npmOnce    sync.Once
+	npmGlobals map[string]bool
+	uvOnce     sync.Once
+	uvTools    map[string]bool
+	codeOnce   sync.Once
+	codeExts   map[string]string
+}
+
+func newEnv() *envState {
+	return &envState{
+		hasBun:    hasBinary("bun"),
+		hasBrew:   hasBinary("brew"),
+		hasNpm:    hasBinary("npm"),
+		hasUv:     hasBinary("uv"),
+		hasPython: hasBinary("python3"),
+		codeCmd:   detectCodeCmd(),
+		binCache:  map[string]bool{},
+	}
+}
+
+func detectCodeCmd() string {
+	candidates := []string{"code", "codium", "code-insiders"}
+	for _, candidate := range candidates {
+		if hasBinary(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func (e *envState) hasBinary(name string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if val, ok := e.binCache[name]; ok {
+		return val
+	}
+	_, err := exec.LookPath(name)
+	ok := err == nil
+	e.binCache[name] = ok
+	return ok
+}
+
+func hasBinary(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
+}
+
+func (e *envState) npmHas(pkg string) bool {
+	e.npmOnce.Do(e.loadNpmGlobals)
+	return e.npmGlobals[pkg]
+}
+
+func (e *envState) loadNpmGlobals() {
+	e.npmGlobals = map[string]bool{}
+	if !e.hasNpm {
+		return
+	}
+	out, _, _, _ := runCmdStdout([]string{"npm", "list", "-g", "--depth=0", "--json"})
+	var payload struct {
+		Dependencies map[string]any `json:"dependencies"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		return
+	}
+	for name := range payload.Dependencies {
+		e.npmGlobals[name] = true
+	}
+}
+
+func (e *envState) uvHas(pkg string) bool {
+	e.uvOnce.Do(e.loadUvTools)
+	return e.uvTools[pkg]
+}
+
+func (e *envState) loadUvTools() {
+	e.uvTools = map[string]bool{}
+	if !e.hasUv {
+		return
+	}
+	out, _, _, _ := runCmdStdout([]string{"uv", "tool", "list"})
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		e.uvTools[fields[0]] = true
+	}
+}
+
+func (e *envState) brewHas(formula string) bool {
+	if !e.hasBrew {
+		return false
+	}
+	out, exitCode, _, _ := runCmdStdout([]string{"brew", "list", "--formula", "--versions", formula})
+	return exitCode == 0 && strings.TrimSpace(out) != ""
+}
+
+func (e *envState) pipHas(pkg string) bool {
+	if !e.hasPython {
+		return false
+	}
+	_, exitCode, _, _ := runCmdStdout([]string{"python3", "-m", "pip", "show", pkg})
+	return exitCode == 0
+}
+
+func (e *envState) vscodeHas(extID string) bool {
+	e.codeOnce.Do(e.loadCodeExtensions)
+	_, ok := e.codeExts[extID]
+	return ok
+}
+
+func (e *envState) vscodeVersion(extID string) string {
+	e.codeOnce.Do(e.loadCodeExtensions)
+	return e.codeExts[extID]
+}
+
+func (e *envState) loadCodeExtensions() {
+	e.codeExts = map[string]string{}
+	if e.codeCmd == "" {
+		return
+	}
+	out, _, _, _ := runCmdStdout([]string{e.codeCmd, "--list-extensions", "--show-versions"})
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		idx := strings.LastIndex(line, "@")
+		if idx <= 0 {
+			continue
+		}
+		id := line[:idx]
+		version := line[idx+1:]
+		e.codeExts[id] = version
+	}
 }
