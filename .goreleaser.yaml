@@ -1,0 +1,35 @@
+project_name: uca
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/uca
+    binary: uca
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+brews:
+  - name: uca
+    homepage: "https://github.com/chhoumann/uca"
+    description: "Update multiple coding-agent CLIs with one command"
+    license: "MIT"
+    tap:
+      owner: chhoumann
+      name: tap
+    install: |
+      bin.install "uca"

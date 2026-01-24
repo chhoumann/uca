@@ -1,0 +1,6 @@
+/dist/
+/uca
+*.exe
+*.out
+*.test
+.DS_Store
