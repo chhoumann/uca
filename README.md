@@ -73,7 +73,7 @@ uca --explain
 
 ## Live output
 
-When `uca` is run in a TTY, it shows a live status dashboard with progress, versions, and timings. When output is piped (or `--quiet`), it prints only completed lines and the summary.
+When `uca` is run in a TTY, it shows a live status dashboard with progress, versions, and timings for installed agents. When output is piped (or `--quiet`), it prints only completed lines and the summary.
 
 ## Detection strategy
 
@@ -85,14 +85,15 @@ When `uca` is run in a TTY, it shows a live status dashboard with progress, vers
 - pip packages
 - VS Code extensions (via `code`, `codium`, or `code-insiders`)
 
-If a tool is installed but managed by an unknown method, it is marked as a manual install and skipped.
+If a tool is installed but managed by an unknown method, it is marked as manual and skipped.
 
 ## Output (default)
 ```
 claude: 2.1.19 -> 2.1.19 (8s)
 ...
 updated: amp claude codex opencode
-skipped (missing): gemini
+unchanged: gemini
+skipped (missing): cursor
 ```
 
 ## Development

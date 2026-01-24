@@ -45,9 +45,10 @@ type result struct {
 }
 
 const (
-	statusUpdated = "updated"
-	statusSkipped = "skipped"
-	statusFailed  = "failed"
+	statusUpdated   = "updated"
+	statusUnchanged = "unchanged"
+	statusSkipped   = "skipped"
+	statusFailed    = "failed"
 )
 
 const (
@@ -280,7 +281,11 @@ func runAgent(agent agents.Agent, env *envState, opts options) result {
 		res.Reason = fmt.Sprintf("exit %d", exitCode)
 		return res
 	}
-	res.Status = statusUpdated
+	if res.Before != "" && res.After != "" && res.Before == res.After && res.Before != "unknown" {
+		res.Status = statusUnchanged
+	} else {
+		res.Status = statusUpdated
+	}
 	return res
 }
 
@@ -336,7 +341,11 @@ func runAgentWithEvents(agent agents.Agent, env *envState, opts options, index i
 		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now()}
 		return res
 	}
-	res.Status = statusUpdated
+	if res.Before != "" && res.After != "" && res.Before == res.After && res.Before != "unknown" {
+		res.Status = statusUnchanged
+	} else {
+		res.Status = statusUpdated
+	}
 	events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now()}
 	return res
 }
@@ -523,6 +532,7 @@ func renderDashboard(rows []uiRow, nameWidth int, start time.Time, opts options,
 	total := 0
 	completed := 0
 	updated := 0
+	unchanged := 0
 	failed := 0
 	visibleRows := make([]uiRow, 0, len(rows))
 	for _, row := range rows {
@@ -531,17 +541,19 @@ func renderDashboard(rows []uiRow, nameWidth int, start time.Time, opts options,
 		}
 		visibleRows = append(visibleRows, row)
 		total++
-		if row.status == statusUpdated || row.status == statusSkipped || row.status == statusFailed {
+		if row.status == statusUpdated || row.status == statusUnchanged || row.status == statusSkipped || row.status == statusFailed {
 			completed++
 		}
 		switch row.status {
 		case statusUpdated:
 			updated++
+		case statusUnchanged:
+			unchanged++
 		case statusFailed:
 			failed++
 		}
 	}
-	header := fmt.Sprintf("uca  %s  %d/%d  ok:%d fail:%d  %s", spinnerGlyph(time.Since(start), r.useUnicode), completed, total, updated, failed, fmtElapsed(time.Since(start)))
+	header := fmt.Sprintf("uca  %s  %d/%d  ok:%d same:%d fail:%d  %s", spinnerGlyph(time.Since(start), r.useUnicode), completed, total, updated, unchanged, failed, fmtElapsed(time.Since(start)))
 	lines := make([]string, 0, total+2)
 	lines = append(lines, fitLine(header, r.width, r.useUnicode), "")
 	for _, row := range visibleRows {
@@ -579,6 +591,9 @@ func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
 	case statusUpdated:
 		version = fmt.Sprintf("%s → %s", safeVersion(row.before), safeVersion(row.after))
 		elapsed = fmtElapsed(row.duration)
+	case statusUnchanged:
+		version = fmt.Sprintf("%s → %s", safeVersion(row.before), safeVersion(row.after))
+		elapsed = fmtElapsed(row.duration)
 	case statusFailed:
 		version = fmt.Sprintf("%s → %s", safeVersion(row.before), safeVersion(row.after))
 		elapsed = fmtElapsed(row.duration)
@@ -614,6 +629,9 @@ func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
 func statusLabelFor(row uiRow) string {
 	if row.status == statusUpdated && row.reason == "dry-run" {
 		return "dry-run"
+	}
+	if row.status == statusUnchanged {
+		return "same"
 	}
 	if row.status == statusSkipped && row.reason == reasonManualInstall {
 		return "manual"
@@ -699,6 +717,11 @@ func statusIcon(row uiRow, unicode bool) string {
 			return "✓"
 		}
 		return "ok"
+	case statusUnchanged:
+		if unicode {
+			return "≡"
+		}
+		return "="
 	case statusFailed:
 		if unicode {
 			return "✕"
@@ -752,6 +775,8 @@ func colorize(text, status string, enabled bool) string {
 		code = "36"
 	case statusUpdated:
 		code = "32"
+	case statusUnchanged:
+		code = "90"
 	case statusFailed:
 		code = "31"
 	case statusSkipped:
@@ -961,6 +986,8 @@ func formatResult(res result, opts options) string {
 			return fmt.Sprintf("%s: %s", name, res.UpdateCmd)
 		}
 		return fmt.Sprintf("%s: %s -> %s (%s)", name, safeVersion(res.Before), safeVersion(res.After), fmtDuration(res.Duration))
+	case statusUnchanged:
+		return fmt.Sprintf("%s: unchanged %s -> %s (%s)", name, safeVersion(res.Before), safeVersion(res.After), fmtDuration(res.Duration))
 	default:
 		return fmt.Sprintf("%s: unknown", name)
 	}
@@ -1012,6 +1039,7 @@ func printLog(agentName, log string) {
 
 func printSummary(results []result, unknown []string) {
 	updated := []string{}
+	unchanged := []string{}
 	skippedMissing := []string{}
 	skippedBun := []string{}
 	skippedCode := []string{}
@@ -1022,6 +1050,8 @@ func printSummary(results []result, unknown []string) {
 		switch res.Status {
 		case statusUpdated:
 			updated = append(updated, res.Agent.Name)
+		case statusUnchanged:
+			unchanged = append(unchanged, res.Agent.Name)
 		case statusSkipped:
 			switch res.Reason {
 			case reasonMissingBun:
@@ -1039,6 +1069,7 @@ func printSummary(results []result, unknown []string) {
 	}
 
 	printSummaryLine("updated", updated)
+	printSummaryLine("unchanged", unchanged)
 	printSummaryLine("skipped (missing)", skippedMissing)
 	printSummaryLine("skipped (missing bun)", skippedBun)
 	printSummaryLine("skipped (missing vscode)", skippedCode)
