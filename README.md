@@ -24,6 +24,7 @@ Options:
 - `-v, --verbose` show update command output for each agent
 - `-q, --quiet` suppress per-agent version lines (summary only)
 - `-n, --dry-run` print commands that would run, do not execute
+- `--explain` show detection details and chosen update method
 - `--only <list>` comma-separated agent list to include (e.g. `claude,codex`)
 - `--skip <list>` comma-separated agent list to exclude
 - `-h, --help` show usage
@@ -43,6 +44,11 @@ uca -p -v
 Dry run only for claude + codex:
 ```bash
 uca --only claude,codex --dry-run
+```
+
+Explain detection and method:
+```bash
+uca --explain
 ```
 
 ## Supported agents

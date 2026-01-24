@@ -21,6 +21,7 @@ type options struct {
 	Verbose  bool
 	Quiet    bool
 	DryRun   bool
+	Explain  bool
 	Only     string
 	Skip     string
 	Help     bool
@@ -36,6 +37,7 @@ type result struct {
 	Log       string
 	UpdateCmd string
 	Method    string
+	Explain   string
 }
 
 const (
@@ -83,6 +85,7 @@ func parseFlags() options {
 	flag.BoolVar(&opts.Quiet, "quiet", false, "summary only")
 	flag.BoolVar(&opts.DryRun, "n", false, "print commands without executing")
 	flag.BoolVar(&opts.DryRun, "dry-run", false, "print commands without executing")
+	flag.BoolVar(&opts.Explain, "explain", false, "explain detection and update method")
 	flag.StringVar(&opts.Only, "only", "", "comma-separated agent list")
 	flag.StringVar(&opts.Skip, "skip", "", "comma-separated agent list to exclude")
 	flag.BoolVar(&opts.Help, "h", false, "show help")
@@ -102,6 +105,7 @@ Options:
   -v, --verbose     show update command output for each agent
   -q, --quiet       suppress per-agent version lines (summary only)
   -n, --dry-run     print commands that would run, do not execute
+      --explain     show detection details and chosen update method
       --only LIST   comma-separated agent list to include
       --skip LIST   comma-separated agent list to exclude
   -h, --help        show usage
@@ -190,7 +194,7 @@ func runAll(selected []agents.Agent, env *envState, opts options) []result {
 func runAgent(agent agents.Agent, env *envState, opts options) result {
 	res := result{Agent: agent}
 
-	updateCmd, reason, method := resolveUpdate(agent, env)
+	updateCmd, reason, method, detail := resolveUpdate(agent, env)
 	if updateCmd == nil {
 		res.Status = statusSkipped
 		if reason == "" {
@@ -198,10 +202,12 @@ func runAgent(agent agents.Agent, env *envState, opts options) result {
 		} else {
 			res.Reason = reason
 		}
+		res.Explain = detail
 		return res
 	}
 
 	res.Method = method
+	res.Explain = detail
 	res.UpdateCmd = cmdString(updateCmd)
 	if opts.DryRun {
 		res.Status = statusUpdated
@@ -223,9 +229,10 @@ func runAgent(agent agents.Agent, env *envState, opts options) result {
 	return res
 }
 
-func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string) {
+func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string, string) {
 	bunMissing := false
 	codeMissing := false
+	detail := ""
 
 	for _, strat := range agent.Strategies {
 		switch strat.Kind {
@@ -233,7 +240,8 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string)
 			if agent.Binary != "" && !env.hasBinary(agent.Binary) {
 				continue
 			}
-			return strat.Command, "", strat.Kind
+			detail = fmt.Sprintf("binary %s found; using built-in update", agent.Binary)
+			return strat.Command, "", strat.Kind, detail
 		case agents.KindBun:
 			if !env.hasBun {
 				bunMissing = true
@@ -242,34 +250,39 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string)
 			if agent.Binary != "" && !env.hasBinary(agent.Binary) {
 				continue
 			}
-			return strat.Command, "", strat.Kind
+			detail = "bun found; updating via bun"
+			return strat.Command, "", strat.Kind, detail
 		case agents.KindBrew:
 			if !env.hasBrew {
 				continue
 			}
 			if env.brewHas(strat.Package) {
-				return []string{"brew", "upgrade", strat.Package}, "", strat.Kind
+				detail = fmt.Sprintf("brew formula %s installed", strat.Package)
+				return []string{"brew", "upgrade", strat.Package}, "", strat.Kind, detail
 			}
 		case agents.KindNpm:
 			if !env.hasNpm {
 				continue
 			}
 			if env.npmHas(strat.Package) {
-				return []string{"npm", "install", "-g", strat.Package}, "", strat.Kind
+				detail = fmt.Sprintf("npm global package %s installed", strat.Package)
+				return []string{"npm", "install", "-g", strat.Package}, "", strat.Kind, detail
 			}
 		case agents.KindPip:
 			if !env.hasPython {
 				continue
 			}
 			if env.pipHas(strat.Package) {
-				return []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", strat.Package}, "", strat.Kind
+				detail = fmt.Sprintf("pip package %s installed", strat.Package)
+				return []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", strat.Package}, "", strat.Kind, detail
 			}
 		case agents.KindUv:
 			if !env.hasUv {
 				continue
 			}
 			if env.uvHas(strat.Package) {
-				return []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@latest"}, "", strat.Kind
+				detail = fmt.Sprintf("uv tool %s installed", strat.Package)
+				return []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@latest"}, "", strat.Kind, detail
 			}
 		case agents.KindVSCode:
 			if env.codeCmd == "" {
@@ -277,21 +290,22 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string)
 				continue
 			}
 			if env.vscodeHas(strat.ExtensionID) {
-				return []string{env.codeCmd, "--install-extension", strat.ExtensionID, "--force"}, "", strat.Kind
+				detail = fmt.Sprintf("VS Code extension %s installed (via %s)", strat.ExtensionID, env.codeCmd)
+				return []string{env.codeCmd, "--install-extension", strat.ExtensionID, "--force"}, "", strat.Kind, detail
 			}
 		}
 	}
 
 	if bunMissing {
-		return nil, reasonMissingBun, ""
+		return nil, reasonMissingBun, "", "bun not found; required for update"
 	}
 	if codeMissing {
-		return nil, reasonMissingCode, ""
+		return nil, reasonMissingCode, "", "VS Code CLI not found (code/codium/code-insiders)"
 	}
 	if agent.Binary != "" && env.hasBinary(agent.Binary) {
-		return nil, reasonManualInstall, ""
+		return nil, reasonManualInstall, "", "binary found but no supported install method detected"
 	}
-	return nil, reasonMissing, ""
+	return nil, reasonMissing, "", "no supported binary or install method detected"
 }
 
 func getVersion(agent agents.Agent, env *envState, method string) string {
@@ -382,6 +396,11 @@ func printResults(results []result, opts options) {
 	}
 	for _, res := range results {
 		fmt.Fprintln(os.Stdout, formatResult(res, opts))
+		if opts.Explain {
+			if line := formatExplain(res); line != "" {
+				fmt.Fprintln(os.Stdout, line)
+			}
+		}
 	}
 }
 
@@ -400,6 +419,13 @@ func formatResult(res result, opts options) string {
 	default:
 		return fmt.Sprintf("%s: unknown", name)
 	}
+}
+
+func formatExplain(res result) string {
+	if strings.TrimSpace(res.Explain) == "" {
+		return ""
+	}
+	return fmt.Sprintf("  info: %s", res.Explain)
 }
 
 func safeVersion(v string) string {
