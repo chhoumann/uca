@@ -29,8 +29,9 @@ brews:
     homepage: "https://github.com/chhoumann/uca"
     description: "Update multiple coding-agent CLIs with one command"
     license: "MIT"
-    tap:
+    repository:
       owner: chhoumann
       name: tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     install: |
       bin.install "uca"
