@@ -18,6 +18,7 @@ import (
 
 type options struct {
 	Parallel bool
+	Serial   bool
 	Verbose  bool
 	Quiet    bool
 	DryRun   bool
@@ -64,9 +65,17 @@ func main() {
 	selected, unknown := filterAgents(all, opts.Only, opts.Skip)
 
 	env := newEnv()
-	results := runAll(selected, env, opts)
+	uiEnabled := shouldShowUI(opts)
+	results := runAll(selected, env, opts, uiEnabled)
 
-	printResults(results, opts)
+	if !uiEnabled {
+		printResults(results, opts)
+	} else {
+		fmt.Fprintln(os.Stdout)
+		if opts.Explain && !opts.Quiet {
+			printExplainDetails(results)
+		}
+	}
 	printLogs(results, opts)
 	printSummary(results, unknown)
 
@@ -79,6 +88,7 @@ func parseFlags() options {
 	var opts options
 	flag.BoolVar(&opts.Parallel, "p", false, "run updates in parallel")
 	flag.BoolVar(&opts.Parallel, "parallel", false, "run updates in parallel")
+	flag.BoolVar(&opts.Serial, "serial", false, "run updates sequentially")
 	flag.BoolVar(&opts.Verbose, "v", false, "show update command output")
 	flag.BoolVar(&opts.Verbose, "verbose", false, "show update command output")
 	flag.BoolVar(&opts.Quiet, "q", false, "summary only")
@@ -101,7 +111,8 @@ Usage:
   uca [options]
 
 Options:
-  -p, --parallel    run updates in parallel (no tty output from workers)
+  -p, --parallel    run updates in parallel (default)
+      --serial      run updates sequentially
   -v, --verbose     show update command output for each agent
   -q, --quiet       suppress per-agent version lines (summary only)
   -n, --dry-run     print commands that would run, do not execute
@@ -169,9 +180,38 @@ func parseList(raw string) map[string]bool {
 	return items
 }
 
-func runAll(selected []agents.Agent, env *envState, opts options) []result {
+func shouldShowUI(opts options) bool {
+	if opts.Quiet {
+		return false
+	}
+	if !isTTY(os.Stdout) {
+		return false
+	}
+	return true
+}
+
+func isTTY(file *os.File) bool {
+	stat, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return (stat.Mode() & os.ModeCharDevice) != 0
+}
+
+func runAll(selected []agents.Agent, env *envState, opts options, uiEnabled bool) []result {
 	results := make([]result, len(selected))
-	if opts.Parallel {
+	if opts.Serial {
+		for i, agent := range selected {
+			results[i] = runAgent(agent, env, opts)
+		}
+		return results
+	}
+
+	if uiEnabled {
+		return runAllWithUI(selected, env, opts)
+	}
+
+	{
 		var wg sync.WaitGroup
 		wg.Add(len(selected))
 		for i := range selected {
@@ -184,11 +224,6 @@ func runAll(selected []agents.Agent, env *envState, opts options) []result {
 		wg.Wait()
 		return results
 	}
-
-	for i, agent := range selected {
-		results[i] = runAgent(agent, env, opts)
-	}
-	return results
 }
 
 func runAgent(agent agents.Agent, env *envState, opts options) result {
@@ -223,10 +258,374 @@ func runAgent(agent agents.Agent, env *envState, opts options) result {
 
 	if exitCode != 0 {
 		res.Status = statusFailed
+		res.Reason = fmt.Sprintf("exit %d", exitCode)
 		return res
 	}
 	res.Status = statusUpdated
 	return res
+}
+
+type updateEvent struct {
+	Index  int
+	Phase  string
+	Result result
+	Time   time.Time
+}
+
+const (
+	phaseStart  = "start"
+	phaseFinish = "finish"
+)
+
+func runAgentWithEvents(agent agents.Agent, env *envState, opts options, index int, events chan<- updateEvent) result {
+	res := result{Agent: agent}
+
+	updateCmd, reason, method, detail := resolveUpdate(agent, env)
+	if updateCmd == nil {
+		res.Status = statusSkipped
+		if reason == "" {
+			res.Reason = reasonMissing
+		} else {
+			res.Reason = reason
+		}
+		res.Explain = detail
+		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now()}
+		return res
+	}
+
+	res.Method = method
+	res.Explain = detail
+	res.UpdateCmd = cmdString(updateCmd)
+	if opts.DryRun {
+		res.Status = statusUpdated
+		res.Reason = "dry-run"
+		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now()}
+		return res
+	}
+
+	res.Before = getVersion(agent, env, method)
+	events <- updateEvent{Index: index, Phase: phaseStart, Result: res, Time: time.Now()}
+
+	out, exitCode, duration, _ := runCmd(updateCmd)
+	res.Duration = duration
+	res.Log = out
+	res.After = getVersion(agent, env, method)
+
+	if exitCode != 0 {
+		res.Status = statusFailed
+		res.Reason = fmt.Sprintf("exit %d", exitCode)
+		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now()}
+		return res
+	}
+	res.Status = statusUpdated
+	events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now()}
+	return res
+}
+
+type uiRow struct {
+	name     string
+	status   string
+	before   string
+	after    string
+	reason   string
+	method   string
+	start    time.Time
+	duration time.Duration
+}
+
+type uiRenderer struct {
+	out        *os.File
+	lastLines  int
+	useColor   bool
+	useUnicode bool
+}
+
+func newRenderer(out *os.File) *uiRenderer {
+	return &uiRenderer{
+		out:        out,
+		useColor:   shouldUseColor(),
+		useUnicode: shouldUseUnicode(),
+	}
+}
+
+func (r *uiRenderer) Draw(content string) {
+	if r.lastLines > 0 {
+		fmt.Fprintf(r.out, "\x1b[%dA", r.lastLines)
+	}
+	fmt.Fprint(r.out, "\x1b[0J")
+	fmt.Fprint(r.out, content)
+	r.lastLines = countLines(content)
+}
+
+func countLines(s string) int {
+	if s == "" {
+		return 0
+	}
+	lines := strings.Count(s, "\n")
+	if !strings.HasSuffix(s, "\n") {
+		lines++
+	}
+	return lines
+}
+
+func shouldUseColor() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	term := strings.ToLower(os.Getenv("TERM"))
+	if term == "" || term == "dumb" {
+		return false
+	}
+	return true
+}
+
+func shouldUseUnicode() bool {
+	locale := strings.ToUpper(os.Getenv("LC_ALL") + os.Getenv("LC_CTYPE") + os.Getenv("LANG"))
+	return strings.Contains(locale, "UTF-8")
+}
+
+func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result {
+	results := make([]result, len(selected))
+	events := make(chan updateEvent, len(selected))
+	done := make(chan struct{})
+
+	rows := make([]uiRow, len(selected))
+	nameWidth := 0
+	for i, agent := range selected {
+		rows[i] = uiRow{name: agent.Name, status: "pending"}
+		if len(agent.Name) > nameWidth {
+			nameWidth = len(agent.Name)
+		}
+	}
+
+	renderer := newRenderer(os.Stdout)
+	start := time.Now()
+	renderer.Draw(renderDashboard(rows, nameWidth, start, opts, renderer))
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case ev, ok := <-events:
+				if !ok {
+					ticker.Stop()
+					renderer.Draw(renderDashboard(rows, nameWidth, start, opts, renderer))
+					return
+				}
+				applyEvent(&rows[ev.Index], ev)
+				renderer.Draw(renderDashboard(rows, nameWidth, start, opts, renderer))
+			case <-ticker.C:
+				renderer.Draw(renderDashboard(rows, nameWidth, start, opts, renderer))
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(len(selected))
+	for i := range selected {
+		i := i
+		go func() {
+			defer wg.Done()
+			results[i] = runAgentWithEvents(selected[i], env, opts, i, events)
+		}()
+	}
+	wg.Wait()
+	close(events)
+	<-done
+	return results
+}
+
+func applyEvent(row *uiRow, ev updateEvent) {
+	res := ev.Result
+	switch ev.Phase {
+	case phaseStart:
+		row.status = "updating"
+		row.before = res.Before
+		row.method = res.Method
+		row.start = ev.Time
+	case phaseFinish:
+		row.status = res.Status
+		row.before = res.Before
+		row.after = res.After
+		row.reason = res.Reason
+		row.method = res.Method
+		row.duration = res.Duration
+	}
+}
+
+func renderDashboard(rows []uiRow, nameWidth int, start time.Time, opts options, r *uiRenderer) string {
+	total := len(rows)
+	completed := 0
+	for _, row := range rows {
+		if row.status == statusUpdated || row.status == statusSkipped || row.status == statusFailed {
+			completed++
+		}
+	}
+	header := fmt.Sprintf("uca  • %s %d/%d • elapsed %s", progressBar(completed, total, 18, r.useUnicode), completed, total, fmtDuration(time.Since(start)))
+	lines := make([]string, 0, total+2)
+	lines = append(lines, header, "")
+	for _, row := range rows {
+		lines = append(lines, formatRow(row, nameWidth, opts, r))
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func progressBar(completed, total, width int, unicode bool) string {
+	if total == 0 {
+		return ""
+	}
+	if width < 5 {
+		width = 5
+	}
+	filled := int(float64(completed) / float64(total) * float64(width))
+	if filled > width {
+		filled = width
+	}
+	empty := width - filled
+	var fillChar, emptyChar string
+	if unicode {
+		fillChar = "█"
+		emptyChar = "░"
+	} else {
+		fillChar = "#"
+		emptyChar = "-"
+	}
+	return "[" + strings.Repeat(fillChar, filled) + strings.Repeat(emptyChar, empty) + "]"
+}
+
+func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
+	statusLabel := row.status
+	if row.status == statusUpdated && row.reason == "dry-run" {
+		statusLabel = "dry-run"
+	}
+
+	icon := statusIcon(statusLabel, r.useUnicode)
+	icon = colorize(icon, statusLabel, r.useColor)
+
+	version := "--"
+	elapsed := "--"
+	info := ""
+	switch row.status {
+	case "pending":
+		statusLabel = "pending"
+	case "updating":
+		statusLabel = "updating"
+		version = fmt.Sprintf("%s -> ?", safeVersion(row.before))
+		if !row.start.IsZero() {
+			elapsed = fmtDuration(time.Since(row.start))
+		}
+	case statusUpdated:
+		version = fmt.Sprintf("%s -> %s", safeVersion(row.before), safeVersion(row.after))
+		elapsed = fmtDuration(row.duration)
+	case statusFailed:
+		version = fmt.Sprintf("%s -> %s", safeVersion(row.before), safeVersion(row.after))
+		elapsed = fmtDuration(row.duration)
+		if row.reason != "" {
+			info = row.reason
+		}
+	case statusSkipped:
+		if row.reason != "" {
+			info = row.reason
+		}
+	}
+
+	if opts.Explain && info == "" && row.method != "" {
+		info = methodLabel(row.method)
+	}
+
+	if statusLabel == "dry-run" {
+		info = "no changes"
+	}
+
+	if info != "" {
+		info = " (" + info + ")"
+	}
+
+	return fmt.Sprintf("%-*s %s %-9s %s %6s%s", nameWidth, row.name, icon, statusLabel, version, elapsed, info)
+}
+
+func statusIcon(status string, unicode bool) string {
+	switch status {
+	case "pending":
+		if unicode {
+			return "⏳"
+		}
+		return "?"
+	case "updating":
+		if unicode {
+			return "🔄"
+		}
+		return "~"
+	case statusUpdated:
+		if unicode {
+			return "✅"
+		}
+		return "ok"
+	case statusFailed:
+		if unicode {
+			return "❌"
+		}
+		return "x"
+	case statusSkipped:
+		if unicode {
+			return "⚠️"
+		}
+		return "!"
+	case "dry-run":
+		if unicode {
+			return "🧪"
+		}
+		return "dr"
+	default:
+		return "-"
+	}
+}
+
+func methodLabel(method string) string {
+	switch method {
+	case agents.KindNative:
+		return "native"
+	case agents.KindBun:
+		return "bun"
+	case agents.KindBrew:
+		return "brew"
+	case agents.KindNpm:
+		return "npm"
+	case agents.KindPip:
+		return "pip"
+	case agents.KindUv:
+		return "uv"
+	case agents.KindVSCode:
+		return "vscode"
+	default:
+		return method
+	}
+}
+
+func colorize(text, status string, enabled bool) string {
+	if !enabled {
+		return text
+	}
+	code := ""
+	switch status {
+	case "pending":
+		code = "90"
+	case "updating":
+		code = "36"
+	case statusUpdated:
+		code = "32"
+	case statusFailed:
+		code = "31"
+	case statusSkipped:
+		code = "33"
+	case "dry-run":
+		code = "35"
+	}
+	if code == "" {
+		return text
+	}
+	return "\x1b[" + code + "m" + text + "\x1b[0m"
 }
 
 func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string, string) {
@@ -401,6 +800,15 @@ func printResults(results []result, opts options) {
 				fmt.Fprintln(os.Stdout, line)
 			}
 		}
+	}
+}
+
+func printExplainDetails(results []result) {
+	for _, res := range results {
+		if strings.TrimSpace(res.Explain) == "" {
+			continue
+		}
+		fmt.Fprintf(os.Stdout, "%s: %s\n", res.Agent.Name, res.Explain)
 	}
 }
 

@@ -1,6 +1,6 @@
 # uca
 
-`uca` updates multiple coding-agent CLIs with one command. Quiet by default, parallel when you want it.
+`uca` updates multiple coding-agent CLIs with one command. Quiet by default, parallel by default.
 
 ## Install
 
@@ -20,7 +20,8 @@ uca [options]
 ```
 
 Options:
-- `-p, --parallel` run updates in parallel (no tty output from workers)
+- `-p, --parallel` run updates in parallel (default)
+- `--serial` run updates sequentially
 - `-v, --verbose` show update command output for each agent
 - `-q, --quiet` suppress per-agent version lines (summary only)
 - `-n, --dry-run` print commands that would run, do not execute
@@ -38,7 +39,12 @@ uca
 
 Parallel update with verbose logs:
 ```bash
-uca -p -v
+uca -v
+```
+
+Serial update:
+```bash
+uca --serial
 ```
 
 Dry run only for claude + codex:
@@ -64,6 +70,10 @@ uca --explain
 - roocode (VS Code extension `RooVeterinaryInc.roo-cline`)
 - aider (uv tool `aider-chat` or pip `aider-chat`)
 - pi (npm `@mariozechner/pi-coding-agent`)
+
+## Live output
+
+When `uca` is run in a TTY, it shows a live status dashboard with progress, versions, and timings. When output is piped (or `--quiet`), it prints only completed lines and the summary.
 
 ## Detection strategy
 
