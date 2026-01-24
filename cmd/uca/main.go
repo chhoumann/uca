@@ -35,6 +35,7 @@ type result struct {
 	Duration  time.Duration
 	Log       string
 	UpdateCmd string
+	Method    string
 }
 
 const (
@@ -189,7 +190,7 @@ func runAll(selected []agents.Agent, env *envState, opts options) []result {
 func runAgent(agent agents.Agent, env *envState, opts options) result {
 	res := result{Agent: agent}
 
-	updateCmd, reason := resolveUpdate(agent, env)
+	updateCmd, reason, method := resolveUpdate(agent, env)
 	if updateCmd == nil {
 		res.Status = statusSkipped
 		if reason == "" {
@@ -200,6 +201,7 @@ func runAgent(agent agents.Agent, env *envState, opts options) result {
 		return res
 	}
 
+	res.Method = method
 	res.UpdateCmd = cmdString(updateCmd)
 	if opts.DryRun {
 		res.Status = statusUpdated
@@ -207,11 +209,11 @@ func runAgent(agent agents.Agent, env *envState, opts options) result {
 		return res
 	}
 
-	res.Before = getVersion(agent, env)
+	res.Before = getVersion(agent, env, method)
 	out, exitCode, duration, _ := runCmd(updateCmd)
 	res.Duration = duration
 	res.Log = out
-	res.After = getVersion(agent, env)
+	res.After = getVersion(agent, env, method)
 
 	if exitCode != 0 {
 		res.Status = statusFailed
@@ -221,7 +223,7 @@ func runAgent(agent agents.Agent, env *envState, opts options) result {
 	return res
 }
 
-func resolveUpdate(agent agents.Agent, env *envState) ([]string, string) {
+func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string) {
 	bunMissing := false
 	codeMissing := false
 
@@ -231,7 +233,7 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string) {
 			if agent.Binary != "" && !env.hasBinary(agent.Binary) {
 				continue
 			}
-			return strat.Command, ""
+			return strat.Command, "", strat.Kind
 		case agents.KindBun:
 			if !env.hasBun {
 				bunMissing = true
@@ -240,34 +242,34 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string) {
 			if agent.Binary != "" && !env.hasBinary(agent.Binary) {
 				continue
 			}
-			return strat.Command, ""
+			return strat.Command, "", strat.Kind
 		case agents.KindBrew:
 			if !env.hasBrew {
 				continue
 			}
 			if env.brewHas(strat.Package) {
-				return []string{"brew", "upgrade", strat.Package}, ""
+				return []string{"brew", "upgrade", strat.Package}, "", strat.Kind
 			}
 		case agents.KindNpm:
 			if !env.hasNpm {
 				continue
 			}
 			if env.npmHas(strat.Package) {
-				return []string{"npm", "install", "-g", strat.Package}, ""
+				return []string{"npm", "install", "-g", strat.Package}, "", strat.Kind
 			}
 		case agents.KindPip:
 			if !env.hasPython {
 				continue
 			}
 			if env.pipHas(strat.Package) {
-				return []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", strat.Package}, ""
+				return []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", strat.Package}, "", strat.Kind
 			}
 		case agents.KindUv:
 			if !env.hasUv {
 				continue
 			}
 			if env.uvHas(strat.Package) {
-				return []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@latest"}, ""
+				return []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@latest"}, "", strat.Kind
 			}
 		case agents.KindVSCode:
 			if env.codeCmd == "" {
@@ -275,24 +277,29 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string) {
 				continue
 			}
 			if env.vscodeHas(strat.ExtensionID) {
-				return []string{env.codeCmd, "--install-extension", strat.ExtensionID, "--force"}, ""
+				return []string{env.codeCmd, "--install-extension", strat.ExtensionID, "--force"}, "", strat.Kind
 			}
 		}
 	}
 
 	if bunMissing {
-		return nil, reasonMissingBun
+		return nil, reasonMissingBun, ""
 	}
 	if codeMissing {
-		return nil, reasonMissingCode
+		return nil, reasonMissingCode, ""
 	}
 	if agent.Binary != "" && env.hasBinary(agent.Binary) {
-		return nil, reasonManualInstall
+		return nil, reasonManualInstall, ""
 	}
-	return nil, reasonMissing
+	return nil, reasonMissing, ""
 }
 
-func getVersion(agent agents.Agent, env *envState) string {
+func getVersion(agent agents.Agent, env *envState, method string) string {
+	if method == agents.KindVSCode && agent.ExtensionID != "" {
+		if version := env.vscodeVersion(agent.ExtensionID); version != "" {
+			return version
+		}
+	}
 	if len(agent.VersionCmd) > 0 {
 		if agent.Binary == "" || env.hasBinary(agent.Binary) {
 			return runVersionCmd(agent.VersionCmd)
