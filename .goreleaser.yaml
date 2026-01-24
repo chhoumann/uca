@@ -31,7 +31,7 @@ brews:
     license: "MIT"
     repository:
       owner: chhoumann
-      name: tap
+      name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     install: |
       bin.install "uca"
