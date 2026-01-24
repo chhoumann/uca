@@ -202,6 +202,18 @@ func isTTY(file *os.File) bool {
 }
 
 func runAll(selected []agents.Agent, env *envState, opts options, uiEnabled bool) []result {
+	if opts.Serial {
+		return runAllWithoutUI(selected, env, opts)
+	}
+
+	if uiEnabled {
+		return runAllWithUI(selected, env, opts)
+	}
+
+	return runAllWithoutUI(selected, env, opts)
+}
+
+func runAllWithoutUI(selected []agents.Agent, env *envState, opts options) []result {
 	results := make([]result, len(selected))
 	if opts.Serial {
 		for i, agent := range selected {
@@ -209,24 +221,28 @@ func runAll(selected []agents.Agent, env *envState, opts options, uiEnabled bool
 		}
 		return results
 	}
-
-	if uiEnabled {
-		return runAllWithUI(selected, env, opts)
+	var wg sync.WaitGroup
+	wg.Add(len(selected))
+	for i := range selected {
+		i := i
+		go func() {
+			defer wg.Done()
+			results[i] = runAgent(selected[i], env, opts)
+		}()
 	}
+	wg.Wait()
+	return results
+}
 
-	{
-		var wg sync.WaitGroup
-		wg.Add(len(selected))
-		for i := range selected {
-			i := i
-			go func() {
-				defer wg.Done()
-				results[i] = runAgent(selected[i], env, opts)
-			}()
-		}
-		wg.Wait()
-		return results
+func shouldShowInUI(agent agents.Agent, env *envState) (bool, string) {
+	updateCmd, reason, _, _ := resolveUpdate(agent, env)
+	if updateCmd != nil {
+		return true, ""
 	}
+	if reason == reasonManualInstall {
+		return true, reason
+	}
+	return false, reason
 }
 
 func runAgent(agent agents.Agent, env *envState, opts options) result {
@@ -334,6 +350,7 @@ type uiRow struct {
 	method   string
 	start    time.Time
 	duration time.Duration
+	visible  bool
 }
 
 type uiRenderer struct {
@@ -424,11 +441,24 @@ func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result
 
 	rows := make([]uiRow, len(selected))
 	nameWidth := 0
+	visibleCount := 0
 	for i, agent := range selected {
-		rows[i] = uiRow{name: agent.Name, status: "pending"}
+		visible, reason := shouldShowInUI(agent, env)
+		status := "pending"
+		if reason == reasonManualInstall {
+			status = statusSkipped
+		}
+		rows[i] = uiRow{name: agent.Name, status: status, visible: visible, reason: reason}
+		if !visible {
+			continue
+		}
+		visibleCount++
 		if len(agent.Name) > nameWidth {
 			nameWidth = len(agent.Name)
 		}
+	}
+	if visibleCount == 0 {
+		return runAllWithoutUI(selected, env, opts)
 	}
 
 	renderer := newRenderer(os.Stdout)
@@ -436,7 +466,7 @@ func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result
 	hideCursor(renderer.out)
 	renderer.Draw(renderDashboard(rows, nameWidth, start, opts, renderer))
 
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(120 * time.Millisecond)
 	go func() {
 		defer close(done)
 		for {
@@ -490,17 +520,31 @@ func applyEvent(row *uiRow, ev updateEvent) {
 }
 
 func renderDashboard(rows []uiRow, nameWidth int, start time.Time, opts options, r *uiRenderer) string {
-	total := len(rows)
+	total := 0
 	completed := 0
+	updated := 0
+	failed := 0
+	visibleRows := make([]uiRow, 0, len(rows))
 	for _, row := range rows {
+		if !row.visible {
+			continue
+		}
+		visibleRows = append(visibleRows, row)
+		total++
 		if row.status == statusUpdated || row.status == statusSkipped || row.status == statusFailed {
 			completed++
 		}
+		switch row.status {
+		case statusUpdated:
+			updated++
+		case statusFailed:
+			failed++
+		}
 	}
-	header := fmt.Sprintf("uca  %s %d/%d  elapsed %s", spinnerGlyph(time.Since(start), r.useUnicode), completed, total, fmtDuration(time.Since(start)))
+	header := fmt.Sprintf("uca  %s  %d/%d  ok:%d fail:%d  %s", spinnerGlyph(time.Since(start), r.useUnicode), completed, total, updated, failed, fmtElapsed(time.Since(start)))
 	lines := make([]string, 0, total+2)
 	lines = append(lines, fitLine(header, r.width, r.useUnicode), "")
-	for _, row := range rows {
+	for _, row := range visibleRows {
 		lines = append(lines, formatRow(row, nameWidth, opts, r))
 	}
 	return strings.Join(lines, "\n") + "\n"
@@ -511,17 +555,13 @@ func spinnerGlyph(elapsed time.Duration, unicode bool) string {
 	if unicode {
 		frames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	}
-	index := int(elapsed/(200*time.Millisecond)) % len(frames)
+	index := int(elapsed/(120*time.Millisecond)) % len(frames)
 	return frames[index]
 }
 
 func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
-	statusLabel := row.status
-	if row.status == statusUpdated && row.reason == "dry-run" {
-		statusLabel = "dry-run"
-	}
-
-	iconPlain := statusIcon(statusLabel, r.useUnicode)
+	statusLabel := statusLabelFor(row)
+	iconPlain := statusIcon(row, r.useUnicode)
 	iconColored := colorize(iconPlain, statusLabel, r.useColor)
 
 	version := "--"
@@ -529,24 +569,24 @@ func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
 	info := ""
 	switch row.status {
 	case "pending":
-		statusLabel = "pending"
+		statusLabel = statusLabelFor(row)
 	case "updating":
-		statusLabel = "updating"
-		version = fmt.Sprintf("%s -> ?", safeVersion(row.before))
+		statusLabel = statusLabelFor(row)
+		version = fmt.Sprintf("%s → …", safeVersion(row.before))
 		if !row.start.IsZero() {
-			elapsed = fmtDuration(time.Since(row.start))
+			elapsed = fmtElapsed(time.Since(row.start))
 		}
 	case statusUpdated:
-		version = fmt.Sprintf("%s -> %s", safeVersion(row.before), safeVersion(row.after))
-		elapsed = fmtDuration(row.duration)
+		version = fmt.Sprintf("%s → %s", safeVersion(row.before), safeVersion(row.after))
+		elapsed = fmtElapsed(row.duration)
 	case statusFailed:
-		version = fmt.Sprintf("%s -> %s", safeVersion(row.before), safeVersion(row.after))
-		elapsed = fmtDuration(row.duration)
+		version = fmt.Sprintf("%s → %s", safeVersion(row.before), safeVersion(row.after))
+		elapsed = fmtElapsed(row.duration)
 		if row.reason != "" {
 			info = row.reason
 		}
 	case statusSkipped:
-		if row.reason != "" {
+		if row.reason != "" && row.reason != reasonManualInstall {
 			info = row.reason
 		}
 	}
@@ -569,6 +609,34 @@ func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
 		line = strings.Replace(line, iconPlain, iconColored, 1)
 	}
 	return line
+}
+
+func statusLabelFor(row uiRow) string {
+	if row.status == statusUpdated && row.reason == "dry-run" {
+		return "dry-run"
+	}
+	if row.status == statusSkipped && row.reason == reasonManualInstall {
+		return "manual"
+	}
+	return row.status
+}
+
+func fmtElapsed(d time.Duration) string {
+	total := int(d.Seconds())
+	if total < 0 {
+		total = 0
+	}
+	if total < 60 {
+		return fmt.Sprintf("%ds", total)
+	}
+	mins := total / 60
+	secs := total % 60
+	if mins < 60 {
+		return fmt.Sprintf("%dm%02ds", mins, secs)
+	}
+	hours := mins / 60
+	mins = mins % 60
+	return fmt.Sprintf("%dh%02dm", hours, mins)
 }
 
 func fitLine(line string, width int, unicode bool) string {
@@ -607,36 +675,43 @@ func fitLine(line string, width int, unicode bool) string {
 	return line
 }
 
-func statusIcon(status string, unicode bool) string {
+func statusIcon(row uiRow, unicode bool) string {
+	status := row.status
+	if status == statusUpdated && row.reason == "dry-run" {
+		status = "dry-run"
+	}
+	if status == statusSkipped && row.reason == reasonManualInstall {
+		if unicode {
+			return "○"
+		}
+		return "o"
+	}
 	switch status {
 	case "pending":
 		if unicode {
-			return "⏳"
+			return "·"
 		}
-		return "?"
+		return "."
 	case "updating":
-		if unicode {
-			return "🔄"
-		}
-		return "~"
+		return spinnerGlyph(time.Since(row.start), unicode)
 	case statusUpdated:
 		if unicode {
-			return "✅"
+			return "✓"
 		}
 		return "ok"
 	case statusFailed:
 		if unicode {
-			return "❌"
+			return "✕"
 		}
 		return "x"
 	case statusSkipped:
 		if unicode {
-			return "⚠️"
+			return "–"
 		}
-		return "!"
+		return "-"
 	case "dry-run":
 		if unicode {
-			return "🧪"
+			return "≈"
 		}
 		return "dr"
 	default:
