@@ -73,7 +73,7 @@ uca --explain
 
 ## Live output
 
-When `uca` is run in a TTY, it shows a live status dashboard with progress, versions, and timings for installed agents. When output is piped (or `--quiet`), it prints only completed lines and the summary.
+When `uca` is run in a TTY, it shows a live status dashboard with progress, versions, and timings for installed agents. It also prints an instant boot line and streams agents into the dashboard as they’re detected. When output is piped (or `--quiet`), it prints only completed lines and the summary.
 
 ## Detection strategy
 

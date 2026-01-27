@@ -303,9 +303,11 @@ type updateEvent struct {
 	Phase  string
 	Result result
 	Time   time.Time
+	Show   bool
 }
 
 const (
+	phaseDetect = "detect"
 	phaseStart  = "start"
 	phaseFinish = "finish"
 )
@@ -314,6 +316,7 @@ func runAgentWithEvents(agent agents.Agent, env *envState, opts options, index i
 	res := result{Agent: agent}
 
 	updateCmd, reason, method, detail := resolveUpdate(agent, env)
+	show := updateCmd != nil || reason == reasonManualInstall
 	if updateCmd == nil {
 		res.Status = statusSkipped
 		if reason == "" {
@@ -322,7 +325,8 @@ func runAgentWithEvents(agent agents.Agent, env *envState, opts options, index i
 			res.Reason = reason
 		}
 		res.Explain = detail
-		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now()}
+		events <- updateEvent{Index: index, Phase: phaseDetect, Result: res, Time: time.Now(), Show: show}
+		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: show}
 		return res
 	}
 
@@ -332,12 +336,14 @@ func runAgentWithEvents(agent agents.Agent, env *envState, opts options, index i
 	if opts.DryRun {
 		res.Status = statusUpdated
 		res.Reason = "dry-run"
-		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now()}
+		events <- updateEvent{Index: index, Phase: phaseDetect, Result: res, Time: time.Now(), Show: show}
+		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: show}
 		return res
 	}
 
 	res.Before = getVersion(agent, env, method)
-	events <- updateEvent{Index: index, Phase: phaseStart, Result: res, Time: time.Now()}
+	events <- updateEvent{Index: index, Phase: phaseDetect, Result: res, Time: time.Now(), Show: show}
+	events <- updateEvent{Index: index, Phase: phaseStart, Result: res, Time: time.Now(), Show: show}
 
 	out, exitCode, duration, _ := runCmd(updateCmd)
 	res.Duration = duration
@@ -347,7 +353,7 @@ func runAgentWithEvents(agent agents.Agent, env *envState, opts options, index i
 	if exitCode != 0 {
 		res.Status = statusFailed
 		res.Reason = fmt.Sprintf("exit %d", exitCode)
-		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now()}
+		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: show}
 		return res
 	}
 	if res.Before != "" && res.After != "" && res.Before == res.After && res.Before != "unknown" {
@@ -355,7 +361,7 @@ func runAgentWithEvents(agent agents.Agent, env *envState, opts options, index i
 	} else {
 		res.Status = statusUpdated
 	}
-	events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now()}
+	events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: show}
 	return res
 }
 
@@ -369,6 +375,7 @@ type uiRow struct {
 	start    time.Time
 	duration time.Duration
 	visible  bool
+	detected bool
 }
 
 type uiRenderer struct {
@@ -459,30 +466,19 @@ func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result
 
 	rows := make([]uiRow, len(selected))
 	nameWidth := 0
-	visibleCount := 0
 	for i, agent := range selected {
-		visible, reason := shouldShowInUI(agent, env)
-		status := "pending"
-		if reason == reasonManualInstall {
-			status = statusSkipped
-		}
-		rows[i] = uiRow{name: agent.Name, status: status, visible: visible, reason: reason}
-		if !visible {
-			continue
-		}
-		visibleCount++
+		rows[i] = uiRow{name: agent.Name, status: "pending", visible: false}
 		if len(agent.Name) > nameWidth {
 			nameWidth = len(agent.Name)
 		}
-	}
-	if visibleCount == 0 {
-		return runAllWithoutUI(selected, env, opts)
 	}
 
 	renderer := newRenderer(os.Stdout)
 	start := time.Now()
 	hideCursor(renderer.out)
-	renderer.Draw(renderDashboard(rows, nameWidth, start, opts, renderer))
+	totalAgents := len(selected)
+	detectedCount := 0
+	renderer.Draw(renderFrame(rows, nameWidth, start, opts, renderer, detectedCount, totalAgents))
 
 	ticker := time.NewTicker(120 * time.Millisecond)
 	go func() {
@@ -492,15 +488,29 @@ func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result
 			case ev, ok := <-events:
 				if !ok {
 					ticker.Stop()
-					renderer.Draw(renderDashboard(rows, nameWidth, start, opts, renderer))
+					renderer.Draw(renderFrame(rows, nameWidth, start, opts, renderer, detectedCount, totalAgents))
 					return
 				}
+				if ev.Phase == phaseDetect && !rows[ev.Index].detected {
+					rows[ev.Index].detected = true
+					detectedCount++
+				}
 				applyEvent(&rows[ev.Index], ev)
-				renderer.Draw(renderDashboard(rows, nameWidth, start, opts, renderer))
+				renderer.Draw(renderFrame(rows, nameWidth, start, opts, renderer, detectedCount, totalAgents))
 			case <-ticker.C:
-				renderer.Draw(renderDashboard(rows, nameWidth, start, opts, renderer))
+				renderer.Draw(renderFrame(rows, nameWidth, start, opts, renderer, detectedCount, totalAgents))
 			}
 		}
+	}()
+
+	go func() {
+		env.npmOnce.Do(env.loadNpmGlobals)
+	}()
+	go func() {
+		env.uvOnce.Do(env.loadUvTools)
+	}()
+	go func() {
+		env.codeOnce.Do(env.loadCodeExtensions)
 	}()
 
 	var wg sync.WaitGroup
@@ -522,6 +532,15 @@ func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result
 func applyEvent(row *uiRow, ev updateEvent) {
 	res := ev.Result
 	switch ev.Phase {
+	case phaseDetect:
+		row.visible = ev.Show
+		row.status = "pending"
+		row.reason = res.Reason
+		row.method = res.Method
+		row.before = res.Before
+		if res.Status == statusSkipped && res.Reason == reasonManualInstall {
+			row.status = statusSkipped
+		}
 	case phaseStart:
 		row.status = "updating"
 		row.before = res.Before
@@ -537,8 +556,8 @@ func applyEvent(row *uiRow, ev updateEvent) {
 	}
 }
 
-func renderDashboard(rows []uiRow, nameWidth int, start time.Time, opts options, r *uiRenderer) string {
-	total := 0
+func renderDashboard(rows []uiRow, nameWidth int, start time.Time, opts options, r *uiRenderer, detected, total int) string {
+	visibleTotal := 0
 	completed := 0
 	updated := 0
 	unchanged := 0
@@ -549,7 +568,7 @@ func renderDashboard(rows []uiRow, nameWidth int, start time.Time, opts options,
 			continue
 		}
 		visibleRows = append(visibleRows, row)
-		total++
+		visibleTotal++
 		if row.status == statusUpdated || row.status == statusUnchanged || row.status == statusSkipped || row.status == statusFailed {
 			completed++
 		}
@@ -562,13 +581,33 @@ func renderDashboard(rows []uiRow, nameWidth int, start time.Time, opts options,
 			failed++
 		}
 	}
-	header := fmt.Sprintf("uca  %s  %d/%d  ok:%d same:%d fail:%d  %s", spinnerGlyph(time.Since(start), r.useUnicode), completed, total, updated, unchanged, failed, fmtElapsed(time.Since(start)))
-	lines := make([]string, 0, total+2)
+	header := fmt.Sprintf("uca  %s  %d/%d  ok:%d same:%d fail:%d  %s", spinnerGlyph(time.Since(start), r.useUnicode), completed, visibleTotal, updated, unchanged, failed, fmtElapsed(time.Since(start)))
+	if detected < total {
+		header = fmt.Sprintf("%s  detecting %d/%d", header, detected, total)
+	}
+	lines := make([]string, 0, visibleTotal+2)
 	lines = append(lines, fitLine(header, r.width, r.useUnicode), "")
 	for _, row := range visibleRows {
 		lines = append(lines, formatRow(row, nameWidth, opts, r))
 	}
 	return strings.Join(lines, "\n") + "\n"
+}
+
+func renderBoot(start time.Time, detected, total int, r *uiRenderer) string {
+	header := fmt.Sprintf("uca  %s  detecting %d/%d  %s", spinnerGlyph(time.Since(start), r.useUnicode), detected, total, fmtElapsed(time.Since(start)))
+	return fitLine(header, r.width, r.useUnicode) + "\n"
+}
+
+func renderFrame(rows []uiRow, nameWidth int, start time.Time, opts options, r *uiRenderer, detected, total int) string {
+	if detected < total {
+		for _, row := range rows {
+			if row.visible {
+				return renderDashboard(rows, nameWidth, start, opts, r, detected, total)
+			}
+		}
+		return renderBoot(start, detected, total, r)
+	}
+	return renderDashboard(rows, nameWidth, start, opts, r, detected, total)
 }
 
 func spinnerGlyph(elapsed time.Duration, unicode bool) string {
