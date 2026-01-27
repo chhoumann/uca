@@ -942,12 +942,60 @@ func runVersionCmd(args []string) string {
 	if err != nil {
 		return "unknown"
 	}
-	trimmed := strings.TrimSpace(string(out))
+	return parseVersionOutput(string(out))
+}
+
+func parseVersionOutput(out string) string {
+	trimmed := strings.TrimSpace(out)
 	if trimmed == "" {
 		return "unknown"
 	}
 	lines := strings.Split(trimmed, "\n")
-	return strings.TrimSpace(lines[0])
+	first := ""
+	versionOnly := ""
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if first == "" {
+			first = line
+		}
+		if isVersionOnlyLine(line) {
+			versionOnly = line
+		}
+	}
+	if versionOnly != "" {
+		return versionOnly
+	}
+	if first != "" {
+		return first
+	}
+	return "unknown"
+}
+
+func isVersionOnlyLine(line string) bool {
+	if strings.ContainsAny(line, " \t") {
+		return false
+	}
+	if strings.HasPrefix(line, "v") {
+		line = line[1:]
+	}
+	parts := strings.Split(line, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func runCmd(args []string) (string, int, time.Duration, error) {
