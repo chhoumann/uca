@@ -39,7 +39,10 @@ func Default() []Agent {
 			Name:       "gemini",
 			Binary:     "gemini",
 			VersionCmd: []string{"gemini", "--version"},
-			Strategies: []UpdateStrategy{{Kind: KindNative, Command: []string{"gemini", "update"}}},
+			Strategies: []UpdateStrategy{
+				{Kind: KindNpm, Package: "@google/gemini-cli"},
+				{Kind: KindNative, Command: []string{"gemini", "update"}},
+			},
 		},
 		{
 			Name:       "claude",

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -59,6 +60,8 @@ const (
 	reasonMissingBun    = "missing bun"
 	reasonMissingCode   = "missing vscode"
 	reasonManualInstall = "manual install"
+	reasonQuota         = "quota"
+	reasonNpmNotEmpty   = "npm ENOTEMPTY"
 )
 
 func main() {
@@ -280,14 +283,13 @@ func runAgent(agent agents.Agent, env *envState, opts options) result {
 	}
 
 	res.Before = getVersion(agent, env, method)
-	out, exitCode, duration, _ := runCmd(updateCmd)
+	out, classifyOut, exitCode, duration, _ := runUpdateCmd(updateCmd)
 	res.Duration = duration
 	res.Log = out
 	res.After = getVersion(agent, env, method)
 
 	if exitCode != 0 {
-		res.Status = statusFailed
-		res.Reason = fmt.Sprintf("exit %d", exitCode)
+		setFailureResult(&res, exitCode, updateCmd, classifyOut)
 		return res
 	}
 	if res.Before != "" && res.After != "" && res.Before == res.After && res.Before != "unknown" {
@@ -345,14 +347,13 @@ func runAgentWithEvents(agent agents.Agent, env *envState, opts options, index i
 	events <- updateEvent{Index: index, Phase: phaseDetect, Result: res, Time: time.Now(), Show: show}
 	events <- updateEvent{Index: index, Phase: phaseStart, Result: res, Time: time.Now(), Show: show}
 
-	out, exitCode, duration, _ := runCmd(updateCmd)
+	out, classifyOut, exitCode, duration, _ := runUpdateCmd(updateCmd)
 	res.Duration = duration
 	res.Log = out
 	res.After = getVersion(agent, env, method)
 
 	if exitCode != 0 {
-		res.Status = statusFailed
-		res.Reason = fmt.Sprintf("exit %d", exitCode)
+		setFailureResult(&res, exitCode, updateCmd, classifyOut)
 		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: show}
 		return res
 	}
@@ -1016,6 +1017,180 @@ func runCmd(args []string) (string, int, time.Duration, error) {
 	return buf.String(), 1, duration, err
 }
 
+func runUpdateCmd(args []string) (string, string, int, time.Duration, error) {
+	out, exitCode, duration, err := runCmd(args)
+	classifyOut := out
+	if exitCode == 0 {
+		return out, classifyOut, exitCode, duration, err
+	}
+	if shouldRetryNpmInstall(args, out) {
+		cleanupMsg := cleanupNpmENotEmpty(out)
+		retryOut, retryCode, retryDuration, retryErr := runCmd(args)
+		combined := formatRetryOutput(out, cleanupMsg, retryOut)
+		classifyOut = retryOut
+		if strings.TrimSpace(classifyOut) == "" {
+			classifyOut = out
+		}
+		return combined, classifyOut, retryCode, duration + retryDuration, retryErr
+	}
+	return out, classifyOut, exitCode, duration, err
+}
+
+func setFailureResult(res *result, exitCode int, updateCmd []string, output string) {
+	res.Status = statusFailed
+	reason, hint := classifyUpdateFailure(updateCmd, output)
+	if reason == "" {
+		res.Reason = fmt.Sprintf("exit %d", exitCode)
+	} else {
+		res.Reason = reason
+	}
+	if hint != "" {
+		res.Explain = appendHint(res.Explain, hint)
+	}
+}
+
+func classifyUpdateFailure(updateCmd []string, output string) (string, string) {
+	lower := strings.ToLower(output)
+	if strings.Contains(output, "TerminalQuotaError") ||
+		strings.Contains(lower, "exhausted your capacity") ||
+		strings.Contains(lower, "quota will reset") {
+		return reasonQuota, "quota exceeded; retry later or update via npm (@google/gemini-cli)"
+	}
+	if isNpmInstall(updateCmd) && (strings.Contains(output, "ENOTEMPTY") ||
+		strings.Contains(output, "errno -66") ||
+		strings.Contains(lower, "directory not empty")) {
+		return reasonNpmNotEmpty, "npm rename failed; retry or remove leftover temp directory under the global npm prefix"
+	}
+	return "", ""
+}
+
+func appendHint(detail, hint string) string {
+	hint = strings.TrimSpace(hint)
+	if hint == "" {
+		return detail
+	}
+	if strings.TrimSpace(detail) == "" {
+		return "hint: " + hint
+	}
+	return detail + "; hint: " + hint
+}
+
+func shouldRetryNpmInstall(args []string, output string) bool {
+	if !isNpmInstall(args) {
+		return false
+	}
+	if strings.Contains(output, "ENOTEMPTY") {
+		return true
+	}
+	if strings.Contains(output, "errno -66") {
+		return true
+	}
+	if strings.Contains(output, "directory not empty") {
+		return true
+	}
+	return false
+}
+
+func formatRetryOutput(first, cleanupMsg, second string) string {
+	first = strings.TrimRight(first, "\n")
+	cleanupMsg = strings.TrimSpace(cleanupMsg)
+	second = strings.TrimSpace(second)
+	if first == "" {
+		return second
+	}
+	if second == "" {
+		return first
+	}
+	if cleanupMsg != "" {
+		return fmt.Sprintf("%s\n\n(uca) %s\n(uca) retrying npm install after ENOTEMPTY\n%s", first, cleanupMsg, second)
+	}
+	return fmt.Sprintf("%s\n\n(uca) retrying npm install after ENOTEMPTY\n%s", first, second)
+}
+
+func isNpmInstall(args []string) bool {
+	return len(args) >= 2 && args[0] == "npm" && args[1] == "install"
+}
+
+func cleanupNpmENotEmpty(output string) string {
+	path, dest := extractNpmRenamePaths(output)
+	if !isSafeNpmRenameTarget(path, dest) {
+		return ""
+	}
+	if _, err := os.Stat(dest); err != nil {
+		return ""
+	}
+	if err := os.RemoveAll(dest); err != nil {
+		return fmt.Sprintf("failed to remove stale npm temp dir %s: %v", dest, err)
+	}
+	return fmt.Sprintf("removed stale npm temp dir %s", dest)
+}
+
+func extractNpmRenamePaths(output string) (string, string) {
+	var path string
+	var dest string
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "npm error path ") {
+			path = strings.TrimSpace(strings.TrimPrefix(line, "npm error path "))
+			continue
+		}
+		if strings.HasPrefix(line, "npm error dest ") {
+			dest = strings.TrimSpace(strings.TrimPrefix(line, "npm error dest "))
+		}
+	}
+	if path != "" && dest != "" {
+		return path, dest
+	}
+	scanner = bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.Contains(line, "rename '") || !strings.Contains(line, "' -> '") {
+			continue
+		}
+		start := strings.Index(line, "rename '")
+		if start == -1 {
+			continue
+		}
+		start += len("rename '")
+		mid := strings.Index(line[start:], "' -> '")
+		if mid == -1 {
+			continue
+		}
+		path = line[start : start+mid]
+		rest := line[start+mid+len("' -> '"):]
+		end := strings.Index(rest, "'")
+		if end == -1 {
+			continue
+		}
+		dest = rest[:end]
+		break
+	}
+	return path, dest
+}
+
+func isSafeNpmRenameTarget(path, dest string) bool {
+	if path == "" || dest == "" {
+		return false
+	}
+	if !filepath.IsAbs(dest) || !filepath.IsAbs(path) {
+		return false
+	}
+	if filepath.Dir(path) != filepath.Dir(dest) {
+		return false
+	}
+	base := filepath.Base(path)
+	destBase := filepath.Base(dest)
+	if destBase == "." || destBase == ".." || base == "." || base == ".." {
+		return false
+	}
+	prefix := "." + base
+	if !strings.HasPrefix(destBase, prefix) {
+		return false
+	}
+	return true
+}
+
 func runCmdStdout(args []string) (string, int, time.Duration, error) {
 	start := time.Now()
 	cmd := exec.Command(args[0], args[1:]...)
@@ -1076,6 +1251,10 @@ func formatResult(res result, opts options) string {
 	case statusSkipped:
 		return fmt.Sprintf("%s: skipped (%s)", name, res.Reason)
 	case statusFailed:
+		reason := strings.TrimSpace(res.Reason)
+		if reason != "" {
+			return fmt.Sprintf("%s: failed (%s; %s -> %s (%s))", name, reason, safeVersion(res.Before), safeVersion(res.After), fmtDuration(res.Duration))
+		}
 		return fmt.Sprintf("%s: failed (%s -> %s (%s))", name, safeVersion(res.Before), safeVersion(res.After), fmtDuration(res.Duration))
 	case statusUpdated:
 		if opts.DryRun {

@@ -60,7 +60,7 @@ uca --explain
 ## Supported agents
 
 - amp (`amp update`)
-- gemini (`gemini update`)
+- gemini (npm `@google/gemini-cli` or `gemini update`)
 - claude (`claude update`)
 - codex (`bun update -g @openai/codex --latest`)
 - opencode (`bun update -g opencode-ai --latest`)
