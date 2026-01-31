@@ -21,10 +21,21 @@ const (
 	KindBun    = "bun"
 	KindBrew   = "brew"
 	KindNpm    = "npm"
+	KindPnpm   = "pnpm"
+	KindYarn   = "yarn"
 	KindPip    = "pip"
 	KindUv     = "uv"
 	KindVSCode = "vscode"
 )
+
+func nodePackageStrategies(pkg string) []UpdateStrategy {
+	return []UpdateStrategy{
+		{Kind: KindNpm, Package: pkg},
+		{Kind: KindPnpm, Package: pkg},
+		{Kind: KindYarn, Package: pkg},
+		{Kind: KindBun, Package: pkg},
+	}
+}
 
 // Default returns the built-in supported agents.
 func Default() []Agent {
@@ -39,10 +50,7 @@ func Default() []Agent {
 			Name:       "gemini",
 			Binary:     "gemini",
 			VersionCmd: []string{"gemini", "--version"},
-			Strategies: []UpdateStrategy{
-				{Kind: KindNpm, Package: "@google/gemini-cli"},
-				{Kind: KindNative, Command: []string{"gemini", "update"}},
-			},
+			Strategies: nodePackageStrategies("@google/gemini-cli"),
 		},
 		{
 			Name:       "claude",
@@ -54,13 +62,13 @@ func Default() []Agent {
 			Name:       "codex",
 			Binary:     "codex",
 			VersionCmd: []string{"codex", "--version"},
-			Strategies: []UpdateStrategy{{Kind: KindBun, Command: []string{"bun", "update", "-g", "@openai/codex", "--latest"}}},
+			Strategies: nodePackageStrategies("@openai/codex"),
 		},
 		{
 			Name:       "opencode",
 			Binary:     "opencode",
 			VersionCmd: []string{"opencode", "--version"},
-			Strategies: []UpdateStrategy{{Kind: KindBun, Command: []string{"bun", "update", "-g", "opencode-ai", "--latest"}}},
+			Strategies: nodePackageStrategies("opencode-ai"),
 		},
 		{
 			Name:       "cursor",
@@ -72,20 +80,14 @@ func Default() []Agent {
 			Name:       "copilot",
 			Binary:     "copilot",
 			VersionCmd: []string{"copilot", "--version"},
-			Strategies: []UpdateStrategy{
-				{Kind: KindBrew, Package: "copilot-cli"},
-				{Kind: KindNpm, Package: "@github/copilot"},
-			},
+			Strategies: append([]UpdateStrategy{{Kind: KindBrew, Package: "copilot-cli"}}, nodePackageStrategies("@github/copilot")...),
 		},
 		{
 			Name:        "cline",
 			Binary:      "cline",
 			VersionCmd:  []string{"cline", "--version"},
 			ExtensionID: "saoudrizwan.claude-dev",
-			Strategies: []UpdateStrategy{
-				{Kind: KindNpm, Package: "cline"},
-				{Kind: KindVSCode, ExtensionID: "saoudrizwan.claude-dev"},
-			},
+			Strategies:  append(nodePackageStrategies("cline"), UpdateStrategy{Kind: KindVSCode, ExtensionID: "saoudrizwan.claude-dev"}),
 		},
 		{
 			Name:        "roocode",
@@ -107,9 +109,7 @@ func Default() []Agent {
 			Name:       "pi",
 			Binary:     "pi",
 			VersionCmd: []string{"pi", "--version"},
-			Strategies: []UpdateStrategy{
-				{Kind: KindNpm, Package: "@mariozechner/pi-coding-agent"},
-			},
+			Strategies: nodePackageStrategies("@mariozechner/pi-coding-agent"),
 		},
 	}
 }

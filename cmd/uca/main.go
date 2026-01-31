@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,7 +19,6 @@ import (
 	"github.com/chhoumann/uca/internal/agents"
 	"github.com/mattn/go-runewidth"
 	"golang.org/x/term"
-	"strconv"
 )
 
 type options struct {
@@ -505,7 +506,16 @@ func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result
 	}()
 
 	go func() {
-		env.npmOnce.Do(env.loadNpmGlobals)
+		env.npmBinOnce.Do(env.loadNpmBin)
+	}()
+	go func() {
+		env.pnpmBinOnce.Do(env.loadPnpmBin)
+	}()
+	go func() {
+		env.yarnBinOnce.Do(env.loadYarnBin)
+	}()
+	go func() {
+		env.bunBinOnce.Do(env.loadBunGlobalBin)
 	}()
 	go func() {
 		env.uvOnce.Do(env.loadUvTools)
@@ -801,6 +811,10 @@ func methodLabel(method string) string {
 		return "brew"
 	case agents.KindNpm:
 		return "npm"
+	case agents.KindPnpm:
+		return "pnpm"
+	case agents.KindYarn:
+		return "yarn"
 	case agents.KindPip:
 		return "pip"
 	case agents.KindUv:
@@ -840,9 +854,17 @@ func colorize(text, status string, enabled bool) string {
 }
 
 func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string, string) {
-	bunMissing := false
 	codeMissing := false
 	detail := ""
+	nodeManager := ""
+	if agent.Binary != "" {
+		nodeManager = env.nodeManagerForBinary(agent.Binary)
+	}
+	packageManager := ""
+	packageName := nodePackageName(agent.Strategies)
+	if nodeManager == "" && packageName != "" {
+		packageManager = env.nodeManagerForPackage(packageName)
+	}
 
 	for _, strat := range agent.Strategies {
 		switch strat.Kind {
@@ -852,16 +874,32 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string,
 			}
 			detail = fmt.Sprintf("binary %s found; using built-in update", agent.Binary)
 			return strat.Command, "", strat.Kind, detail
-		case agents.KindBun:
-			if !env.hasBun {
-				bunMissing = true
+		case agents.KindBun, agents.KindNpm, agents.KindPnpm, agents.KindYarn:
+			if !env.hasNodeManager(strat.Kind) {
 				continue
 			}
-			if agent.Binary != "" && !env.hasBinary(agent.Binary) {
+			if agent.Binary == "" || strat.Package == "" {
 				continue
 			}
-			detail = "bun found; updating via bun"
-			return strat.Command, "", strat.Kind, detail
+			if nodeManager != "" {
+				if nodeManager != strat.Kind {
+					continue
+				}
+				detail = fmt.Sprintf("%s global bin has %s; updating via %s", strat.Kind, agent.Binary, strat.Kind)
+				return nodeUpdateCommand(strat), "", strat.Kind, detail
+			}
+			if packageManager != "" {
+				if packageManager != strat.Kind {
+					continue
+				}
+				detail = fmt.Sprintf("%s global package %s installed; updating via %s", strat.Kind, strat.Package, strat.Kind)
+				return nodeUpdateCommand(strat), "", strat.Kind, detail
+			}
+			if !env.nodeBinHasBinary(strat.Kind, agent.Binary) {
+				continue
+			}
+			detail = fmt.Sprintf("%s global bin has %s; updating via %s", strat.Kind, agent.Binary, strat.Kind)
+			return nodeUpdateCommand(strat), "", strat.Kind, detail
 		case agents.KindBrew:
 			if !env.hasBrew {
 				continue
@@ -869,14 +907,6 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string,
 			if env.brewHas(strat.Package) {
 				detail = fmt.Sprintf("brew formula %s installed", strat.Package)
 				return []string{"brew", "upgrade", strat.Package}, "", strat.Kind, detail
-			}
-		case agents.KindNpm:
-			if !env.hasNpm {
-				continue
-			}
-			if env.npmHas(strat.Package) {
-				detail = fmt.Sprintf("npm global package %s installed", strat.Package)
-				return []string{"npm", "install", "-g", strat.Package}, "", strat.Kind, detail
 			}
 		case agents.KindPip:
 			if !env.hasPython {
@@ -906,9 +936,6 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string,
 		}
 	}
 
-	if bunMissing {
-		return nil, reasonMissingBun, "", "bun not found; required for update"
-	}
 	if codeMissing {
 		return nil, reasonMissingCode, "", "VS Code CLI not found (code/codium/code-insiders)"
 	}
@@ -916,6 +943,36 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string,
 		return nil, reasonManualInstall, "", "binary found but no supported install method detected"
 	}
 	return nil, reasonMissing, "", "no supported binary or install method detected"
+}
+
+func nodeUpdateCommand(strat agents.UpdateStrategy) []string {
+	if len(strat.Command) > 0 {
+		return strat.Command
+	}
+	switch strat.Kind {
+	case agents.KindNpm:
+		return []string{"npm", "install", "-g", strat.Package}
+	case agents.KindPnpm:
+		return []string{"pnpm", "add", "-g", strat.Package}
+	case agents.KindYarn:
+		return []string{"yarn", "global", "add", strat.Package}
+	case agents.KindBun:
+		return []string{"bun", "add", "-g", strat.Package}
+	default:
+		return strat.Command
+	}
+}
+
+func nodePackageName(strategies []agents.UpdateStrategy) string {
+	for _, strat := range strategies {
+		switch strat.Kind {
+		case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun:
+			if strat.Package != "" {
+				return strat.Package
+			}
+		}
+	}
+	return ""
 }
 
 func getVersion(agent agents.Agent, env *envState, method string) string {
@@ -1377,29 +1434,47 @@ type envState struct {
 	hasBun    bool
 	hasBrew   bool
 	hasNpm    bool
+	hasPnpm   bool
+	hasYarn   bool
 	hasUv     bool
 	hasPython bool
 	codeCmd   string
 
-	mu         sync.Mutex
-	binCache   map[string]bool
-	npmOnce    sync.Once
-	npmGlobals map[string]bool
-	uvOnce     sync.Once
-	uvTools    map[string]bool
-	codeOnce   sync.Once
-	codeExts   map[string]string
+	mu           sync.Mutex
+	binPathCache map[string]string
+	npmBinOnce   sync.Once
+	npmBin       string
+	npmPkgOnce   sync.Once
+	npmPkgs      map[string]bool
+	pnpmBinOnce  sync.Once
+	pnpmBin      string
+	pnpmPkgOnce  sync.Once
+	pnpmPkgs     map[string]bool
+	yarnBinOnce  sync.Once
+	yarnBin      string
+	yarnPkgOnce  sync.Once
+	yarnPkgs     map[string]bool
+	bunBinOnce   sync.Once
+	bunGlobalBin string
+	bunPkgOnce   sync.Once
+	bunPkgs      map[string]bool
+	uvOnce       sync.Once
+	uvTools      map[string]bool
+	codeOnce     sync.Once
+	codeExts     map[string]string
 }
 
 func newEnv() *envState {
 	return &envState{
-		hasBun:    hasBinary("bun"),
-		hasBrew:   hasBinary("brew"),
-		hasNpm:    hasBinary("npm"),
-		hasUv:     hasBinary("uv"),
-		hasPython: hasBinary("python3"),
-		codeCmd:   detectCodeCmd(),
-		binCache:  map[string]bool{},
+		hasBun:       hasBinary("bun"),
+		hasBrew:      hasBinary("brew"),
+		hasNpm:       hasBinary("npm"),
+		hasPnpm:      hasBinary("pnpm"),
+		hasYarn:      hasBinary("yarn"),
+		hasUv:        hasBinary("uv"),
+		hasPython:    hasBinary("python3"),
+		codeCmd:      detectCodeCmd(),
+		binPathCache: map[string]string{},
 	}
 }
 
@@ -1414,15 +1489,7 @@ func detectCodeCmd() string {
 }
 
 func (e *envState) hasBinary(name string) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if val, ok := e.binCache[name]; ok {
-		return val
-	}
-	_, err := exec.LookPath(name)
-	ok := err == nil
-	e.binCache[name] = ok
-	return ok
+	return e.binaryPath(name) != ""
 }
 
 func hasBinary(name string) bool {
@@ -1430,13 +1497,169 @@ func hasBinary(name string) bool {
 	return err == nil
 }
 
-func (e *envState) npmHas(pkg string) bool {
-	e.npmOnce.Do(e.loadNpmGlobals)
-	return e.npmGlobals[pkg]
+func (e *envState) binaryPath(name string) string {
+	if name == "" {
+		return ""
+	}
+	e.mu.Lock()
+	if path, ok := e.binPathCache[name]; ok {
+		e.mu.Unlock()
+		return path
+	}
+	e.mu.Unlock()
+	path, err := exec.LookPath(name)
+	if err != nil {
+		path = ""
+	} else {
+		path = filepath.Clean(path)
+	}
+	e.mu.Lock()
+	e.binPathCache[name] = path
+	e.mu.Unlock()
+	return path
 }
 
-func (e *envState) loadNpmGlobals() {
-	e.npmGlobals = map[string]bool{}
+func (e *envState) hasNodeManager(kind string) bool {
+	switch kind {
+	case agents.KindNpm:
+		return e.hasNpm
+	case agents.KindPnpm:
+		return e.hasPnpm
+	case agents.KindYarn:
+		return e.hasYarn
+	case agents.KindBun:
+		return e.hasBun
+	default:
+		return false
+	}
+}
+
+func (e *envState) nodeManagerForBinary(name string) string {
+	binPath := e.binaryPath(name)
+	if binPath == "" {
+		return ""
+	}
+	binDir := filepath.Dir(binPath)
+	resolvedBinDir := ""
+	if resolvedPath := resolveSymlinkPath(binPath); resolvedPath != "" {
+		resolvedBinDir = filepath.Dir(resolvedPath)
+	}
+	matches := []string{}
+	for _, kind := range []string{agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun} {
+		if !e.hasNodeManager(kind) {
+			continue
+		}
+		dir := e.nodeBinDir(kind)
+		if dir == "" {
+			continue
+		}
+		if samePath(dir, binDir) || (resolvedBinDir != "" && samePath(dir, resolvedBinDir)) {
+			matches = append(matches, kind)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	if len(matches) > 1 {
+		bestKind := ""
+		bestLen := -1
+		tie := false
+		for _, kind := range matches {
+			dir := e.nodeBinDir(kind)
+			if len(dir) > bestLen {
+				bestLen = len(dir)
+				bestKind = kind
+				tie = false
+				continue
+			}
+			if len(dir) == bestLen {
+				tie = true
+			}
+		}
+		if !tie {
+			return bestKind
+		}
+	}
+	return ""
+}
+
+func (e *envState) nodeBinHasBinary(kind, name string) bool {
+	return binDirHasBinary(e.nodeBinDir(kind), name)
+}
+
+func (e *envState) nodeBinDir(kind string) string {
+	switch kind {
+	case agents.KindNpm:
+		return e.npmBinDir()
+	case agents.KindPnpm:
+		return e.pnpmBinDir()
+	case agents.KindYarn:
+		return e.yarnBinDir()
+	case agents.KindBun:
+		return e.bunGlobalBinDir()
+	default:
+		return ""
+	}
+}
+
+func (e *envState) nodeManagerForPackage(pkg string) string {
+	if pkg == "" {
+		return ""
+	}
+	matches := []string{}
+	for _, kind := range []string{agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun} {
+		if !e.hasNodeManager(kind) {
+			continue
+		}
+		if e.nodeManagerHasPackage(kind, pkg) {
+			matches = append(matches, kind)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	return ""
+}
+
+func (e *envState) nodeManagerHasPackage(kind, pkg string) bool {
+	switch kind {
+	case agents.KindNpm:
+		return e.npmHas(pkg)
+	case agents.KindPnpm:
+		return e.pnpmHas(pkg)
+	case agents.KindYarn:
+		return e.yarnHas(pkg)
+	case agents.KindBun:
+		return e.bunHas(pkg)
+	default:
+		return false
+	}
+}
+
+func (e *envState) npmBinDir() string {
+	e.npmBinOnce.Do(e.loadNpmBin)
+	return e.npmBin
+}
+
+func (e *envState) loadNpmBin() {
+	e.npmBin = ""
+	if !e.hasNpm {
+		return
+	}
+	out, exitCode, _, _ := runCmdStdout([]string{"npm", "bin", "-g"})
+	if exitCode != 0 {
+		return
+	}
+	e.npmBin = strings.TrimSpace(out)
+}
+
+func (e *envState) npmHas(pkg string) bool {
+	e.npmPkgOnce.Do(e.loadNpmPkgs)
+	return e.npmPkgs[pkg]
+}
+
+func (e *envState) loadNpmPkgs() {
+	e.npmPkgs = map[string]bool{}
 	if !e.hasNpm {
 		return
 	}
@@ -1448,8 +1671,225 @@ func (e *envState) loadNpmGlobals() {
 		return
 	}
 	for name := range payload.Dependencies {
-		e.npmGlobals[name] = true
+		e.npmPkgs[name] = true
 	}
+}
+
+func (e *envState) pnpmBinDir() string {
+	e.pnpmBinOnce.Do(e.loadPnpmBin)
+	return e.pnpmBin
+}
+
+func (e *envState) loadPnpmBin() {
+	e.pnpmBin = ""
+	if !e.hasPnpm {
+		return
+	}
+	out, exitCode, _, _ := runCmdStdout([]string{"pnpm", "bin", "-g"})
+	if exitCode != 0 {
+		return
+	}
+	e.pnpmBin = strings.TrimSpace(out)
+}
+
+func (e *envState) pnpmHas(pkg string) bool {
+	e.pnpmPkgOnce.Do(e.loadPnpmPkgs)
+	return e.pnpmPkgs[pkg]
+}
+
+func (e *envState) loadPnpmPkgs() {
+	e.pnpmPkgs = map[string]bool{}
+	if !e.hasPnpm {
+		return
+	}
+	out, _, _, _ := runCmdStdout([]string{"pnpm", "list", "-g", "--depth=0", "--json"})
+	type pnpmPayload struct {
+		Dependencies map[string]any `json:"dependencies"`
+	}
+	var list []pnpmPayload
+	if err := json.Unmarshal([]byte(out), &list); err == nil {
+		for _, entry := range list {
+			for name := range entry.Dependencies {
+				e.pnpmPkgs[name] = true
+			}
+		}
+		return
+	}
+	var single pnpmPayload
+	if err := json.Unmarshal([]byte(out), &single); err != nil {
+		return
+	}
+	for name := range single.Dependencies {
+		e.pnpmPkgs[name] = true
+	}
+}
+
+func (e *envState) yarnBinDir() string {
+	e.yarnBinOnce.Do(e.loadYarnBin)
+	return e.yarnBin
+}
+
+func (e *envState) loadYarnBin() {
+	e.yarnBin = ""
+	if !e.hasYarn {
+		return
+	}
+	out, exitCode, _, _ := runCmdStdout([]string{"yarn", "global", "bin"})
+	if exitCode != 0 {
+		return
+	}
+	e.yarnBin = strings.TrimSpace(out)
+}
+
+func (e *envState) yarnHas(pkg string) bool {
+	e.yarnPkgOnce.Do(e.loadYarnPkgs)
+	return e.yarnPkgs[pkg]
+}
+
+func (e *envState) loadYarnPkgs() {
+	e.yarnPkgs = map[string]bool{}
+	if !e.hasYarn {
+		return
+	}
+	out, exitCode, _, _ := runCmdStdout([]string{"yarn", "global", "list", "--depth=0"})
+	if exitCode != 0 {
+		return
+	}
+	for name := range parsePackageListOutput(out) {
+		e.yarnPkgs[name] = true
+	}
+}
+
+func (e *envState) bunGlobalBinDir() string {
+	e.bunBinOnce.Do(e.loadBunGlobalBin)
+	return e.bunGlobalBin
+}
+
+func (e *envState) loadBunGlobalBin() {
+	e.bunGlobalBin = ""
+	if !e.hasBun {
+		return
+	}
+	out, exitCode, _, _ := runCmdStdout([]string{"bun", "pm", "bin", "-g"})
+	if exitCode != 0 {
+		return
+	}
+	e.bunGlobalBin = strings.TrimSpace(out)
+}
+
+func (e *envState) bunHas(pkg string) bool {
+	e.bunPkgOnce.Do(e.loadBunPkgs)
+	return e.bunPkgs[pkg]
+}
+
+func (e *envState) loadBunPkgs() {
+	e.bunPkgs = map[string]bool{}
+	if !e.hasBun {
+		return
+	}
+	out, exitCode, _, _ := runCmdStdout([]string{"bun", "pm", "ls", "-g"})
+	if exitCode != 0 {
+		return
+	}
+	for name := range parsePackageListOutput(out) {
+		e.bunPkgs[name] = true
+	}
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func binDirHasBinary(binDir, name string) bool {
+	if binDir == "" || name == "" {
+		return false
+	}
+	candidates := []string{filepath.Join(binDir, name)}
+	if runtime.GOOS == "windows" {
+		candidates = append(candidates,
+			filepath.Join(binDir, name+".exe"),
+			filepath.Join(binDir, name+".cmd"),
+			filepath.Join(binDir, name+".bat"),
+		)
+	}
+	for _, candidate := range candidates {
+		if fileExists(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func samePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	a = filepath.Clean(a)
+	b = filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	if a == b {
+		return true
+	}
+	ra := resolveSymlinkPath(a)
+	rb := resolveSymlinkPath(b)
+	if ra != "" && rb != "" {
+		return ra == rb
+	}
+	if ra != "" && ra == b {
+		return true
+	}
+	if rb != "" && rb == a {
+		return true
+	}
+	return false
+}
+
+func resolveSymlinkPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return ""
+	}
+	return filepath.Clean(resolved)
+}
+
+func parsePackageListOutput(out string) map[string]bool {
+	pkgs := map[string]bool{}
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		for _, token := range strings.Fields(line) {
+			if name := parsePackageFromToken(token); name != "" {
+				pkgs[name] = true
+			}
+		}
+	}
+	return pkgs
+}
+
+func parsePackageFromToken(token string) string {
+	if token == "" {
+		return ""
+	}
+	token = strings.Trim(token, "\"'`,")
+	token = strings.TrimRight(token, "):,")
+	token = strings.TrimLeft(token, "(")
+	if !strings.Contains(token, "@") {
+		return ""
+	}
+	idx := strings.LastIndex(token, "@")
+	if idx <= 0 || idx == len(token)-1 {
+		return ""
+	}
+	return token[:idx]
 }
 
 func (e *envState) uvHas(pkg string) bool {

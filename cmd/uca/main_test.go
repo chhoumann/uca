@@ -3,8 +3,11 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/chhoumann/uca/internal/agents"
 )
 
 func TestParseVersionOutput(t *testing.T) {
@@ -175,7 +178,7 @@ func TestClassifyUpdateFailure(t *testing.T) {
 	}{
 		{
 			name:       "quota",
-			args:       []string{"gemini", "update"},
+			args:       []string{"gemini", "--version"},
 			output:     "TerminalQuotaError: You have exhausted your capacity on this model.",
 			wantReason: reasonQuota,
 			wantHint:   "quota exceeded",
@@ -189,7 +192,7 @@ func TestClassifyUpdateFailure(t *testing.T) {
 		},
 		{
 			name:       "enotempty_non_npm",
-			args:       []string{"gemini", "update"},
+			args:       []string{"gemini", "--version"},
 			output:     "ENOTEMPTY",
 			wantReason: "",
 			wantHint:   "",
@@ -277,6 +280,88 @@ func TestIsNpmInstall(t *testing.T) {
 				t.Fatalf("isNpmInstall() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNodeManagerForBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping PATH-based binary detection test on windows")
+	}
+	dir := t.TempDir()
+	binName := "fakecli"
+	binPath := filepath.Join(dir, binName)
+	if err := os.WriteFile(binPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write fake binary: %v", err)
+	}
+	origPath := os.Getenv("PATH")
+	if err := os.Setenv("PATH", dir+string(os.PathListSeparator)+origPath); err != nil {
+		t.Fatalf("set PATH: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Setenv("PATH", origPath)
+	})
+
+	env := &envState{
+		hasNpm:       true,
+		binPathCache: map[string]string{},
+		npmBin:       dir,
+	}
+	env.npmBinOnce.Do(func() {})
+
+	if got := env.nodeManagerForBinary(binName); got != agents.KindNpm {
+		t.Fatalf("nodeManagerForBinary() = %q, want %q", got, agents.KindNpm)
+	}
+}
+
+func TestNodeManagerForBinarySymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping symlink detection test on windows")
+	}
+	binDir := t.TempDir()
+	targetDir := t.TempDir()
+	binName := "fakecli"
+	targetPath := filepath.Join(targetDir, binName)
+	if err := os.WriteFile(targetPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write target binary: %v", err)
+	}
+	linkPath := filepath.Join(binDir, binName)
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	origPath := os.Getenv("PATH")
+	if err := os.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath); err != nil {
+		t.Fatalf("set PATH: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Setenv("PATH", origPath)
+	})
+
+	env := &envState{
+		hasNpm:       true,
+		binPathCache: map[string]string{},
+		npmBin:       targetDir,
+	}
+	env.npmBinOnce.Do(func() {})
+
+	if got := env.nodeManagerForBinary(binName); got != agents.KindNpm {
+		t.Fatalf("nodeManagerForBinary() = %q, want %q", got, agents.KindNpm)
+	}
+}
+
+func TestParsePackageFromToken(t *testing.T) {
+	tests := []struct {
+		token string
+		want  string
+	}{
+		{token: "\"@google/gemini-cli@1.2.3\"", want: "@google/gemini-cli"},
+		{token: "opencode-ai@0.1.0", want: "opencode-ai"},
+		{token: "nope", want: ""},
+		{token: "@scope/nover@", want: ""},
+	}
+	for _, tt := range tests {
+		if got := parsePackageFromToken(tt.token); got != tt.want {
+			t.Fatalf("parsePackageFromToken(%q) = %q, want %q", tt.token, got, tt.want)
+		}
 	}
 }
 

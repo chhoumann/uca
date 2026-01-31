@@ -60,16 +60,16 @@ uca --explain
 ## Supported agents
 
 - amp (`amp update`)
-- gemini (npm `@google/gemini-cli` or `gemini update`)
+- gemini (npm/pnpm/yarn/bun `@google/gemini-cli`)
 - claude (`claude update`)
-- codex (`bun update -g @openai/codex --latest`)
-- opencode (`bun update -g opencode-ai --latest`)
+- codex (npm/pnpm/yarn/bun `@openai/codex`)
+- opencode (npm/pnpm/yarn/bun `opencode-ai`)
 - cursor (`cursor-agent update`)
-- copilot (Homebrew `copilot-cli` or npm `@github/copilot`)
-- cline (npm `cline` or VS Code extension `saoudrizwan.claude-dev`)
+- copilot (Homebrew `copilot-cli` or npm/pnpm/yarn/bun `@github/copilot`)
+- cline (npm/pnpm/yarn/bun `cline` or VS Code extension `saoudrizwan.claude-dev`)
 - roocode (VS Code extension `RooVeterinaryInc.roo-cline`)
 - aider (uv tool `aider-chat` or pip `aider-chat`)
-- pi (npm `@mariozechner/pi-coding-agent`)
+- pi (npm/pnpm/yarn/bun `@mariozechner/pi-coding-agent`)
 
 ## Live output
 
@@ -80,7 +80,7 @@ When `uca` is run in a TTY, it shows a live status dashboard with progress, vers
 `uca` only updates agents it can confidently detect. It checks:
 - built-in update commands for native CLIs
 - Homebrew formulas
-- npm global packages
+- npm/pnpm/yarn/bun global bins
 - uv tool installs
 - pip packages
 - VS Code extensions (via `code`, `codium`, or `code-insiders`)
