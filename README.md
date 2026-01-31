@@ -80,7 +80,7 @@ When `uca` is run in a TTY, it shows a live status dashboard with progress, vers
 `uca` only updates agents it can confidently detect. It checks:
 - built-in update commands for native CLIs
 - Homebrew formulas
-- npm/pnpm/yarn/bun global bins
+- npm/pnpm/yarn/bun global bins and package lists
 - uv tool installs
 - pip packages
 - VS Code extensions (via `code`, `codium`, or `code-insiders`)

@@ -509,13 +509,25 @@ func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result
 		env.npmBinOnce.Do(env.loadNpmBin)
 	}()
 	go func() {
+		env.npmPkgOnce.Do(env.loadNpmPkgs)
+	}()
+	go func() {
 		env.pnpmBinOnce.Do(env.loadPnpmBin)
+	}()
+	go func() {
+		env.pnpmPkgOnce.Do(env.loadPnpmPkgs)
 	}()
 	go func() {
 		env.yarnBinOnce.Do(env.loadYarnBin)
 	}()
 	go func() {
+		env.yarnPkgOnce.Do(env.loadYarnPkgs)
+	}()
+	go func() {
 		env.bunBinOnce.Do(env.loadBunGlobalBin)
+	}()
+	go func() {
+		env.bunPkgOnce.Do(env.loadBunPkgs)
 	}()
 	go func() {
 		env.uvOnce.Do(env.loadUvTools)
@@ -885,20 +897,20 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string,
 				if nodeManager != strat.Kind {
 					continue
 				}
-				detail = fmt.Sprintf("%s global bin has %s; updating via %s", strat.Kind, agent.Binary, strat.Kind)
+				detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
 				return nodeUpdateCommand(strat), "", strat.Kind, detail
 			}
 			if packageManager != "" {
 				if packageManager != strat.Kind {
 					continue
 				}
-				detail = fmt.Sprintf("%s global package %s installed; updating via %s", strat.Kind, strat.Package, strat.Kind)
+				detail = fmt.Sprintf("%s global package %s installed; matched by package list; updating via %s", strat.Kind, strat.Package, strat.Kind)
 				return nodeUpdateCommand(strat), "", strat.Kind, detail
 			}
 			if !env.nodeBinHasBinary(strat.Kind, agent.Binary) {
 				continue
 			}
-			detail = fmt.Sprintf("%s global bin has %s; updating via %s", strat.Kind, agent.Binary, strat.Kind)
+			detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
 			return nodeUpdateCommand(strat), "", strat.Kind, detail
 		case agents.KindBrew:
 			if !env.hasBrew {
