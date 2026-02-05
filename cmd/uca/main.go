@@ -3,17 +3,21 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/chhoumann/uca/internal/agents"
@@ -24,14 +28,19 @@ import (
 type options struct {
 	Parallel bool
 	Serial   bool
-	Verbose  bool
-	Quiet    bool
-	DryRun   bool
-	Explain  bool
-	Only     string
-	Skip     string
-	Help     bool
-	Version  bool
+	Safe     bool
+	Timeout  time.Duration
+	// Concurrency limits how many update commands are allowed to run at once.
+	// 0 means "no limit" (default).
+	Concurrency int
+	Verbose     bool
+	Quiet       bool
+	DryRun      bool
+	Explain     bool
+	Only        string
+	Skip        string
+	Help        bool
+	Version     bool
 }
 
 type result struct {
@@ -66,6 +75,9 @@ const (
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	opts := parseFlags()
 	if opts.Help {
 		usage()
@@ -79,9 +91,9 @@ func main() {
 	all := agents.Default()
 	selected, unknown := filterAgents(all, opts.Only, opts.Skip)
 
-	env := newEnv()
+	env := newEnv(ctx)
 	uiEnabled := shouldShowUI(opts)
-	results := runAll(selected, env, opts, uiEnabled)
+	results := runAll(ctx, selected, env, opts, uiEnabled)
 
 	if !uiEnabled {
 		printResults(results, opts)
@@ -104,6 +116,9 @@ func parseFlags() options {
 	flag.BoolVar(&opts.Parallel, "p", false, "run updates in parallel")
 	flag.BoolVar(&opts.Parallel, "parallel", false, "run updates in parallel")
 	flag.BoolVar(&opts.Serial, "serial", false, "run updates sequentially")
+	flag.BoolVar(&opts.Safe, "safe", false, "use safer execution (limits concurrency)")
+	flag.DurationVar(&opts.Timeout, "timeout", 15*time.Minute, "timeout per update command (0 disables)")
+	flag.IntVar(&opts.Concurrency, "concurrency", 0, "max concurrent update commands (0 disables)")
 	flag.BoolVar(&opts.Verbose, "v", false, "show update command output")
 	flag.BoolVar(&opts.Verbose, "verbose", false, "show update command output")
 	flag.BoolVar(&opts.Quiet, "q", false, "summary only")
@@ -129,6 +144,9 @@ Usage:
 Options:
   -p, --parallel    run updates in parallel (default)
       --serial      run updates sequentially
+      --safe        safer execution (limits concurrency)
+      --timeout D   timeout per update command (0 disables, default 15m)
+      --concurrency N max concurrent update commands (0 disables)
   -v, --verbose     show update command output for each agent
   -q, --quiet       suppress per-agent version lines (summary only)
   -n, --dry-run     print commands that would run, do not execute
@@ -215,90 +233,334 @@ func isTTY(file *os.File) bool {
 	return (stat.Mode() & os.ModeCharDevice) != 0
 }
 
-func runAll(selected []agents.Agent, env *envState, opts options, uiEnabled bool) []result {
-	if opts.Serial {
-		return runAllWithoutUI(selected, env, opts)
-	}
-
+func runAll(ctx context.Context, selected []agents.Agent, env *envState, opts options, uiEnabled bool) []result {
 	if uiEnabled {
-		return runAllWithUI(selected, env, opts)
+		return runAllWithUI(ctx, selected, env, opts)
 	}
-
-	return runAllWithoutUI(selected, env, opts)
+	return runAllWithEvents(ctx, selected, env, opts, nil)
 }
 
-func runAllWithoutUI(selected []agents.Agent, env *envState, opts options) []result {
-	results := make([]result, len(selected))
+type agentWork struct {
+	agent           agents.Agent
+	index           int
+	show            bool
+	method          string
+	explain         string
+	reason          string
+	nodePackageName string
+	// updateCmd is the final command to run (may be a batch command).
+	updateCmd []string
+	// updateCmdSingle is the per-agent command (used for fallback when batch updates fail).
+	updateCmdSingle []string
+}
+
+type updateTask struct {
+	kind   string
+	cmd    []string
+	agents []agentWork
+}
+
+type managerLocker struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+func newManagerLocker() *managerLocker {
+	return &managerLocker{locks: map[string]*sync.Mutex{}}
+}
+
+func (l *managerLocker) lock(kind string) func() {
+	if kind == "" {
+		return func() {}
+	}
+	l.mu.Lock()
+	m, ok := l.locks[kind]
+	if !ok {
+		m = &sync.Mutex{}
+		l.locks[kind] = m
+	}
+	l.mu.Unlock()
+	m.Lock()
+	return func() { m.Unlock() }
+}
+
+func shouldLockKind(kind string) bool {
+	switch kind {
+	case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun, agents.KindBrew, agents.KindPip, agents.KindUv, agents.KindVSCode:
+		return true
+	default:
+		return false
+	}
+}
+
+func isNodeKind(kind string) bool {
+	switch kind {
+	case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun:
+		return true
+	default:
+		return false
+	}
+}
+
+func effectiveConcurrency(opts options, numTasks int) int {
 	if opts.Serial {
-		for i, agent := range selected {
-			results[i] = runAgent(agent, env, opts)
+		return 1
+	}
+	if opts.Safe && opts.Concurrency == 0 {
+		return 1
+	}
+	if opts.Concurrency > 0 {
+		return opts.Concurrency
+	}
+	if numTasks <= 0 {
+		return 1
+	}
+	return numTasks
+}
+
+func nodeBatchUpdateCommand(kind string, pkgs []string) []string {
+	args := []string{}
+	switch kind {
+	case agents.KindNpm:
+		args = append(args, "npm", "update", "-g")
+	case agents.KindPnpm:
+		args = append(args, "pnpm", "add", "-g")
+	case agents.KindYarn:
+		args = append(args, "yarn", "global", "add")
+	case agents.KindBun:
+		args = append(args, "bun", "add", "-g")
+	default:
+		return nil
+	}
+	args = append(args, pkgs...)
+	return args
+}
+
+func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envState, opts options, events chan<- updateEvent) []result {
+	results := make([]result, len(selected))
+	works := make([]agentWork, len(selected))
+
+	for i, agent := range selected {
+		updateCmd, reason, method, detail := resolveUpdate(agent, env)
+		show := updateCmd != nil || reason == reasonManualInstall
+		work := agentWork{
+			agent:           agent,
+			index:           i,
+			show:            show,
+			method:          method,
+			explain:         detail,
+			reason:          reason,
+			updateCmdSingle: updateCmd,
 		}
+		if isNodeKind(method) {
+			work.nodePackageName = nodePackageName(agent.Strategies)
+		}
+		works[i] = work
+	}
+
+	// Build tasks (batch node updates by manager kind).
+	tasks := []updateTask{}
+	nodeGroups := map[string][]int{}
+	for i := range works {
+		work := &works[i]
+		if work.updateCmdSingle == nil {
+			continue
+		}
+		if isNodeKind(work.method) {
+			nodeGroups[work.method] = append(nodeGroups[work.method], i)
+			continue
+		}
+		work.updateCmd = work.updateCmdSingle
+		tasks = append(tasks, updateTask{kind: work.method, cmd: work.updateCmd, agents: []agentWork{*work}})
+	}
+	for kind, indexes := range nodeGroups {
+		pkgSet := map[string]bool{}
+		pkgs := make([]string, 0, len(indexes))
+		batchIndexes := make([]int, 0, len(indexes))
+		for _, idx := range indexes {
+			pkg := strings.TrimSpace(works[idx].nodePackageName)
+			if pkg == "" {
+				works[idx].updateCmd = works[idx].updateCmdSingle
+				tasks = append(tasks, updateTask{kind: kind, cmd: works[idx].updateCmd, agents: []agentWork{works[idx]}})
+				continue
+			}
+			if !pkgSet[pkg] {
+				pkgSet[pkg] = true
+				pkgs = append(pkgs, pkg)
+			}
+			batchIndexes = append(batchIndexes, idx)
+		}
+		if len(batchIndexes) == 0 {
+			continue
+		}
+		sort.Strings(pkgs)
+		cmd := nodeBatchUpdateCommand(kind, pkgs)
+		group := make([]agentWork, 0, len(indexes))
+		for _, idx := range batchIndexes {
+			works[idx].updateCmd = cmd
+			group = append(group, works[idx])
+		}
+		tasks = append(tasks, updateTask{kind: kind, cmd: cmd, agents: group})
+	}
+
+	// Emit detect events and handle skipped/dry-run results.
+	now := time.Now()
+	for _, work := range works {
+		res := result{
+			Agent:     work.agent,
+			Method:    work.method,
+			Explain:   work.explain,
+			UpdateCmd: cmdString(work.updateCmd),
+		}
+
+		if work.updateCmdSingle == nil {
+			res.Status = statusSkipped
+			if work.reason == "" {
+				res.Reason = reasonMissing
+			} else {
+				res.Reason = work.reason
+			}
+			results[work.index] = res
+			if events != nil {
+				events <- updateEvent{Index: work.index, Phase: phaseDetect, Result: res, Time: now, Show: work.show}
+				events <- updateEvent{Index: work.index, Phase: phaseFinish, Result: res, Time: now, Show: work.show}
+			}
+			continue
+		}
+
+		if opts.DryRun {
+			res.Status = statusUpdated
+			res.Reason = "dry-run"
+			results[work.index] = res
+			if events != nil {
+				events <- updateEvent{Index: work.index, Phase: phaseDetect, Result: res, Time: now, Show: work.show}
+				events <- updateEvent{Index: work.index, Phase: phaseFinish, Result: res, Time: now, Show: work.show}
+			}
+			continue
+		}
+
+		if events != nil {
+			events <- updateEvent{Index: work.index, Phase: phaseDetect, Result: res, Time: now, Show: work.show}
+		}
+	}
+
+	if opts.DryRun {
 		return results
 	}
+
+	locker := newManagerLocker()
+	taskCh := make(chan updateTask)
 	var wg sync.WaitGroup
-	wg.Add(len(selected))
-	for i := range selected {
-		i := i
+	workerCount := effectiveConcurrency(opts, len(tasks))
+	if workerCount > len(tasks) {
+		workerCount = len(tasks)
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	wg.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
 		go func() {
 			defer wg.Done()
-			results[i] = runAgent(selected[i], env, opts)
+			for task := range taskCh {
+				runTask(ctx, task, env, opts, locker, events, results)
+			}
 		}()
 	}
+	for _, task := range tasks {
+		taskCh <- task
+	}
+	close(taskCh)
 	wg.Wait()
+
 	return results
 }
 
-func shouldShowInUI(agent agents.Agent, env *envState) (bool, string) {
-	updateCmd, reason, _, _ := resolveUpdate(agent, env)
-	if updateCmd != nil {
-		return true, ""
+func runTask(ctx context.Context, task updateTask, env *envState, opts options, locker *managerLocker, events chan<- updateEvent, results []result) {
+	if len(task.agents) == 0 {
+		return
 	}
-	if reason == reasonManualInstall {
-		return true, reason
+
+	kind := task.kind
+	unlock := func() {}
+	if shouldLockKind(kind) {
+		unlock = locker.lock(kind)
 	}
-	return false, reason
-}
+	defer unlock()
 
-func runAgent(agent agents.Agent, env *envState, opts options) result {
-	res := result{Agent: agent}
-
-	updateCmd, reason, method, detail := resolveUpdate(agent, env)
-	if updateCmd == nil {
-		res.Status = statusSkipped
-		if reason == "" {
-			res.Reason = reasonMissing
-		} else {
-			res.Reason = reason
+	// Prepare results and emit start events.
+	prepared := make([]result, len(task.agents))
+	for i, work := range task.agents {
+		res := result{
+			Agent:     work.agent,
+			Method:    work.method,
+			Explain:   work.explain,
+			UpdateCmd: cmdString(work.updateCmd),
 		}
-		res.Explain = detail
-		return res
+		res.Before = getVersion(ctx, work.agent, env, work.method)
+		prepared[i] = res
+	}
+	startTime := time.Now()
+	if events != nil {
+		for i, work := range task.agents {
+			events <- updateEvent{Index: work.index, Phase: phaseStart, Result: prepared[i], Time: startTime, Show: work.show}
+		}
 	}
 
-	res.Method = method
-	res.Explain = detail
-	res.UpdateCmd = cmdString(updateCmd)
-	if opts.DryRun {
-		res.Status = statusUpdated
-		res.Reason = "dry-run"
-		return res
+	out, classifyOut, exitCode, duration, _ := runUpdateCmd(ctx, task.cmd, opts.Timeout)
+
+	// If a batched node update fails, fall back to per-package updates so we can still make progress and
+	// attribute failures precisely.
+	if exitCode != 0 && len(task.agents) > 1 && isNodeKind(kind) {
+		for i, work := range task.agents {
+			res := prepared[i]
+			res.Explain = appendHint(res.Explain, "batch update failed; retrying individually")
+
+			indOut, indClassifyOut, indExitCode, indDuration, _ := runUpdateCmd(ctx, work.updateCmdSingle, opts.Timeout)
+			res.Duration = indDuration
+			res.Log = strings.TrimRight(out, "\n")
+			if strings.TrimSpace(res.Log) != "" && strings.TrimSpace(indOut) != "" {
+				res.Log += "\n\n(uca) retrying individually after batch failure\n"
+			} else if strings.TrimSpace(res.Log) != "" {
+				res.Log += "\n"
+			}
+			res.Log += strings.TrimSpace(indOut)
+			res.After = getVersion(ctx, work.agent, env, work.method)
+
+			if indExitCode != 0 {
+				setFailureResult(&res, indExitCode, work.updateCmdSingle, indClassifyOut, opts.Timeout)
+			} else if res.Before != "" && res.After != "" && res.Before == res.After && res.Before != "unknown" {
+				res.Status = statusUnchanged
+			} else {
+				res.Status = statusUpdated
+			}
+			results[work.index] = res
+			if events != nil {
+				events <- updateEvent{Index: work.index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: work.show}
+			}
+		}
+		return
 	}
 
-	res.Before = getVersion(agent, env, method)
-	out, classifyOut, exitCode, duration, _ := runUpdateCmd(updateCmd)
-	res.Duration = duration
-	res.Log = out
-	res.After = getVersion(agent, env, method)
+	// Batch success or non-batch failure path.
+	for i, work := range task.agents {
+		res := prepared[i]
+		res.Duration = duration
+		res.Log = out
+		res.After = getVersion(ctx, work.agent, env, work.method)
 
-	if exitCode != 0 {
-		setFailureResult(&res, exitCode, updateCmd, classifyOut)
-		return res
+		if exitCode != 0 {
+			setFailureResult(&res, exitCode, task.cmd, classifyOut, opts.Timeout)
+		} else if res.Before != "" && res.After != "" && res.Before == res.After && res.Before != "unknown" {
+			res.Status = statusUnchanged
+		} else {
+			res.Status = statusUpdated
+		}
+		results[work.index] = res
+		if events != nil {
+			events <- updateEvent{Index: work.index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: work.show}
+		}
 	}
-	if res.Before != "" && res.After != "" && res.Before == res.After && res.Before != "unknown" {
-		res.Status = statusUnchanged
-	} else {
-		res.Status = statusUpdated
-	}
-	return res
 }
 
 type updateEvent struct {
@@ -314,58 +576,6 @@ const (
 	phaseStart  = "start"
 	phaseFinish = "finish"
 )
-
-func runAgentWithEvents(agent agents.Agent, env *envState, opts options, index int, events chan<- updateEvent) result {
-	res := result{Agent: agent}
-
-	updateCmd, reason, method, detail := resolveUpdate(agent, env)
-	show := updateCmd != nil || reason == reasonManualInstall
-	if updateCmd == nil {
-		res.Status = statusSkipped
-		if reason == "" {
-			res.Reason = reasonMissing
-		} else {
-			res.Reason = reason
-		}
-		res.Explain = detail
-		events <- updateEvent{Index: index, Phase: phaseDetect, Result: res, Time: time.Now(), Show: show}
-		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: show}
-		return res
-	}
-
-	res.Method = method
-	res.Explain = detail
-	res.UpdateCmd = cmdString(updateCmd)
-	if opts.DryRun {
-		res.Status = statusUpdated
-		res.Reason = "dry-run"
-		events <- updateEvent{Index: index, Phase: phaseDetect, Result: res, Time: time.Now(), Show: show}
-		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: show}
-		return res
-	}
-
-	res.Before = getVersion(agent, env, method)
-	events <- updateEvent{Index: index, Phase: phaseDetect, Result: res, Time: time.Now(), Show: show}
-	events <- updateEvent{Index: index, Phase: phaseStart, Result: res, Time: time.Now(), Show: show}
-
-	out, classifyOut, exitCode, duration, _ := runUpdateCmd(updateCmd)
-	res.Duration = duration
-	res.Log = out
-	res.After = getVersion(agent, env, method)
-
-	if exitCode != 0 {
-		setFailureResult(&res, exitCode, updateCmd, classifyOut)
-		events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: show}
-		return res
-	}
-	if res.Before != "" && res.After != "" && res.Before == res.After && res.Before != "unknown" {
-		res.Status = statusUnchanged
-	} else {
-		res.Status = statusUpdated
-	}
-	events <- updateEvent{Index: index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: show}
-	return res
-}
 
 type uiRow struct {
 	name     string
@@ -461,9 +671,8 @@ func termWidth(out *os.File) int {
 	return 80
 }
 
-func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result {
-	results := make([]result, len(selected))
-	events := make(chan updateEvent, len(selected))
+func runAllWithUI(ctx context.Context, selected []agents.Agent, env *envState, opts options) []result {
+	events := make(chan updateEvent, len(selected)*4)
 	done := make(chan struct{})
 
 	rows := make([]uiRow, len(selected))
@@ -536,16 +745,7 @@ func runAllWithUI(selected []agents.Agent, env *envState, opts options) []result
 		env.codeOnce.Do(env.loadCodeExtensions)
 	}()
 
-	var wg sync.WaitGroup
-	wg.Add(len(selected))
-	for i := range selected {
-		i := i
-		go func() {
-			defer wg.Done()
-			results[i] = runAgentWithEvents(selected[i], env, opts, i, events)
-		}()
-	}
-	wg.Wait()
+	results := runAllWithEvents(ctx, selected, env, opts, events)
 	close(events)
 	<-done
 	showCursor(renderer.out)
@@ -963,7 +1163,9 @@ func nodeUpdateCommand(strat agents.UpdateStrategy) []string {
 	}
 	switch strat.Kind {
 	case agents.KindNpm:
-		return []string{"npm", "install", "-g", strat.Package}
+		// `npm update -g` is much faster than `npm install -g` for already-installed packages,
+		// and avoids some wrapper side-effects (e.g. mise's npm reshim wrapper).
+		return []string{"npm", "update", "-g", strat.Package}
 	case agents.KindPnpm:
 		return []string{"pnpm", "add", "-g", strat.Package}
 	case agents.KindYarn:
@@ -987,7 +1189,9 @@ func nodePackageName(strategies []agents.UpdateStrategy) string {
 	return ""
 }
 
-func getVersion(agent agents.Agent, env *envState, method string) string {
+const versionCmdTimeout = 10 * time.Second
+
+func getVersion(ctx context.Context, agent agents.Agent, env *envState, method string) string {
 	if method == agents.KindVSCode && agent.ExtensionID != "" {
 		if version := env.vscodeVersion(agent.ExtensionID); version != "" {
 			return version
@@ -995,7 +1199,7 @@ func getVersion(agent agents.Agent, env *envState, method string) string {
 	}
 	if len(agent.VersionCmd) > 0 {
 		if agent.Binary == "" || env.hasBinary(agent.Binary) {
-			return runVersionCmd(agent.VersionCmd)
+			return runVersionCmd(ctx, agent.VersionCmd)
 		}
 	}
 	if agent.ExtensionID != "" {
@@ -1006,8 +1210,17 @@ func getVersion(agent agents.Agent, env *envState, method string) string {
 	return "unknown"
 }
 
-func runVersionCmd(args []string) string {
-	cmd := exec.Command(args[0], args[1:]...)
+func runVersionCmd(ctx context.Context, args []string) string {
+	if len(args) == 0 {
+		return "unknown"
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmdCtx, cancel := context.WithTimeout(ctx, versionCmdTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "unknown"
@@ -1068,9 +1281,24 @@ func isVersionOnlyLine(line string) bool {
 	return true
 }
 
-func runCmd(args []string) (string, int, time.Duration, error) {
+const (
+	exitCodeTimeout  = 124
+	exitCodeCanceled = 130
+)
+
+func runCmd(ctx context.Context, args []string, timeout time.Duration) (string, int, time.Duration, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	start := time.Now()
-	cmd := exec.Command(args[0], args[1:]...)
+	cmdCtx := ctx
+	cancel := func() {}
+	if timeout > 0 {
+		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -1080,21 +1308,27 @@ func runCmd(args []string) (string, int, time.Duration, error) {
 	if err == nil {
 		return buf.String(), 0, duration, nil
 	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return buf.String(), exitCodeTimeout, duration, err
+	}
+	if errors.Is(err, context.Canceled) {
+		return buf.String(), exitCodeCanceled, duration, err
+	}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		return buf.String(), exitErr.ExitCode(), duration, err
 	}
 	return buf.String(), 1, duration, err
 }
 
-func runUpdateCmd(args []string) (string, string, int, time.Duration, error) {
-	out, exitCode, duration, err := runCmd(args)
+func runUpdateCmd(ctx context.Context, args []string, timeout time.Duration) (string, string, int, time.Duration, error) {
+	out, exitCode, duration, err := runCmd(ctx, args, timeout)
 	classifyOut := out
 	if exitCode == 0 {
 		return out, classifyOut, exitCode, duration, err
 	}
-	if shouldRetryNpmInstall(args, out) {
+	if shouldRetryNpm(args, out) {
 		cleanupMsg := cleanupNpmENotEmpty(out)
-		retryOut, retryCode, retryDuration, retryErr := runCmd(args)
+		retryOut, retryCode, retryDuration, retryErr := runCmd(ctx, args, timeout)
 		combined := formatRetryOutput(out, cleanupMsg, retryOut)
 		classifyOut = retryOut
 		if strings.TrimSpace(classifyOut) == "" {
@@ -1105,8 +1339,22 @@ func runUpdateCmd(args []string) (string, string, int, time.Duration, error) {
 	return out, classifyOut, exitCode, duration, err
 }
 
-func setFailureResult(res *result, exitCode int, updateCmd []string, output string) {
+func setFailureResult(res *result, exitCode int, updateCmd []string, output string, timeout time.Duration) {
 	res.Status = statusFailed
+	switch exitCode {
+	case exitCodeTimeout:
+		res.Reason = "timeout"
+		if timeout > 0 {
+			res.Explain = appendHint(res.Explain, fmt.Sprintf("command timed out after %s; rerun with --timeout 0 or increase it", timeout.Round(time.Second)))
+		} else {
+			res.Explain = appendHint(res.Explain, "command timed out; rerun with a larger --timeout")
+		}
+		return
+	case exitCodeCanceled:
+		res.Reason = "canceled"
+		res.Explain = appendHint(res.Explain, "interrupted; retry the update")
+		return
+	}
 	reason, hint := classifyUpdateFailure(updateCmd, output)
 	if reason == "" {
 		res.Reason = fmt.Sprintf("exit %d", exitCode)
@@ -1125,10 +1373,35 @@ func classifyUpdateFailure(updateCmd []string, output string) (string, string) {
 		strings.Contains(lower, "quota will reset") {
 		return reasonQuota, "quota exceeded; retry later or update via npm (@google/gemini-cli)"
 	}
-	if isNpmInstall(updateCmd) && (strings.Contains(output, "ENOTEMPTY") ||
+	if isNpmGlobalMutate(updateCmd) && (strings.Contains(output, "ENOTEMPTY") ||
 		strings.Contains(output, "errno -66") ||
 		strings.Contains(lower, "directory not empty")) {
 		return reasonNpmNotEmpty, "npm rename failed; retry or remove leftover temp directory under the global npm prefix"
+	}
+	if strings.Contains(lower, "eacces") || strings.Contains(lower, "eperm") || strings.Contains(lower, "permission denied") {
+		return "permission", "permission error; check your global install prefix and file permissions"
+	}
+	if strings.Contains(lower, "etimedout") ||
+		strings.Contains(lower, "timed out") ||
+		strings.Contains(lower, "econnreset") ||
+		strings.Contains(lower, "enotfound") ||
+		strings.Contains(lower, "eai_again") ||
+		strings.Contains(lower, "econnrefused") ||
+		strings.Contains(lower, "socket hang up") {
+		return "network", "network error; check connectivity/proxy/VPN and retry"
+	}
+	if strings.Contains(lower, "self signed certificate") ||
+		strings.Contains(lower, "unable to get local issuer certificate") ||
+		strings.Contains(lower, "cert has expired") ||
+		strings.Contains(lower, "ssl routines") ||
+		strings.Contains(lower, "tls") && strings.Contains(lower, "certificate") {
+		return "tls", "TLS/CA error; check corporate proxy settings or system certificates"
+	}
+	if len(updateCmd) > 0 && updateCmd[0] == "brew" &&
+		(strings.Contains(lower, "another active homebrew update process") ||
+			strings.Contains(lower, "homebrew is already updating") ||
+			strings.Contains(lower, "cannot install in homebrew prefix")) {
+		return "brew busy", "homebrew is locked/busy; wait for other brew process and retry"
 	}
 	return "", ""
 }
@@ -1144,8 +1417,8 @@ func appendHint(detail, hint string) string {
 	return detail + "; hint: " + hint
 }
 
-func shouldRetryNpmInstall(args []string, output string) bool {
-	if !isNpmInstall(args) {
+func shouldRetryNpm(args []string, output string) bool {
+	if !isNpmGlobalMutate(args) {
 		return false
 	}
 	if strings.Contains(output, "ENOTEMPTY") {
@@ -1171,13 +1444,21 @@ func formatRetryOutput(first, cleanupMsg, second string) string {
 		return first
 	}
 	if cleanupMsg != "" {
-		return fmt.Sprintf("%s\n\n(uca) %s\n(uca) retrying npm install after ENOTEMPTY\n%s", first, cleanupMsg, second)
+		return fmt.Sprintf("%s\n\n(uca) %s\n(uca) retrying npm after ENOTEMPTY\n%s", first, cleanupMsg, second)
 	}
-	return fmt.Sprintf("%s\n\n(uca) retrying npm install after ENOTEMPTY\n%s", first, second)
+	return fmt.Sprintf("%s\n\n(uca) retrying npm after ENOTEMPTY\n%s", first, second)
 }
 
-func isNpmInstall(args []string) bool {
-	return len(args) >= 2 && args[0] == "npm" && args[1] == "install"
+func isNpmGlobalMutate(args []string) bool {
+	if len(args) < 2 || args[0] != "npm" {
+		return false
+	}
+	switch args[1] {
+	case "install", "update":
+		return true
+	default:
+		return false
+	}
 }
 
 func cleanupNpmENotEmpty(output string) string {
@@ -1260,15 +1541,33 @@ func isSafeNpmRenameTarget(path, dest string) bool {
 	return true
 }
 
-func runCmdStdout(args []string) (string, int, time.Duration, error) {
+const detectCmdTimeout = 30 * time.Second
+
+func runCmdStdout(ctx context.Context, args []string, timeout time.Duration) (string, int, time.Duration, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	start := time.Now()
-	cmd := exec.Command(args[0], args[1:]...)
+	cmdCtx := ctx
+	cancel := func() {}
+	if timeout > 0 {
+		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	duration := time.Since(start)
 	if err == nil {
 		return string(out), 0, duration, nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return string(out), exitCodeTimeout, duration, err
+	}
+	if errors.Is(err, context.Canceled) {
+		return string(out), exitCodeCanceled, duration, err
 	}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		return string(out), exitErr.ExitCode(), duration, err
@@ -1360,14 +1659,30 @@ func printLogs(results []result, opts options) {
 	if opts.DryRun {
 		return
 	}
+	type logGroup struct {
+		names []string
+		log   string
+	}
+	groups := map[string]*logGroup{}
+	order := []string{}
+
 	for _, res := range results {
-		if res.Status == statusFailed {
-			printLog(res.Agent.Name, res.Log)
+		if res.Status != statusFailed && !(opts.Verbose && res.Status == statusUpdated) {
 			continue
 		}
-		if opts.Verbose && res.Status == statusUpdated {
-			printLog(res.Agent.Name, res.Log)
+		key := res.UpdateCmd + "\n" + res.Status + "\n" + res.Log
+		group := groups[key]
+		if group == nil {
+			group = &logGroup{log: res.Log}
+			groups[key] = group
+			order = append(order, key)
 		}
+		group.names = append(group.names, res.Agent.Name)
+	}
+
+	for _, key := range order {
+		group := groups[key]
+		printLog(strings.Join(group.names, ", "), group.log)
 	}
 }
 
@@ -1443,6 +1758,8 @@ func hasFailures(results []result) bool {
 }
 
 type envState struct {
+	ctx context.Context
+
 	hasBun    bool
 	hasBrew   bool
 	hasNpm    bool
@@ -1476,8 +1793,9 @@ type envState struct {
 	codeExts     map[string]string
 }
 
-func newEnv() *envState {
+func newEnv(ctx context.Context) *envState {
 	return &envState{
+		ctx:          ctx,
 		hasBun:       hasBinary("bun"),
 		hasBrew:      hasBinary("brew"),
 		hasNpm:       hasBinary("npm"),
@@ -1498,6 +1816,13 @@ func detectCodeCmd() string {
 		}
 	}
 	return ""
+}
+
+func (e *envState) baseCtx() context.Context {
+	if e == nil || e.ctx == nil {
+		return context.Background()
+	}
+	return e.ctx
 }
 
 func (e *envState) hasBinary(name string) bool {
@@ -1658,7 +1983,7 @@ func (e *envState) loadNpmBin() {
 	if !e.hasNpm {
 		return
 	}
-	out, exitCode, _, _ := runCmdStdout([]string{"npm", "bin", "-g"})
+	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"npm", "bin", "-g"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -1675,7 +2000,7 @@ func (e *envState) loadNpmPkgs() {
 	if !e.hasNpm {
 		return
 	}
-	out, _, _, _ := runCmdStdout([]string{"npm", "list", "-g", "--depth=0", "--json"})
+	out, _, _, _ := runCmdStdout(e.baseCtx(), []string{"npm", "list", "-g", "--depth=0", "--json"}, detectCmdTimeout)
 	var payload struct {
 		Dependencies map[string]any `json:"dependencies"`
 	}
@@ -1697,7 +2022,7 @@ func (e *envState) loadPnpmBin() {
 	if !e.hasPnpm {
 		return
 	}
-	out, exitCode, _, _ := runCmdStdout([]string{"pnpm", "bin", "-g"})
+	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"pnpm", "bin", "-g"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -1714,7 +2039,7 @@ func (e *envState) loadPnpmPkgs() {
 	if !e.hasPnpm {
 		return
 	}
-	out, _, _, _ := runCmdStdout([]string{"pnpm", "list", "-g", "--depth=0", "--json"})
+	out, _, _, _ := runCmdStdout(e.baseCtx(), []string{"pnpm", "list", "-g", "--depth=0", "--json"}, detectCmdTimeout)
 	type pnpmPayload struct {
 		Dependencies map[string]any `json:"dependencies"`
 	}
@@ -1746,7 +2071,7 @@ func (e *envState) loadYarnBin() {
 	if !e.hasYarn {
 		return
 	}
-	out, exitCode, _, _ := runCmdStdout([]string{"yarn", "global", "bin"})
+	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"yarn", "global", "bin"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -1763,7 +2088,7 @@ func (e *envState) loadYarnPkgs() {
 	if !e.hasYarn {
 		return
 	}
-	out, exitCode, _, _ := runCmdStdout([]string{"yarn", "global", "list", "--depth=0"})
+	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"yarn", "global", "list", "--depth=0"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -1782,7 +2107,7 @@ func (e *envState) loadBunGlobalBin() {
 	if !e.hasBun {
 		return
 	}
-	out, exitCode, _, _ := runCmdStdout([]string{"bun", "pm", "bin", "-g"})
+	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"bun", "pm", "bin", "-g"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -1799,7 +2124,7 @@ func (e *envState) loadBunPkgs() {
 	if !e.hasBun {
 		return
 	}
-	out, exitCode, _, _ := runCmdStdout([]string{"bun", "pm", "ls", "-g"})
+	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"bun", "pm", "ls", "-g"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -1914,7 +2239,7 @@ func (e *envState) loadUvTools() {
 	if !e.hasUv {
 		return
 	}
-	out, _, _, _ := runCmdStdout([]string{"uv", "tool", "list"})
+	out, _, _, _ := runCmdStdout(e.baseCtx(), []string{"uv", "tool", "list"}, detectCmdTimeout)
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -1933,7 +2258,7 @@ func (e *envState) brewHas(formula string) bool {
 	if !e.hasBrew {
 		return false
 	}
-	out, exitCode, _, _ := runCmdStdout([]string{"brew", "list", "--formula", "--versions", formula})
+	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"brew", "list", "--formula", "--versions", formula}, detectCmdTimeout)
 	return exitCode == 0 && strings.TrimSpace(out) != ""
 }
 
@@ -1941,7 +2266,7 @@ func (e *envState) pipHas(pkg string) bool {
 	if !e.hasPython {
 		return false
 	}
-	_, exitCode, _, _ := runCmdStdout([]string{"python3", "-m", "pip", "show", pkg})
+	_, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"python3", "-m", "pip", "show", pkg}, detectCmdTimeout)
 	return exitCode == 0
 }
 
@@ -1961,7 +2286,7 @@ func (e *envState) loadCodeExtensions() {
 	if e.codeCmd == "" {
 		return
 	}
-	out, _, _, _ := runCmdStdout([]string{e.codeCmd, "--list-extensions", "--show-versions"})
+	out, _, _, _ := runCmdStdout(e.baseCtx(), []string{e.codeCmd, "--list-extensions", "--show-versions"}, detectCmdTimeout)
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())

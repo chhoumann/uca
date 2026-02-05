@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -57,7 +58,7 @@ func TestParseVersionOutput(t *testing.T) {
 	}
 }
 
-func TestShouldRetryNpmInstall(t *testing.T) {
+func TestShouldRetryNpm(t *testing.T) {
 	tests := []struct {
 		name   string
 		args   []string
@@ -67,6 +68,12 @@ func TestShouldRetryNpmInstall(t *testing.T) {
 		{
 			name:   "enotempty",
 			args:   []string{"npm", "install", "-g", "pkg"},
+			output: "npm error ENOTEMPTY: directory not empty",
+			want:   true,
+		},
+		{
+			name:   "enotempty_update",
+			args:   []string{"npm", "update", "-g", "pkg"},
 			output: "npm error ENOTEMPTY: directory not empty",
 			want:   true,
 		},
@@ -110,8 +117,8 @@ func TestShouldRetryNpmInstall(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldRetryNpmInstall(tt.args, tt.output); got != tt.want {
-				t.Fatalf("shouldRetryNpmInstall() = %v, want %v", got, tt.want)
+			if got := shouldRetryNpm(tt.args, tt.output); got != tt.want {
+				t.Fatalf("shouldRetryNpm() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -144,14 +151,14 @@ func TestFormatRetryOutput(t *testing.T) {
 			first:  "first output",
 			msg:    "",
 			second: "second output",
-			want:   "first output\n\n(uca) retrying npm install after ENOTEMPTY\nsecond output",
+			want:   "first output\n\n(uca) retrying npm after ENOTEMPTY\nsecond output",
 		},
 		{
 			name:   "with_cleanup_msg",
 			first:  "first output",
 			msg:    "removed stale npm temp dir /tmp/.pkg-abc",
 			second: "second output",
-			want:   "first output\n\n(uca) removed stale npm temp dir /tmp/.pkg-abc\n(uca) retrying npm install after ENOTEMPTY\nsecond output",
+			want:   "first output\n\n(uca) removed stale npm temp dir /tmp/.pkg-abc\n(uca) retrying npm after ENOTEMPTY\nsecond output",
 		},
 	}
 
@@ -251,7 +258,7 @@ func TestAppendHint(t *testing.T) {
 	}
 }
 
-func TestIsNpmInstall(t *testing.T) {
+func TestIsNpmGlobalMutate(t *testing.T) {
 	tests := []struct {
 		name string
 		args []string
@@ -260,6 +267,11 @@ func TestIsNpmInstall(t *testing.T) {
 		{
 			name: "npm_install",
 			args: []string{"npm", "install", "-g", "pkg"},
+			want: true,
+		},
+		{
+			name: "npm_update",
+			args: []string{"npm", "update", "-g", "pkg"},
 			want: true,
 		},
 		{
@@ -276,8 +288,61 @@ func TestIsNpmInstall(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isNpmInstall(tt.args); got != tt.want {
-				t.Fatalf("isNpmInstall() = %v, want %v", got, tt.want)
+			if got := isNpmGlobalMutate(tt.args); got != tt.want {
+				t.Fatalf("isNpmGlobalMutate() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNodeUpdateCommandNpmUsesUpdate(t *testing.T) {
+	strat := agents.UpdateStrategy{Kind: agents.KindNpm, Package: "pkg"}
+	want := []string{"npm", "update", "-g", "pkg"}
+	if got := nodeUpdateCommand(strat); !reflect.DeepEqual(got, want) {
+		t.Fatalf("nodeUpdateCommand() = %#v, want %#v", got, want)
+	}
+}
+
+func TestNodeBatchUpdateCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		kind string
+		pkgs []string
+		want []string
+	}{
+		{name: "npm", kind: agents.KindNpm, pkgs: []string{"a", "b"}, want: []string{"npm", "update", "-g", "a", "b"}},
+		{name: "pnpm", kind: agents.KindPnpm, pkgs: []string{"a", "b"}, want: []string{"pnpm", "add", "-g", "a", "b"}},
+		{name: "yarn", kind: agents.KindYarn, pkgs: []string{"a", "b"}, want: []string{"yarn", "global", "add", "a", "b"}},
+		{name: "bun", kind: agents.KindBun, pkgs: []string{"a", "b"}, want: []string{"bun", "add", "-g", "a", "b"}},
+		{name: "unknown", kind: "nope", pkgs: []string{"a", "b"}, want: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nodeBatchUpdateCommand(tt.kind, tt.pkgs); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("nodeBatchUpdateCommand() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEffectiveConcurrency(t *testing.T) {
+	tests := []struct {
+		name  string
+		opts  options
+		tasks int
+		want  int
+	}{
+		{name: "serial", opts: options{Serial: true}, tasks: 10, want: 1},
+		{name: "safe_default", opts: options{Safe: true}, tasks: 10, want: 1},
+		{name: "safe_override", opts: options{Safe: true, Concurrency: 3}, tasks: 10, want: 3},
+		{name: "explicit_concurrency", opts: options{Concurrency: 2}, tasks: 10, want: 2},
+		{name: "default_unlimited", opts: options{}, tasks: 7, want: 7},
+		{name: "no_tasks", opts: options{}, tasks: 0, want: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := effectiveConcurrency(tt.opts, tt.tasks); got != tt.want {
+				t.Fatalf("effectiveConcurrency() = %d, want %d", got, tt.want)
 			}
 		})
 	}

@@ -22,6 +22,9 @@ uca [options]
 Options:
 - `-p, --parallel` run updates in parallel (default)
 - `--serial` run updates sequentially
+- `--safe` safer execution (limits concurrency)
+- `--timeout <duration>` timeout per update command (default `15m`, `0` disables)
+- `--concurrency <n>` max concurrent update commands (`0` disables)
 - `-v, --verbose` show update command output for each agent
 - `-q, --quiet` suppress per-agent version lines (summary only)
 - `-n, --dry-run` print commands that would run, do not execute
@@ -86,6 +89,11 @@ When `uca` is run in a TTY, it shows a live status dashboard with progress, vers
 - VS Code extensions (via `code`, `codium`, or `code-insiders`)
 
 If a tool is installed but managed by an unknown method, it is marked as manual and skipped.
+
+## Performance & reliability notes
+
+- Node-based agents are updated in batch per package manager when possible (e.g. one `npm update -g ...` for multiple npm-managed agents).
+- Updates that mutate global package manager state are serialized per manager (e.g. only one `npm` global update at a time).
 
 ## Output (default)
 ```
