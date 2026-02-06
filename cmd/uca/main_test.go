@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chhoumann/uca/internal/agents"
 )
@@ -95,6 +96,22 @@ func TestFormatVersionWithToken(t *testing.T) {
 		if got := formatVersionWithToken(tt.before, tt.newVer); got != tt.want {
 			t.Fatalf("formatVersionWithToken(%q,%q)=%q, want %q", tt.before, tt.newVer, got, tt.want)
 		}
+	}
+}
+
+func TestFormatRowUpdatingShowsTargetVersion(t *testing.T) {
+	row := uiRow{
+		name:   "codex",
+		status: "updating",
+		before: "codex-cli 0.90.0-alpha.5",
+		after:  "codex-cli 0.98.0",
+		start:  time.Now(),
+	}
+	r := &uiRenderer{width: 200, useColor: false, useUnicode: true}
+
+	got := formatRow(row, len(row.name), options{}, r)
+	if !strings.Contains(got, "codex-cli 0.90.0-alpha.5 → codex-cli 0.98.0") {
+		t.Fatalf("formatRow() did not include target version; got %q", got)
 	}
 }
 

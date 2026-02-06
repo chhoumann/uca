@@ -521,6 +521,33 @@ func runTask(ctx context.Context, task updateTask, env *envState, opts options, 
 		res.Before = getVersion(ctx, work.agent, env, work.method)
 		prepared[i] = res
 	}
+	if events != nil && isNodeKind(kind) {
+		// Best-effort latest version preview. Keep it short so we don't delay updates on bad networks.
+		previewCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		var wg sync.WaitGroup
+		for i, work := range task.agents {
+			pkg := strings.TrimSpace(work.nodePackageName)
+			if pkg == "" {
+				continue
+			}
+			before := prepared[i].Before
+			wg.Add(1)
+			go func(i int, before, pkg string) {
+				defer wg.Done()
+				latest := nodeLatestVersion(previewCtx, kind, pkg)
+				if latest == "" {
+					return
+				}
+				after := formatVersionWithToken(before, latest)
+				if after == "" {
+					after = latest
+				}
+				prepared[i].After = after
+			}(i, before, pkg)
+		}
+		wg.Wait()
+		cancel()
+	}
 	startTime := time.Now()
 	if events != nil {
 		for i, work := range task.agents {
@@ -788,6 +815,7 @@ func applyEvent(row *uiRow, ev updateEvent) {
 	case phaseStart:
 		row.status = "updating"
 		row.before = res.Before
+		row.after = res.After
 		row.method = res.Method
 		row.start = ev.Time
 	case phaseFinish:
@@ -876,7 +904,11 @@ func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
 		statusLabel = statusLabelFor(row)
 	case "updating":
 		statusLabel = statusLabelFor(row)
-		version = fmt.Sprintf("%s → …", safeVersion(row.before))
+		if strings.TrimSpace(row.after) != "" {
+			version = fmt.Sprintf("%s → %s", safeVersion(row.before), safeVersion(row.after))
+		} else {
+			version = fmt.Sprintf("%s → …", safeVersion(row.before))
+		}
 		if !row.start.IsZero() {
 			elapsed = fmtElapsed(time.Since(row.start))
 		}
