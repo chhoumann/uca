@@ -58,6 +58,46 @@ func TestParseVersionOutput(t *testing.T) {
 	}
 }
 
+func TestExtractVersionToken(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{in: "", want: "", ok: false},
+		{in: "codex-cli 0.90.0-alpha.5", want: "0.90.0-alpha.5", ok: true},
+		{in: "v2.0.1", want: "v2.0.1", ok: true},
+		{in: "no version here", want: "", ok: false},
+	}
+	for _, tt := range tests {
+		got, ok := extractVersionToken(tt.in)
+		if ok != tt.ok {
+			t.Fatalf("extractVersionToken(%q) ok=%v, want %v (got %q)", tt.in, ok, tt.ok, got)
+		}
+		if got != tt.want {
+			t.Fatalf("extractVersionToken(%q)=%q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestFormatVersionWithToken(t *testing.T) {
+	tests := []struct {
+		before string
+		newVer string
+		want   string
+	}{
+		{before: "codex-cli 0.90.0-alpha.5", newVer: "0.98.0", want: "codex-cli 0.98.0"},
+		{before: "v2.0.1", newVer: "2.0.2", want: "v2.0.2"},
+		{before: "unknown", newVer: "1.2.3", want: "1.2.3"},
+		{before: "", newVer: "1.2.3", want: "1.2.3"},
+	}
+	for _, tt := range tests {
+		if got := formatVersionWithToken(tt.before, tt.newVer); got != tt.want {
+			t.Fatalf("formatVersionWithToken(%q,%q)=%q, want %q", tt.before, tt.newVer, got, tt.want)
+		}
+	}
+}
+
 func TestShouldRetryNpm(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -295,11 +335,40 @@ func TestIsNpmGlobalMutate(t *testing.T) {
 	}
 }
 
-func TestNodeUpdateCommandNpmUsesUpdate(t *testing.T) {
-	strat := agents.UpdateStrategy{Kind: agents.KindNpm, Package: "pkg"}
-	want := []string{"npm", "update", "-g", "pkg"}
-	if got := nodeUpdateCommand(strat); !reflect.DeepEqual(got, want) {
-		t.Fatalf("nodeUpdateCommand() = %#v, want %#v", got, want)
+func TestNodeUpdateCommand_UsesLatestTag(t *testing.T) {
+	tests := []struct {
+		name  string
+		strat agents.UpdateStrategy
+		want  []string
+	}{
+		{
+			name:  "npm",
+			strat: agents.UpdateStrategy{Kind: agents.KindNpm, Package: "pkg"},
+			want:  []string{"npm", "install", "-g", "pkg@latest"},
+		},
+		{
+			name:  "pnpm",
+			strat: agents.UpdateStrategy{Kind: agents.KindPnpm, Package: "pkg"},
+			want:  []string{"pnpm", "add", "-g", "pkg@latest"},
+		},
+		{
+			name:  "yarn",
+			strat: agents.UpdateStrategy{Kind: agents.KindYarn, Package: "pkg"},
+			want:  []string{"yarn", "global", "add", "pkg@latest"},
+		},
+		{
+			name:  "bun",
+			strat: agents.UpdateStrategy{Kind: agents.KindBun, Package: "pkg"},
+			want:  []string{"bun", "add", "-g", "pkg@latest"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nodeUpdateCommand(tt.strat); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("nodeUpdateCommand() = %#v, want %#v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -310,10 +379,11 @@ func TestNodeBatchUpdateCommand(t *testing.T) {
 		pkgs []string
 		want []string
 	}{
-		{name: "npm", kind: agents.KindNpm, pkgs: []string{"a", "b"}, want: []string{"npm", "update", "-g", "a", "b"}},
-		{name: "pnpm", kind: agents.KindPnpm, pkgs: []string{"a", "b"}, want: []string{"pnpm", "add", "-g", "a", "b"}},
-		{name: "yarn", kind: agents.KindYarn, pkgs: []string{"a", "b"}, want: []string{"yarn", "global", "add", "a", "b"}},
-		{name: "bun", kind: agents.KindBun, pkgs: []string{"a", "b"}, want: []string{"bun", "add", "-g", "a", "b"}},
+		{name: "npm", kind: agents.KindNpm, pkgs: []string{"a", "b"}, want: []string{"npm", "install", "-g", "a@latest", "b@latest"}},
+		{name: "pnpm", kind: agents.KindPnpm, pkgs: []string{"a", "b"}, want: []string{"pnpm", "add", "-g", "a@latest", "b@latest"}},
+		{name: "yarn", kind: agents.KindYarn, pkgs: []string{"a", "b"}, want: []string{"yarn", "global", "add", "a@latest", "b@latest"}},
+		{name: "bun", kind: agents.KindBun, pkgs: []string{"a", "b"}, want: []string{"bun", "add", "-g", "a@latest", "b@latest"}},
+		{name: "npm_skips_empty", kind: agents.KindNpm, pkgs: []string{"a", "", "  ", "b"}, want: []string{"npm", "install", "-g", "a@latest", "b@latest"}},
 		{name: "unknown", kind: "nope", pkgs: []string{"a", "b"}, want: nil},
 	}
 	for _, tt := range tests {

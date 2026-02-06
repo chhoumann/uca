@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -322,7 +323,7 @@ func nodeBatchUpdateCommand(kind string, pkgs []string) []string {
 	args := []string{}
 	switch kind {
 	case agents.KindNpm:
-		args = append(args, "npm", "update", "-g")
+		args = append(args, "npm", "install", "-g")
 	case agents.KindPnpm:
 		args = append(args, "pnpm", "add", "-g")
 	case agents.KindYarn:
@@ -332,7 +333,12 @@ func nodeBatchUpdateCommand(kind string, pkgs []string) []string {
 	default:
 		return nil
 	}
-	args = append(args, pkgs...)
+	for _, pkg := range pkgs {
+		if strings.TrimSpace(pkg) == "" {
+			continue
+		}
+		args = append(args, pkg+"@latest")
+	}
 	return args
 }
 
@@ -429,11 +435,26 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 		}
 
 		if opts.DryRun {
-			res.Status = statusUpdated
-			res.Reason = "dry-run"
-			results[work.index] = res
+			// Emit detect first so the UI can render quickly, then populate versions.
 			if events != nil {
 				events <- updateEvent{Index: work.index, Phase: phaseDetect, Result: res, Time: now, Show: work.show}
+			}
+
+			res.Status = statusUpdated
+			res.Reason = "dry-run"
+			res.Before = getVersion(ctx, work.agent, env, work.method)
+			res.After = res.Before
+			if isNodeKind(work.method) {
+				if latest := nodeLatestVersion(ctx, work.method, work.nodePackageName); latest != "" {
+					if formatted := formatVersionWithToken(res.Before, latest); formatted != "" {
+						res.After = formatted
+					} else {
+						res.After = latest
+					}
+				}
+			}
+			results[work.index] = res
+			if events != nil {
 				events <- updateEvent{Index: work.index, Phase: phaseFinish, Result: res, Time: now, Show: work.show}
 			}
 			continue
@@ -882,7 +903,7 @@ func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
 	}
 
 	if statusLabel == "dry-run" {
-		info = "no changes"
+		info = "preview"
 	}
 
 	if info != "" {
@@ -1163,15 +1184,15 @@ func nodeUpdateCommand(strat agents.UpdateStrategy) []string {
 	}
 	switch strat.Kind {
 	case agents.KindNpm:
-		// `npm update -g` is much faster than `npm install -g` for already-installed packages,
-		// and avoids some wrapper side-effects (e.g. mise's npm reshim wrapper).
-		return []string{"npm", "update", "-g", strat.Package}
+		// Force `@latest` to avoid getting stuck on old minor/prerelease versions (common for 0.x CLIs).
+		// `npm update -g` does not accept `pkg@latest` specs, so we use install.
+		return []string{"npm", "install", "-g", strat.Package + "@latest"}
 	case agents.KindPnpm:
-		return []string{"pnpm", "add", "-g", strat.Package}
+		return []string{"pnpm", "add", "-g", strat.Package + "@latest"}
 	case agents.KindYarn:
-		return []string{"yarn", "global", "add", strat.Package}
+		return []string{"yarn", "global", "add", strat.Package + "@latest"}
 	case agents.KindBun:
-		return []string{"bun", "add", "-g", strat.Package}
+		return []string{"bun", "add", "-g", strat.Package + "@latest"}
 	default:
 		return strat.Command
 	}
@@ -1208,6 +1229,69 @@ func getVersion(ctx context.Context, agent agents.Agent, env *envState, method s
 		}
 	}
 	return "unknown"
+}
+
+const latestVersionCmdTimeout = 12 * time.Second
+
+var semverTokenRe = regexp.MustCompile(`(?i)\bv?\d+\.\d+(?:\.\d+)?(?:-[0-9a-z.-]+)?(?:\+[0-9a-z.-]+)?\b`)
+
+func extractVersionToken(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	if match := semverTokenRe.FindString(s); match != "" {
+		return match, true
+	}
+	return "", false
+}
+
+func formatVersionWithToken(before, newVersion string) string {
+	newVersion = strings.TrimSpace(newVersion)
+	if newVersion == "" {
+		return ""
+	}
+	before = strings.TrimSpace(before)
+	if before == "" || before == "unknown" {
+		return newVersion
+	}
+	token, ok := extractVersionToken(before)
+	if !ok {
+		return newVersion
+	}
+	if strings.HasPrefix(token, "v") && !strings.HasPrefix(newVersion, "v") {
+		newVersion = "v" + newVersion
+	}
+	return strings.Replace(before, token, newVersion, 1)
+}
+
+func nodeLatestVersion(ctx context.Context, kind, pkg string) string {
+	pkg = strings.TrimSpace(pkg)
+	if pkg == "" {
+		return ""
+	}
+	args := []string{}
+	switch kind {
+	case agents.KindNpm:
+		args = []string{"npm", "view", pkg, "dist-tags.latest"}
+	case agents.KindPnpm:
+		args = []string{"pnpm", "view", pkg, "dist-tags.latest", "--silent"}
+	case agents.KindYarn:
+		args = []string{"yarn", "info", pkg, "dist-tags.latest", "--silent"}
+	case agents.KindBun:
+		// `bun info` needs `-g` to work outside of a JS project.
+		args = []string{"bun", "info", "-g", pkg, "version", "--json"}
+	default:
+		return ""
+	}
+
+	out, exitCode, _, _ := runCmdStdout(ctx, args, latestVersionCmdTimeout)
+	if exitCode != 0 {
+		return ""
+	}
+	trimmed := strings.TrimSpace(out)
+	trimmed = strings.Trim(trimmed, "\"'")
+	return strings.TrimSpace(trimmed)
 }
 
 func runVersionCmd(ctx context.Context, args []string) string {
@@ -1984,10 +2068,34 @@ func (e *envState) loadNpmBin() {
 		return
 	}
 	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"npm", "bin", "-g"}, detectCmdTimeout)
+	if exitCode == 0 {
+		if dir := strings.TrimSpace(out); dir != "" {
+			e.npmBin = dir
+			return
+		}
+	}
+
+	// npm v11 removed `npm bin`, but `npm prefix -g` still works.
+	prefixOut, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"npm", "prefix", "-g"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
-	e.npmBin = strings.TrimSpace(out)
+	prefix := strings.TrimSpace(prefixOut)
+	if prefix == "" {
+		return
+	}
+	// On Unix-like systems, global binaries are installed under <prefix>/bin.
+	// On Windows, global binaries are typically installed directly under <prefix>.
+	if runtime.GOOS == "windows" {
+		bin := filepath.Join(prefix, "bin")
+		if info, err := os.Stat(bin); err == nil && info.IsDir() {
+			e.npmBin = bin
+			return
+		}
+		e.npmBin = prefix
+		return
+	}
+	e.npmBin = filepath.Join(prefix, "bin")
 }
 
 func (e *envState) npmHas(pkg string) bool {
