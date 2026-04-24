@@ -67,6 +67,7 @@ uca --explain
 - claude (`claude update`)
 - codex (npm/pnpm/yarn/bun `@openai/codex`)
 - opencode (npm/pnpm/yarn/bun `opencode-ai`)
+- droid (npm/pnpm/yarn/bun `droid` or `droid update`)
 - cursor (`cursor-agent update`)
 - copilot (Homebrew `copilot-cli` or npm/pnpm/yarn/bun `@github/copilot`)
 - cline (npm/pnpm/yarn/bun `cline` or VS Code extension `saoudrizwan.claude-dev`)

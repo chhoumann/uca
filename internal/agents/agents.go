@@ -71,6 +71,12 @@ func Default() []Agent {
 			Strategies: nodePackageStrategies("opencode-ai"),
 		},
 		{
+			Name:       "droid",
+			Binary:     "droid",
+			VersionCmd: []string{"droid", "--version"},
+			Strategies: append(nodePackageStrategies("droid"), UpdateStrategy{Kind: KindNative, Command: []string{"droid", "update"}}),
+		},
+		{
 			Name:       "cursor",
 			Binary:     "cursor-agent",
 			VersionCmd: []string{"cursor-agent", "--version"},
