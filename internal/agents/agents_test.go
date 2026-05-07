@@ -49,3 +49,44 @@ func TestDefaultIncludesDroid(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultIncludesPiFromEarendilWorks(t *testing.T) {
+	defaults := Default()
+	var got *Agent
+	for i := range defaults {
+		if defaults[i].Name == "pi" {
+			got = &defaults[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("Default() is missing pi")
+	}
+	if got.Binary != "pi" {
+		t.Fatalf("pi Binary = %q, want %q", got.Binary, "pi")
+	}
+	if len(got.VersionCmd) != 2 || got.VersionCmd[0] != "pi" || got.VersionCmd[1] != "--version" {
+		t.Fatalf("pi VersionCmd = %#v, want %#v", got.VersionCmd, []string{"pi", "--version"})
+	}
+
+	wantKinds := map[string]bool{
+		KindNpm:  false,
+		KindPnpm: false,
+		KindYarn: false,
+		KindBun:  false,
+	}
+	for _, strat := range got.Strategies {
+		if _, ok := wantKinds[strat.Kind]; !ok {
+			continue
+		}
+		wantKinds[strat.Kind] = true
+		if strat.Package != "@earendil-works/pi-coding-agent" {
+			t.Fatalf("%s pi package = %q, want %q", strat.Kind, strat.Package, "@earendil-works/pi-coding-agent")
+		}
+	}
+	for kind, found := range wantKinds {
+		if !found {
+			t.Fatalf("pi is missing %s strategy", kind)
+		}
+	}
+}

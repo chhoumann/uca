@@ -73,7 +73,7 @@ uca --explain
 - cline (npm/pnpm/yarn/bun `cline` or VS Code extension `saoudrizwan.claude-dev`)
 - roocode (VS Code extension `RooVeterinaryInc.roo-cline`)
 - aider (uv tool `aider-chat` or pip `aider-chat`)
-- pi (npm/pnpm/yarn/bun `@mariozechner/pi-coding-agent`)
+- pi (npm/pnpm/yarn/bun `@earendil-works/pi-coding-agent`)
 
 ## Live output
 

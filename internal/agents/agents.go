@@ -115,7 +115,7 @@ func Default() []Agent {
 			Name:       "pi",
 			Binary:     "pi",
 			VersionCmd: []string{"pi", "--version"},
-			Strategies: nodePackageStrategies("@mariozechner/pi-coding-agent"),
+			Strategies: nodePackageStrategies("@earendil-works/pi-coding-agent"),
 		},
 	}
 }
