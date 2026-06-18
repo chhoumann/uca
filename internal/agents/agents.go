@@ -1,10 +1,13 @@
 package agents
 
 type UpdateStrategy struct {
-	Kind        string
-	Command     []string
-	Package     string
-	ExtensionID string
+	Kind         string
+	Command      []string
+	Package      string
+	ExtensionID  string
+	Binary       string
+	VersionCmd   []string
+	HelpContains string
 }
 
 // Agent defines how to update and version a CLI tool.
@@ -13,6 +16,7 @@ type Agent struct {
 	Binary      string
 	VersionCmd  []string
 	ExtensionID string
+	Aliases     []string
 	Strategies  []UpdateStrategy
 }
 
@@ -80,7 +84,20 @@ func Default() []Agent {
 			Name:       "cursor",
 			Binary:     "cursor-agent",
 			VersionCmd: []string{"cursor-agent", "--version"},
-			Strategies: []UpdateStrategy{{Kind: KindNative, Command: []string{"cursor-agent", "update"}}},
+			Aliases:    []string{"agent"},
+			Strategies: []UpdateStrategy{
+				{
+					Kind:         KindNative,
+					Binary:       "agent",
+					Command:      []string{"agent", "update"},
+					VersionCmd:   []string{"agent", "--version"},
+					HelpContains: "Cursor Agent",
+				},
+				{
+					Kind:    KindNative,
+					Command: []string{"cursor-agent", "update"},
+				},
+			},
 		},
 		{
 			Name:       "copilot",

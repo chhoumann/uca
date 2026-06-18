@@ -90,3 +90,61 @@ func TestDefaultIncludesPiFromEarendilWorks(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultIncludesCursorAgentPrimaryAndLegacyFallback(t *testing.T) {
+	defaults := Default()
+	var got *Agent
+	cursorCount := 0
+	for i := range defaults {
+		if defaults[i].Name == "cursor" {
+			got = &defaults[i]
+			cursorCount++
+		}
+		if defaults[i].Name == "agent" {
+			t.Fatal("Default() should not expose agent as a separate supported agent")
+		}
+	}
+	if cursorCount != 1 {
+		t.Fatalf("Default() has %d cursor agents, want 1", cursorCount)
+	}
+	if got == nil {
+		t.Fatal("Default() is missing cursor")
+	}
+	if got.Binary != "cursor-agent" {
+		t.Fatalf("cursor Binary = %q, want %q", got.Binary, "cursor-agent")
+	}
+	if len(got.Aliases) != 1 || got.Aliases[0] != "agent" {
+		t.Fatalf("cursor Aliases = %#v, want %#v", got.Aliases, []string{"agent"})
+	}
+	if len(got.Strategies) < 2 {
+		t.Fatalf("cursor has %d strategies, want at least 2", len(got.Strategies))
+	}
+
+	primary := got.Strategies[0]
+	if primary.Kind != KindNative || primary.Binary != "agent" {
+		t.Fatalf("primary cursor strategy = %#v, want native agent", primary)
+	}
+	if len(primary.Command) != 2 || primary.Command[0] != "agent" || primary.Command[1] != "update" {
+		t.Fatalf("primary cursor command = %#v, want %#v", primary.Command, []string{"agent", "update"})
+	}
+	if len(primary.VersionCmd) != 2 || primary.VersionCmd[0] != "agent" || primary.VersionCmd[1] != "--version" {
+		t.Fatalf("primary cursor VersionCmd = %#v, want %#v", primary.VersionCmd, []string{"agent", "--version"})
+	}
+	if primary.HelpContains != "Cursor Agent" {
+		t.Fatalf("primary cursor HelpContains = %q, want %q", primary.HelpContains, "Cursor Agent")
+	}
+
+	fallback := got.Strategies[1]
+	if fallback.Kind != KindNative {
+		t.Fatalf("fallback cursor strategy = %#v, want native", fallback)
+	}
+	if len(fallback.Command) != 2 || fallback.Command[0] != "cursor-agent" || fallback.Command[1] != "update" {
+		t.Fatalf("fallback cursor command = %#v, want %#v", fallback.Command, []string{"cursor-agent", "update"})
+	}
+	if fallback.Binary != "" {
+		t.Fatalf("fallback cursor Binary = %q, want agent-level default", fallback.Binary)
+	}
+	if len(fallback.VersionCmd) != 0 {
+		t.Fatalf("fallback cursor VersionCmd = %#v, want agent-level default", fallback.VersionCmd)
+	}
+}

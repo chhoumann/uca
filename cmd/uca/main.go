@@ -160,24 +160,28 @@ Options:
 }
 
 func filterAgents(all []agents.Agent, onlyRaw, skipRaw string) ([]agents.Agent, []string) {
-	only := parseList(onlyRaw)
-	skip := parseList(skipRaw)
-
-	known := make(map[string]bool, len(all))
+	known := make(map[string]string, len(all))
 	for _, agent := range all {
-		known[agent.Name] = true
+		name := strings.ToLower(agent.Name)
+		known[name] = name
+		for _, alias := range agent.Aliases {
+			alias = strings.ToLower(strings.TrimSpace(alias))
+			if alias == "" {
+				continue
+			}
+			known[alias] = name
+		}
 	}
+
+	only, onlyUnknown := normalizeAgentList(parseList(onlyRaw), known)
+	skip, skipUnknown := normalizeAgentList(parseList(skipRaw), known)
 
 	unknownSet := map[string]bool{}
-	for name := range only {
-		if !known[name] {
-			unknownSet[name] = true
-		}
+	for _, name := range onlyUnknown {
+		unknownSet[name] = true
 	}
-	for name := range skip {
-		if !known[name] {
-			unknownSet[name] = true
-		}
+	for _, name := range skipUnknown {
+		unknownSet[name] = true
 	}
 
 	selected := make([]agents.Agent, 0, len(all))
@@ -198,6 +202,20 @@ func filterAgents(all []agents.Agent, onlyRaw, skipRaw string) ([]agents.Agent, 
 	}
 	sort.Strings(unknown)
 	return selected, unknown
+}
+
+func normalizeAgentList(items map[string]bool, known map[string]string) (map[string]bool, []string) {
+	normalized := map[string]bool{}
+	unknown := []string{}
+	for name := range items {
+		canonical, ok := known[name]
+		if !ok {
+			unknown = append(unknown, name)
+			continue
+		}
+		normalized[canonical] = true
+	}
+	return normalized, unknown
 }
 
 func parseList(raw string) map[string]bool {
@@ -248,11 +266,20 @@ type agentWork struct {
 	method          string
 	explain         string
 	reason          string
+	versionCmd      []string
 	nodePackageName string
 	// updateCmd is the final command to run (may be a batch command).
 	updateCmd []string
 	// updateCmdSingle is the per-agent command (used for fallback when batch updates fail).
 	updateCmdSingle []string
+}
+
+type resolvedUpdate struct {
+	cmd        []string
+	reason     string
+	method     string
+	detail     string
+	versionCmd []string
 }
 
 type updateTask struct {
@@ -347,18 +374,19 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 	works := make([]agentWork, len(selected))
 
 	for i, agent := range selected {
-		updateCmd, reason, method, detail := resolveUpdate(agent, env)
-		show := updateCmd != nil || reason == reasonManualInstall
+		resolved := resolveUpdate(agent, env)
+		show := resolved.cmd != nil || resolved.reason == reasonManualInstall
 		work := agentWork{
 			agent:           agent,
 			index:           i,
 			show:            show,
-			method:          method,
-			explain:         detail,
-			reason:          reason,
-			updateCmdSingle: updateCmd,
+			method:          resolved.method,
+			explain:         resolved.detail,
+			reason:          resolved.reason,
+			versionCmd:      resolved.versionCmd,
+			updateCmdSingle: resolved.cmd,
 		}
-		if isNodeKind(method) {
+		if isNodeKind(resolved.method) {
 			work.nodePackageName = nodePackageName(agent.Strategies)
 		}
 		works[i] = work
@@ -442,7 +470,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 
 			res.Status = statusUpdated
 			res.Reason = "dry-run"
-			res.Before = getVersion(ctx, work.agent, env, work.method)
+			res.Before = getVersion(ctx, work.agent, env, work.method, work.versionCmd)
 			res.After = res.Before
 			if isNodeKind(work.method) {
 				if latest := nodeLatestVersion(ctx, work.method, work.nodePackageName); latest != "" {
@@ -518,7 +546,7 @@ func runTask(ctx context.Context, task updateTask, env *envState, opts options, 
 			Explain:   work.explain,
 			UpdateCmd: cmdString(work.updateCmd),
 		}
-		res.Before = getVersion(ctx, work.agent, env, work.method)
+		res.Before = getVersion(ctx, work.agent, env, work.method, work.versionCmd)
 		prepared[i] = res
 	}
 	if events != nil && isNodeKind(kind) {
@@ -573,7 +601,7 @@ func runTask(ctx context.Context, task updateTask, env *envState, opts options, 
 				res.Log += "\n"
 			}
 			res.Log += strings.TrimSpace(indOut)
-			res.After = getVersion(ctx, work.agent, env, work.method)
+			res.After = getVersion(ctx, work.agent, env, work.method, work.versionCmd)
 
 			if indExitCode != 0 {
 				setFailureResult(&res, indExitCode, work.updateCmdSingle, indClassifyOut, opts.Timeout)
@@ -595,7 +623,7 @@ func runTask(ctx context.Context, task updateTask, env *envState, opts options, 
 		res := prepared[i]
 		res.Duration = duration
 		res.Log = out
-		res.After = getVersion(ctx, work.agent, env, work.method)
+		res.After = getVersion(ctx, work.agent, env, work.method, work.versionCmd)
 
 		if exitCode != 0 {
 			setFailureResult(&res, exitCode, task.cmd, classifyOut, opts.Timeout)
@@ -1118,9 +1146,10 @@ func colorize(text, status string, enabled bool) string {
 	return "\x1b[" + code + "m" + text + "\x1b[0m"
 }
 
-func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string, string) {
+func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
 	codeMissing := false
 	detail := ""
+	nativeIdentityMiss := ""
 	nodeManager := ""
 	if agent.Binary != "" {
 		nodeManager = env.nodeManagerForBinary(agent.Binary)
@@ -1134,11 +1163,22 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string,
 	for _, strat := range agent.Strategies {
 		switch strat.Kind {
 		case agents.KindNative:
-			if agent.Binary != "" && !env.hasBinary(agent.Binary) {
+			binary := nativeStrategyBinary(agent, strat)
+			if binary != "" && !env.hasBinary(binary) {
 				continue
 			}
-			detail = fmt.Sprintf("binary %s found; using built-in update", agent.Binary)
-			return strat.Command, "", strat.Kind, detail
+			if !nativeStrategyHelpMatches(env, binary, strat.HelpContains) {
+				nativeIdentityMiss = fmt.Sprintf("binary %s found but help text did not identify %s", binary, strat.HelpContains)
+				continue
+			}
+			versionCmd := nativeStrategyVersionCmd(agent, strat)
+			detail = fmt.Sprintf("binary %s found; using built-in update", binary)
+			return resolvedUpdate{
+				cmd:        strat.Command,
+				method:     strat.Kind,
+				detail:     detail,
+				versionCmd: versionCmd,
+			}
 		case agents.KindBun, agents.KindNpm, agents.KindPnpm, agents.KindYarn:
 			if !env.hasNodeManager(strat.Kind) {
 				continue
@@ -1151,27 +1191,27 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string,
 					continue
 				}
 				detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
-				return nodeUpdateCommand(strat), "", strat.Kind, detail
+				return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail}
 			}
 			if packageManager != "" {
 				if packageManager != strat.Kind {
 					continue
 				}
 				detail = fmt.Sprintf("%s global package %s installed; matched by package list; updating via %s", strat.Kind, strat.Package, strat.Kind)
-				return nodeUpdateCommand(strat), "", strat.Kind, detail
+				return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail}
 			}
 			if !env.nodeBinHasBinary(strat.Kind, agent.Binary) {
 				continue
 			}
 			detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
-			return nodeUpdateCommand(strat), "", strat.Kind, detail
+			return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail}
 		case agents.KindBrew:
 			if !env.hasBrew {
 				continue
 			}
 			if env.brewHas(strat.Package) {
 				detail = fmt.Sprintf("brew formula %s installed", strat.Package)
-				return []string{"brew", "upgrade", strat.Package}, "", strat.Kind, detail
+				return resolvedUpdate{cmd: []string{"brew", "upgrade", strat.Package}, method: strat.Kind, detail: detail}
 			}
 		case agents.KindPip:
 			if !env.hasPython {
@@ -1179,7 +1219,7 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string,
 			}
 			if env.pipHas(strat.Package) {
 				detail = fmt.Sprintf("pip package %s installed", strat.Package)
-				return []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", strat.Package}, "", strat.Kind, detail
+				return resolvedUpdate{cmd: []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", strat.Package}, method: strat.Kind, detail: detail}
 			}
 		case agents.KindUv:
 			if !env.hasUv {
@@ -1187,7 +1227,7 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string,
 			}
 			if env.uvHas(strat.Package) {
 				detail = fmt.Sprintf("uv tool %s installed", strat.Package)
-				return []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@latest"}, "", strat.Kind, detail
+				return resolvedUpdate{cmd: []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@latest"}, method: strat.Kind, detail: detail}
 			}
 		case agents.KindVSCode:
 			if env.codeCmd == "" {
@@ -1196,18 +1236,66 @@ func resolveUpdate(agent agents.Agent, env *envState) ([]string, string, string,
 			}
 			if env.vscodeHas(strat.ExtensionID) {
 				detail = fmt.Sprintf("VS Code extension %s installed (via %s)", strat.ExtensionID, env.codeCmd)
-				return []string{env.codeCmd, "--install-extension", strat.ExtensionID, "--force"}, "", strat.Kind, detail
+				return resolvedUpdate{cmd: []string{env.codeCmd, "--install-extension", strat.ExtensionID, "--force"}, method: strat.Kind, detail: detail}
 			}
 		}
 	}
 
 	if codeMissing {
-		return nil, reasonMissingCode, "", "VS Code CLI not found (code/codium/code-insiders)"
+		return resolvedUpdate{reason: reasonMissingCode, detail: "VS Code CLI not found (code/codium/code-insiders)"}
 	}
 	if agent.Binary != "" && env.hasBinary(agent.Binary) {
-		return nil, reasonManualInstall, "", "binary found but no supported install method detected"
+		return resolvedUpdate{reason: reasonManualInstall, detail: "binary found but no supported install method detected"}
 	}
-	return nil, reasonMissing, "", "no supported binary or install method detected"
+	if nativeIdentityMiss != "" {
+		return resolvedUpdate{reason: reasonMissing, detail: nativeIdentityMiss + "; no supported binary or install method detected"}
+	}
+	return resolvedUpdate{reason: reasonMissing, detail: "no supported binary or install method detected"}
+}
+
+func nativeStrategyBinary(agent agents.Agent, strat agents.UpdateStrategy) string {
+	if strat.Binary != "" {
+		return strat.Binary
+	}
+	return agent.Binary
+}
+
+func nativeStrategyVersionCmd(agent agents.Agent, strat agents.UpdateStrategy) []string {
+	if len(strat.VersionCmd) > 0 {
+		return strat.VersionCmd
+	}
+	return agent.VersionCmd
+}
+
+const nativeHelpCheckTimeout = 2 * time.Second
+
+func nativeStrategyHelpMatches(env *envState, binary, contains string) bool {
+	if strings.TrimSpace(contains) == "" {
+		return true
+	}
+	if binary == "" {
+		return false
+	}
+	path := env.binaryPath(binary)
+	cacheKey := binary + "\x00" + path + "\x00" + contains
+	env.mu.Lock()
+	if env.helpChecks != nil {
+		if ok, found := env.helpChecks[cacheKey]; found {
+			env.mu.Unlock()
+			return ok
+		}
+	} else {
+		env.helpChecks = map[string]bool{}
+	}
+	env.mu.Unlock()
+
+	out, exitCode, _, _ := runCmd(env.baseCtx(), []string{binary, "--help"}, nativeHelpCheckTimeout)
+	ok := exitCode == 0 && strings.Contains(out, contains)
+
+	env.mu.Lock()
+	env.helpChecks[cacheKey] = ok
+	env.mu.Unlock()
+	return ok
 }
 
 func nodeUpdateCommand(strat agents.UpdateStrategy) []string {
@@ -1244,11 +1332,14 @@ func nodePackageName(strategies []agents.UpdateStrategy) string {
 
 const versionCmdTimeout = 10 * time.Second
 
-func getVersion(ctx context.Context, agent agents.Agent, env *envState, method string) string {
+func getVersion(ctx context.Context, agent agents.Agent, env *envState, method string, versionCmd []string) string {
 	if method == agents.KindVSCode && agent.ExtensionID != "" {
 		if version := env.vscodeVersion(agent.ExtensionID); version != "" {
 			return version
 		}
+	}
+	if len(versionCmd) > 0 {
+		return runVersionCmd(ctx, versionCmd)
 	}
 	if len(agent.VersionCmd) > 0 {
 		if agent.Binary == "" || env.hasBinary(agent.Binary) {
@@ -1907,6 +1998,7 @@ type envState struct {
 	uvTools      map[string]bool
 	codeOnce     sync.Once
 	codeExts     map[string]string
+	helpChecks   map[string]bool
 }
 
 func newEnv(ctx context.Context) *envState {
@@ -1921,6 +2013,7 @@ func newEnv(ctx context.Context) *envState {
 		hasPython:    hasBinary("python3"),
 		codeCmd:      detectCodeCmd(),
 		binPathCache: map[string]string{},
+		helpChecks:   map[string]bool{},
 	}
 }
 

@@ -33,6 +33,8 @@ Options:
 - `--skip <list>` comma-separated agent list to exclude
 - `-h, --help` show usage
 
+`agent` is accepted as an alias for `cursor` in `--only` and `--skip`.
+
 ## Examples
 
 Update everything:
@@ -68,7 +70,7 @@ uca --explain
 - codex (npm/pnpm/yarn/bun `@openai/codex`)
 - opencode (npm/pnpm/yarn/bun `opencode-ai`)
 - droid (npm/pnpm/yarn/bun `droid` or `droid update`)
-- cursor (`cursor-agent update`)
+- cursor (`agent update`, falling back to `cursor-agent update`)
 - copilot (Homebrew `copilot-cli` or npm/pnpm/yarn/bun `@github/copilot`)
 - cline (npm/pnpm/yarn/bun `cline` or VS Code extension `saoudrizwan.claude-dev`)
 - roocode (VS Code extension `RooVeterinaryInc.roo-cline`)
@@ -93,8 +95,9 @@ If a tool is installed but managed by an unknown method, it is marked as manual 
 
 ## Performance & reliability notes
 
-- Node-based agents are updated in batch per package manager when possible (e.g. one `npm update -g ...` for multiple npm-managed agents).
+- Node-based agents are updated in batch per package manager when possible (e.g. one `npm install -g ...@latest` for multiple npm-managed agents).
 - Updates that mutate global package manager state are serialized per manager (e.g. only one `npm` global update at a time).
+- Cursor's `cursor-agent` fallback is selected only when detecting the installed CLI; failed `agent update` runs are reported as failures rather than retried with `cursor-agent`.
 
 ## Output (default)
 ```

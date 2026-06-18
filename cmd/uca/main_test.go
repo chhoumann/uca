@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -112,6 +113,252 @@ func TestFormatRowUpdatingShowsTargetVersion(t *testing.T) {
 	got := formatRow(row, len(row.name), options{}, r)
 	if !strings.Contains(got, "codex-cli 0.90.0-alpha.5 → codex-cli 0.98.0") {
 		t.Fatalf("formatRow() did not include target version; got %q", got)
+	}
+}
+
+func TestFilterAgentsAcceptsCursorAgentAlias(t *testing.T) {
+	defaults := agents.Default()
+
+	selected, unknown := filterAgents(defaults, "agent", "")
+	if len(unknown) != 0 {
+		t.Fatalf("unknown = %#v, want none", unknown)
+	}
+	if len(selected) != 1 || selected[0].Name != "cursor" {
+		t.Fatalf("--only agent selected %#v, want only cursor", agentNames(selected))
+	}
+
+	selected, unknown = filterAgents(defaults, "agent,cursor", "")
+	if len(unknown) != 0 {
+		t.Fatalf("unknown = %#v, want none", unknown)
+	}
+	if len(selected) != 1 || selected[0].Name != "cursor" {
+		t.Fatalf("--only agent,cursor selected %#v, want only cursor", agentNames(selected))
+	}
+
+	selected, unknown = filterAgents(defaults, "", "agent")
+	if len(unknown) != 0 {
+		t.Fatalf("unknown = %#v, want none", unknown)
+	}
+	if hasAgentName(selected, "cursor") {
+		t.Fatalf("--skip agent selected cursor in %#v", agentNames(selected))
+	}
+
+	selected, unknown = filterAgents(defaults, "agent", "cursor")
+	if len(unknown) != 0 {
+		t.Fatalf("unknown = %#v, want none", unknown)
+	}
+	if len(selected) != 0 {
+		t.Fatalf("--only agent --skip cursor selected %#v, want none", agentNames(selected))
+	}
+
+	selected, unknown = filterAgents(defaults, "agent,nope", "")
+	if !reflect.DeepEqual(unknown, []string{"nope"}) {
+		t.Fatalf("unknown = %#v, want %#v", unknown, []string{"nope"})
+	}
+	if len(selected) != 1 || selected[0].Name != "cursor" {
+		t.Fatalf("--only agent,nope selected %#v, want only cursor", agentNames(selected))
+	}
+}
+
+func TestResolveUpdateCursorPrefersAgentWhenBothInstalled(t *testing.T) {
+	cursor := defaultAgent(t, "cursor")
+	withFakeCommands(t, map[string]fakeCommand{
+		"agent":        {help: "Usage: agent\nStart the Cursor Agent", version: "2026.6.15"},
+		"cursor-agent": {help: "Cursor Agent", version: "2026.6.14"},
+	})
+
+	resolved := resolveUpdate(cursor, newTestEnv())
+	if !reflect.DeepEqual(resolved.cmd, []string{"agent", "update"}) {
+		t.Fatalf("cmd = %#v, want %#v", resolved.cmd, []string{"agent", "update"})
+	}
+	if !reflect.DeepEqual(resolved.versionCmd, []string{"agent", "--version"}) {
+		t.Fatalf("versionCmd = %#v, want %#v", resolved.versionCmd, []string{"agent", "--version"})
+	}
+	if !strings.Contains(resolved.detail, "binary agent found") {
+		t.Fatalf("detail = %q, want selected agent binary", resolved.detail)
+	}
+}
+
+func TestResolveUpdateCursorUsesAgentWhenOnlyAgentInstalled(t *testing.T) {
+	cursor := defaultAgent(t, "cursor")
+	withFakeCommands(t, map[string]fakeCommand{
+		"agent": {help: "Usage: agent\nStart the Cursor Agent", version: "2026.6.15"},
+	})
+
+	resolved := resolveUpdate(cursor, newTestEnv())
+	if !reflect.DeepEqual(resolved.cmd, []string{"agent", "update"}) {
+		t.Fatalf("cmd = %#v, want %#v", resolved.cmd, []string{"agent", "update"})
+	}
+	if !reflect.DeepEqual(resolved.versionCmd, []string{"agent", "--version"}) {
+		t.Fatalf("versionCmd = %#v, want %#v", resolved.versionCmd, []string{"agent", "--version"})
+	}
+}
+
+func TestResolveUpdateCursorFallsBackToCursorAgent(t *testing.T) {
+	cursor := defaultAgent(t, "cursor")
+	withFakeCommands(t, map[string]fakeCommand{
+		"cursor-agent": {help: "Cursor Agent", version: "2026.6.14"},
+	})
+
+	resolved := resolveUpdate(cursor, newTestEnv())
+	if !reflect.DeepEqual(resolved.cmd, []string{"cursor-agent", "update"}) {
+		t.Fatalf("cmd = %#v, want %#v", resolved.cmd, []string{"cursor-agent", "update"})
+	}
+	if !reflect.DeepEqual(resolved.versionCmd, []string{"cursor-agent", "--version"}) {
+		t.Fatalf("versionCmd = %#v, want %#v", resolved.versionCmd, []string{"cursor-agent", "--version"})
+	}
+}
+
+func TestResolveUpdateCursorFallsBackWhenAgentIdentityFails(t *testing.T) {
+	cursor := defaultAgent(t, "cursor")
+	withFakeCommands(t, map[string]fakeCommand{
+		"agent":        {help: "Usage: agent\nOther Agent", version: "1.2.3"},
+		"cursor-agent": {help: "Cursor Agent", version: "2026.6.14"},
+	})
+
+	resolved := resolveUpdate(cursor, newTestEnv())
+	if !reflect.DeepEqual(resolved.cmd, []string{"cursor-agent", "update"}) {
+		t.Fatalf("cmd = %#v, want %#v", resolved.cmd, []string{"cursor-agent", "update"})
+	}
+	if resolved.reason != "" {
+		t.Fatalf("reason = %q, want empty", resolved.reason)
+	}
+}
+
+func TestResolveUpdateCursorRejectsUnrelatedAgent(t *testing.T) {
+	cursor := defaultAgent(t, "cursor")
+	withFakeCommands(t, map[string]fakeCommand{
+		"agent": {help: "Usage: agent\nOther Agent", version: "1.2.3"},
+	})
+
+	resolved := resolveUpdate(cursor, newTestEnv())
+	if resolved.cmd != nil {
+		t.Fatalf("cmd = %#v, want nil", resolved.cmd)
+	}
+	if resolved.reason != reasonMissing {
+		t.Fatalf("reason = %q, want %q", resolved.reason, reasonMissing)
+	}
+	if !strings.Contains(resolved.detail, "did not identify Cursor Agent") {
+		t.Fatalf("detail = %q, want Cursor Agent identity miss", resolved.detail)
+	}
+}
+
+func TestResolveUpdateNativeStrategyDefaultsToAgentFields(t *testing.T) {
+	amp := defaultAgent(t, "amp")
+	withFakeCommands(t, map[string]fakeCommand{
+		"amp": {help: "Usage: amp", version: "1.2.3"},
+	})
+
+	resolved := resolveUpdate(amp, newTestEnv())
+	if !reflect.DeepEqual(resolved.cmd, []string{"amp", "update"}) {
+		t.Fatalf("cmd = %#v, want %#v", resolved.cmd, []string{"amp", "update"})
+	}
+	if !reflect.DeepEqual(resolved.versionCmd, []string{"amp", "--version"}) {
+		t.Fatalf("versionCmd = %#v, want %#v", resolved.versionCmd, []string{"amp", "--version"})
+	}
+	if !strings.Contains(resolved.detail, "binary amp found") {
+		t.Fatalf("detail = %q, want selected amp binary", resolved.detail)
+	}
+}
+
+func TestRunAllDryRunCursorUsesSelectedVersionCommand(t *testing.T) {
+	cursor := defaultAgent(t, "cursor")
+	withFakeCommands(t, map[string]fakeCommand{
+		"agent": {help: "Usage: agent\nStart the Cursor Agent", version: "2026.6.15"},
+	})
+
+	results := runAllWithEvents(context.Background(), []agents.Agent{cursor}, newTestEnv(), options{DryRun: true}, nil)
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	if results[0].Agent.Name != "cursor" {
+		t.Fatalf("Agent.Name = %q, want cursor", results[0].Agent.Name)
+	}
+	if results[0].UpdateCmd != "agent update" {
+		t.Fatalf("UpdateCmd = %q, want %q", results[0].UpdateCmd, "agent update")
+	}
+	if results[0].Before != "2026.6.15" || results[0].After != "2026.6.15" {
+		t.Fatalf("Before/After = %q/%q, want selected agent version", results[0].Before, results[0].After)
+	}
+}
+
+func agentNames(list []agents.Agent) []string {
+	names := make([]string, 0, len(list))
+	for _, agent := range list {
+		names = append(names, agent.Name)
+	}
+	return names
+}
+
+func hasAgentName(list []agents.Agent, name string) bool {
+	for _, agent := range list {
+		if agent.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func defaultAgent(t *testing.T, name string) agents.Agent {
+	t.Helper()
+	for _, agent := range agents.Default() {
+		if agent.Name == name {
+			return agent
+		}
+	}
+	t.Fatalf("Default() is missing %s", name)
+	return agents.Agent{}
+}
+
+type fakeCommand struct {
+	help    string
+	version string
+}
+
+func withFakeCommands(t *testing.T, commands map[string]fakeCommand) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping shell-script PATH fixture on windows")
+	}
+	dir := t.TempDir()
+	for name, cmd := range commands {
+		writeFakeCommand(t, dir, name, cmd)
+	}
+	t.Setenv("PATH", dir)
+}
+
+func writeFakeCommand(t *testing.T, dir, name string, cmd fakeCommand) {
+	t.Helper()
+	body := "#!/bin/sh\n" +
+		"case \"$1\" in\n" +
+		"  --help)\n" +
+		"    printf '%s\\n' " + shellQuote(cmd.help) + "\n" +
+		"    ;;\n" +
+		"  --version)\n" +
+		"    printf '%s\\n' " + shellQuote(cmd.version) + "\n" +
+		"    ;;\n" +
+		"  update)\n" +
+		"    printf \"%s\\n\" \"updated\"\n" +
+		"    ;;\n" +
+		"  *)\n" +
+		"    printf \"%s\\n\" \"unknown\"\n" +
+		"    ;;\n" +
+		"esac\n"
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatalf("write fake %s: %v", name, err)
+	}
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func newTestEnv() *envState {
+	return &envState{
+		ctx:          context.Background(),
+		binPathCache: map[string]string{},
+		helpChecks:   map[string]bool{},
 	}
 }
 
