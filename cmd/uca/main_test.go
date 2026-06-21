@@ -628,6 +628,204 @@ func TestJSONStatus(t *testing.T) {
 	}
 }
 
+func TestCompareVersions(t *testing.T) {
+	tests := []struct {
+		name    string
+		current string
+		latest  string
+		want    checkState
+	}{
+		{name: "equal", current: "0.141.0", latest: "0.141.0", want: checkUpToDate},
+		{name: "embedded_current", current: "codex-cli 0.141.0", latest: "0.141.0", want: checkUpToDate},
+		{name: "v_prefix_normalized", current: "v2.0.1", latest: "2.0.1", want: checkUpToDate},
+		{name: "outdated", current: "0.140.0", latest: "0.141.0", want: checkOutdated},
+		{name: "no_latest", current: "1.0.0", latest: "", want: checkUnknown},
+		{name: "unparseable_current", current: "n/a", latest: "1.0.0", want: checkUnknown},
+		// Ordering, not equality: a build newer than the published latest is NOT outdated.
+		{name: "newer_than_latest", current: "1.2.0", latest: "1.1.0", want: checkUpToDate},
+		{name: "newer_prerelease", current: "0.142.0-rc.1", latest: "0.141.0", want: checkUpToDate},
+		{name: "build_metadata_ignored", current: "1.2.3+build.5", latest: "1.2.3", want: checkUpToDate},
+		{name: "component_count_equiv", current: "1.2", latest: "1.2.0", want: checkUpToDate},
+		{name: "prerelease_behind_release", current: "1.2.0-rc.1", latest: "1.2.0", want: checkOutdated},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := compareVersions(tt.current, tt.latest); got != tt.want {
+				t.Fatalf("compareVersions(%q,%q) = %q, want %q", tt.current, tt.latest, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasOutdated(t *testing.T) {
+	if hasOutdated([]checkResult{{State: checkUpToDate}, {State: checkUnknown}, {State: checkMissing}}) {
+		t.Fatal("hasOutdated = true for no-outdated slice, want false")
+	}
+	if !hasOutdated([]checkResult{{State: checkUpToDate}, {State: checkOutdated}}) {
+		t.Fatal("hasOutdated = false with an outdated entry, want true")
+	}
+}
+
+func TestLatestVersionDispatch(t *testing.T) {
+	env := newTestEnv()
+	// Non-knowable methods short-circuit to "".
+	for _, m := range []string{agents.KindNative, agents.KindPip, agents.KindUv, agents.KindVSCode} {
+		if got := env.latestVersion(context.Background(), m, "pkg"); got != "" {
+			t.Fatalf("latestVersion(%q) = %q, want empty", m, got)
+		}
+	}
+}
+
+func TestBrewLatestLivePath(t *testing.T) {
+	_, env := fakePathEnv(t, map[string]string{
+		"brew": "#!/bin/sh\necho '{\"formulae\":[{\"versions\":{\"stable\":\"1.2.3\"}}]}'\n",
+	})
+	if got := env.brewLatest(context.Background(), "copilot-cli"); got != "1.2.3" {
+		t.Fatalf("brewLatest = %q, want 1.2.3", got)
+	}
+	if got := env.latestVersion(context.Background(), agents.KindBrew, "copilot-cli"); got != "1.2.3" {
+		t.Fatalf("latestVersion(brew) = %q, want 1.2.3", got)
+	}
+}
+
+func TestRunCheckMissingAgent(t *testing.T) {
+	// No managers, binary absent -> missing.
+	_, env := fakePathEnv(t, map[string]string{})
+	list := []agents.Agent{{Name: "ghost", Binary: "ghost", VersionCmd: []string{"ghost", "--version"}, Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "ghost"}}}}
+	results := runCheck(context.Background(), list, env)
+	if len(results) != 1 || results[0].State != checkMissing {
+		t.Fatalf("runCheck(missing) = %#v, want one checkMissing", results)
+	}
+	if hasOutdated(results) {
+		t.Fatal("missing agent should not be outdated")
+	}
+}
+
+func TestPrintCheck(t *testing.T) {
+	results := []checkResult{
+		{Agent: agents.Agent{Name: "codex"}, Method: "bun", State: checkUpToDate, Current: "1.0.0"},
+		{Agent: agents.Agent{Name: "copilot"}, Method: "brew", State: checkOutdated, Current: "1.0.0", Latest: "1.1.0"},
+		{Agent: agents.Agent{Name: "claude"}, Method: "native", State: checkUnknown, Current: "2.0.0"},
+		{Agent: agents.Agent{Name: "gemini"}, State: checkMissing, Reason: "missing"},
+	}
+	out := captureStdout(t, func() { printCheck(results, []string{"bogus"}, options{}) })
+	for _, want := range []string{
+		"outdated (1.0.0 -> 1.1.0)",
+		"up-to-date (1.0.0)",
+		"2.0.0 (latest unknown)",
+		"outdated: copilot",
+		"up-to-date: codex",
+		"skipped (unknown): bogus",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("printCheck output missing %q; got:\n%s", want, out)
+		}
+	}
+	// --explain appends the method label.
+	out = captureStdout(t, func() { printCheck(results[:1], nil, options{Explain: true}) })
+	if !strings.Contains(out, "[bun]") {
+		t.Fatalf("printCheck --explain missing method label; got:\n%s", out)
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				b.Write(buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+		done <- b.String()
+	}()
+	fn()
+	_ = w.Close()
+	os.Stdout = orig
+	return <-done
+}
+
+func TestParseBrewLatest(t *testing.T) {
+	tests := []struct {
+		name string
+		out  string
+		want string
+	}{
+		{name: "v2", out: `{"formulae":[{"versions":{"stable":"1.2.3"}}]}`, want: "1.2.3"},
+		{name: "empty_formulae", out: `{"formulae":[]}`, want: ""},
+		{name: "bad_json", out: "not json", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseBrewLatest(tt.out); got != tt.want {
+				t.Fatalf("parseBrewLatest(%q) = %q, want %q", tt.out, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildCheckReport(t *testing.T) {
+	results := []checkResult{
+		{Agent: agents.Agent{Name: "codex"}, Method: "bun", State: checkUpToDate, Current: "1.0.0", Latest: "1.0.0"},
+		{Agent: agents.Agent{Name: "copilot"}, Method: "brew", State: checkOutdated, Current: "1.0.0", Latest: "1.1.0"},
+		{Agent: agents.Agent{Name: "claude"}, Method: "native", State: checkUnknown, Current: "2.0.0"},
+		{Agent: agents.Agent{Name: "gemini"}, State: checkMissing, Reason: "missing"},
+	}
+	rep := buildCheckReport(results, []string{"bogus"})
+	want := map[string]int{"up-to-date": 1, "outdated": 1, "unknown": 1, "missing": 1}
+	if !reflect.DeepEqual(rep.Summary, want) {
+		t.Fatalf("summary = %#v, want %#v", rep.Summary, want)
+	}
+	if !reflect.DeepEqual(rep.UnknownNames, []string{"bogus"}) {
+		t.Fatalf("unknownNames = %#v", rep.UnknownNames)
+	}
+	if !hasOutdated(results) {
+		t.Fatal("hasOutdated = false, want true")
+	}
+}
+
+func TestKnownAgentNamesSorted(t *testing.T) {
+	got := knownAgentNames()
+	for _, name := range []string{"amp", "claude", "codex", "cursor"} {
+		if !strings.Contains(got, name) {
+			t.Fatalf("knownAgentNames() = %q, missing %q", got, name)
+		}
+	}
+	if !strings.Contains(got, "aider, amp") {
+		t.Fatalf("knownAgentNames() not sorted: %q", got)
+	}
+}
+
+func TestRunCheckDetectsOutdated(t *testing.T) {
+	env := nodeIntegrationEnv(t, map[string]string{
+		"npm": "#!/bin/sh\ncase \"$1\" in\n  view) echo 2.0.0 ;;\nesac\n",
+		"one": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
+	})
+	list := []agents.Agent{{Name: "one", Binary: "one", VersionCmd: []string{"one", "--version"}, Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-one"}}}}
+	results := runCheck(context.Background(), list, env)
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	if results[0].State != checkOutdated {
+		t.Fatalf("state = %q, want outdated (current=%q latest=%q)", results[0].State, results[0].Current, results[0].Latest)
+	}
+	if results[0].Current != "1.0.0" || results[0].Latest != "2.0.0" {
+		t.Fatalf("current/latest = %q/%q", results[0].Current, results[0].Latest)
+	}
+}
+
 func TestApplyEvent(t *testing.T) {
 	// detect of a manual-install agent -> visible, shown as skipped.
 	row := uiRow{}
