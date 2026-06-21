@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -68,7 +69,6 @@ var version = "dev"
 
 const (
 	reasonMissing       = "missing"
-	reasonMissingBun    = "missing bun"
 	reasonMissingCode   = "missing vscode"
 	reasonManualInstall = "manual install"
 	reasonQuota         = "quota"
@@ -79,7 +79,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	opts := parseFlags()
+	opts, err := parseFlags(os.Args[1:])
+	if err != nil {
+		// parseFlags already printed the error and the custom usage to stderr.
+		os.Exit(2)
+	}
 	if opts.Help {
 		usage()
 		return
@@ -88,9 +92,19 @@ func main() {
 		fmt.Fprintln(os.Stdout, version)
 		return
 	}
+	if err := validateOptions(opts); err != nil {
+		fmt.Fprintf(os.Stderr, "uca: %v\n", err)
+		usageTo(os.Stderr)
+		os.Exit(2)
+	}
 
 	all := agents.Default()
 	selected, unknown := filterAgents(all, opts.Only, opts.Skip)
+	if len(selected) == 0 {
+		fmt.Fprintln(os.Stdout, noSelectionMessage(unknown))
+		printSummary(nil, unknown)
+		return
+	}
 
 	env := newEnv(ctx)
 	uiEnabled := shouldShowUI(opts)
@@ -112,32 +126,63 @@ func main() {
 	}
 }
 
-func parseFlags() options {
+func parseFlags(args []string) (options, error) {
 	var opts options
-	flag.BoolVar(&opts.Parallel, "p", false, "run updates in parallel")
-	flag.BoolVar(&opts.Parallel, "parallel", false, "run updates in parallel")
-	flag.BoolVar(&opts.Serial, "serial", false, "run updates sequentially")
-	flag.BoolVar(&opts.Safe, "safe", false, "use safer execution (limits concurrency)")
-	flag.DurationVar(&opts.Timeout, "timeout", 15*time.Minute, "timeout per update command (0 disables)")
-	flag.IntVar(&opts.Concurrency, "concurrency", 0, "max concurrent update commands (0 disables)")
-	flag.BoolVar(&opts.Verbose, "v", false, "show update command output")
-	flag.BoolVar(&opts.Verbose, "verbose", false, "show update command output")
-	flag.BoolVar(&opts.Quiet, "q", false, "summary only")
-	flag.BoolVar(&opts.Quiet, "quiet", false, "summary only")
-	flag.BoolVar(&opts.DryRun, "n", false, "print commands without executing")
-	flag.BoolVar(&opts.DryRun, "dry-run", false, "print commands without executing")
-	flag.BoolVar(&opts.Explain, "explain", false, "explain detection and update method")
-	flag.StringVar(&opts.Only, "only", "", "comma-separated agent list")
-	flag.StringVar(&opts.Skip, "skip", "", "comma-separated agent list to exclude")
-	flag.BoolVar(&opts.Help, "h", false, "show help")
-	flag.BoolVar(&opts.Help, "help", false, "show help")
-	flag.BoolVar(&opts.Version, "version", false, "show version")
-	flag.Parse()
-	return opts
+	fs := flag.NewFlagSet("uca", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	// On a parse error, render the polished custom usage (to stderr) instead of
+	// Go's raw PrintDefaults dump, keeping error output consistent with --help.
+	fs.Usage = func() { usageTo(os.Stderr) }
+	fs.BoolVar(&opts.Parallel, "p", false, "run updates in parallel")
+	fs.BoolVar(&opts.Parallel, "parallel", false, "run updates in parallel")
+	fs.BoolVar(&opts.Serial, "serial", false, "run updates sequentially")
+	fs.BoolVar(&opts.Safe, "safe", false, "use safer execution (limits concurrency)")
+	fs.DurationVar(&opts.Timeout, "timeout", 15*time.Minute, "timeout per update command (0 disables)")
+	fs.IntVar(&opts.Concurrency, "concurrency", 0, "max concurrent update commands (0 disables)")
+	fs.BoolVar(&opts.Verbose, "v", false, "show update command output")
+	fs.BoolVar(&opts.Verbose, "verbose", false, "show update command output")
+	fs.BoolVar(&opts.Quiet, "q", false, "summary only")
+	fs.BoolVar(&opts.Quiet, "quiet", false, "summary only")
+	fs.BoolVar(&opts.DryRun, "n", false, "print commands without executing")
+	fs.BoolVar(&opts.DryRun, "dry-run", false, "print commands without executing")
+	fs.BoolVar(&opts.Explain, "explain", false, "explain detection and update method")
+	fs.StringVar(&opts.Only, "only", "", "comma-separated agent list")
+	fs.StringVar(&opts.Skip, "skip", "", "comma-separated agent list to exclude")
+	fs.BoolVar(&opts.Help, "h", false, "show help")
+	fs.BoolVar(&opts.Help, "help", false, "show help")
+	fs.BoolVar(&opts.Version, "version", false, "show version")
+	if err := fs.Parse(args); err != nil {
+		return opts, err
+	}
+	return opts, nil
+}
+
+// validateOptions rejects flag combinations that are contradictory or
+// nonsensical, so the tool fails fast with a clear message instead of silently
+// picking a surprising behavior.
+func validateOptions(opts options) error {
+	if opts.Serial && opts.Parallel {
+		return errors.New("--serial and --parallel are mutually exclusive")
+	}
+	if opts.Concurrency < 0 {
+		return errors.New("--concurrency must be >= 0")
+	}
+	return nil
+}
+
+func noSelectionMessage(unknown []string) string {
+	if len(unknown) > 0 {
+		return "no agents selected (unknown: " + strings.Join(unknown, " ") + ")"
+	}
+	return "no agents selected"
 }
 
 func usage() {
-	fmt.Fprintf(os.Stdout, `uca - update multiple coding-agent CLIs
+	usageTo(os.Stdout)
+}
+
+func usageTo(w io.Writer) {
+	fmt.Fprintf(w, `uca - update multiple coding-agent CLIs
 
 Usage:
   uca [options]
@@ -176,6 +221,11 @@ func filterAgents(all []agents.Agent, onlyRaw, skipRaw string) ([]agents.Agent, 
 	only, onlyUnknown := normalizeAgentList(parseList(onlyRaw), known)
 	skip, skipUnknown := normalizeAgentList(parseList(skipRaw), known)
 
+	// Distinguish "no --only given" (select all) from "--only given but every
+	// entry was unknown" (select none). Without this, a typo like `--only bogus`
+	// would fall through to selecting every agent.
+	onlyProvided := strings.TrimSpace(onlyRaw) != ""
+
 	unknownSet := map[string]bool{}
 	for _, name := range onlyUnknown {
 		unknownSet[name] = true
@@ -187,7 +237,7 @@ func filterAgents(all []agents.Agent, onlyRaw, skipRaw string) ([]agents.Agent, 
 	selected := make([]agents.Agent, 0, len(all))
 	for _, agent := range all {
 		name := agent.Name
-		if len(only) > 0 && !only[name] {
+		if onlyProvided && !only[name] {
 			continue
 		}
 		if skip[name] {
@@ -334,7 +384,7 @@ func effectiveConcurrency(opts options, numTasks int) int {
 	if opts.Serial {
 		return 1
 	}
-	if opts.Safe && opts.Concurrency == 0 {
+	if opts.Safe && opts.Concurrency <= 0 {
 		return 1
 	}
 	if opts.Concurrency > 0 {
@@ -728,7 +778,10 @@ func shouldUseColor() bool {
 
 func shouldUseUnicode() bool {
 	locale := strings.ToUpper(os.Getenv("LC_ALL") + os.Getenv("LC_CTYPE") + os.Getenv("LANG"))
-	return strings.Contains(locale, "UTF-8")
+	// Match both the macOS canonical form (en_US.UTF-8) and the glibc/Linux
+	// canonical lowercase form (en_US.utf8) so Linux UTF-8 terminals still get
+	// the unicode glyphs.
+	return strings.Contains(locale, "UTF-8") || strings.Contains(locale, "UTF8")
 }
 
 func termWidth(out *os.File) int {
@@ -882,7 +935,10 @@ func renderDashboard(rows []uiRow, nameWidth int, start time.Time, opts options,
 		}
 	}
 	header := fmt.Sprintf("uca  %s  %d/%d  ok:%d same:%d fail:%d  %s", spinnerGlyph(time.Since(start), r.useUnicode), completed, visibleTotal, updated, unchanged, failed, fmtElapsed(time.Since(start)))
-	if detected < total {
+	// Only advertise detection progress while it is genuinely ongoing. Once any
+	// row has finished, a lingering "detecting" suffix is misleading (this shows
+	// up in dry-run, where detect and finish events are emitted back-to-back).
+	if detected < total && completed == 0 {
 		header = fmt.Sprintf("%s  detecting %d/%d", header, detected, total)
 	}
 	lines := make([]string, 0, visibleTotal+2)
@@ -924,6 +980,15 @@ func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
 	iconPlain := statusIcon(row, r.useUnicode)
 	iconColored := colorize(iconPlain, statusLabel, r.useColor)
 
+	// Gate the version separators on the locale like every other glyph, so a
+	// non-UTF-8 terminal does not get a stray unicode arrow/ellipsis.
+	arrow := "->"
+	ellipsis := "..."
+	if r.useUnicode {
+		arrow = "→"
+		ellipsis = "…"
+	}
+
 	version := "--"
 	elapsed := "--"
 	info := ""
@@ -933,21 +998,21 @@ func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
 	case "updating":
 		statusLabel = statusLabelFor(row)
 		if strings.TrimSpace(row.after) != "" {
-			version = fmt.Sprintf("%s → %s", safeVersion(row.before), safeVersion(row.after))
+			version = fmt.Sprintf("%s %s %s", safeVersion(row.before), arrow, safeVersion(row.after))
 		} else {
-			version = fmt.Sprintf("%s → …", safeVersion(row.before))
+			version = fmt.Sprintf("%s %s %s", safeVersion(row.before), arrow, ellipsis)
 		}
 		if !row.start.IsZero() {
 			elapsed = fmtElapsed(time.Since(row.start))
 		}
 	case statusUpdated:
-		version = fmt.Sprintf("%s → %s", safeVersion(row.before), safeVersion(row.after))
+		version = fmt.Sprintf("%s %s %s", safeVersion(row.before), arrow, safeVersion(row.after))
 		elapsed = fmtElapsed(row.duration)
 	case statusUnchanged:
-		version = fmt.Sprintf("%s → %s", safeVersion(row.before), safeVersion(row.after))
+		version = fmt.Sprintf("%s %s %s", safeVersion(row.before), arrow, safeVersion(row.after))
 		elapsed = fmtElapsed(row.duration)
 	case statusFailed:
-		version = fmt.Sprintf("%s → %s", safeVersion(row.before), safeVersion(row.after))
+		version = fmt.Sprintf("%s %s %s", safeVersion(row.before), arrow, safeVersion(row.after))
 		elapsed = fmtElapsed(row.duration)
 		if row.reason != "" {
 			info = row.reason
@@ -973,9 +1038,23 @@ func formatRow(row uiRow, nameWidth int, opts options, r *uiRenderer) string {
 	line := fmt.Sprintf("%-*s %s %-9s %s %6s%s", nameWidth, row.name, iconPlain, statusLabel, version, elapsed, info)
 	line = fitLine(line, r.width, r.useUnicode)
 	if iconPlain != iconColored {
-		line = strings.Replace(line, iconPlain, iconColored, 1)
+		line = recolorIcon(line, nameWidth, iconPlain, iconColored)
 	}
 	return line
+}
+
+// recolorIcon wraps the status icon in its colored form at its known position
+// (immediately after the name column and one space) rather than at the first
+// textual match. A blind strings.Replace would corrupt rows whose name contains
+// the plain icon token, e.g. the "dr" dry-run icon inside "droid" or the "x"
+// failed icon inside "codex" on ASCII (non-unicode) terminals.
+func recolorIcon(line string, nameWidth int, iconPlain, iconColored string) string {
+	start := nameWidth + 1
+	if start+len(iconPlain) <= len(line) && line[start:start+len(iconPlain)] == iconPlain {
+		return line[:start] + iconColored + line[start+len(iconPlain):]
+	}
+	// Fallback (e.g. if the line was truncated before the icon): best effort.
+	return strings.Replace(line, iconPlain, iconColored, 1)
 }
 
 func statusLabelFor(row uiRow) string {
@@ -1493,6 +1572,13 @@ const (
 	exitCodeCanceled = 130
 )
 
+// cmdWaitDelay bounds how long Wait blocks after a command's context is
+// canceled (timeout/SIGINT) or after the process exits while a child still
+// holds an output pipe open. Without it, a single orphaned grandchild (e.g. a
+// `sleep` spawned by an update script) keeps the pipe open and makes --timeout
+// and Ctrl-C effectively non-responsive.
+const cmdWaitDelay = 5 * time.Second
+
 func runCmd(ctx context.Context, args []string, timeout time.Duration) (string, int, time.Duration, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1510,16 +1596,26 @@ func runCmd(ctx context.Context, args []string, timeout time.Duration) (string, 
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	cmd.Stdin = nil
+	cmd.WaitDelay = cmdWaitDelay
+	configureProcessGroup(cmd)
 	err := cmd.Run()
 	duration := time.Since(start)
 	if err == nil {
 		return buf.String(), 0, duration, nil
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	// On timeout/cancellation exec kills the child with SIGKILL, so the returned
+	// error is an *exec.ExitError ("signal: killed", code -1), not a context
+	// error. Inspect the context state directly to classify these correctly.
+	if cmdCtx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
 		return buf.String(), exitCodeTimeout, duration, err
 	}
-	if errors.Is(err, context.Canceled) {
+	if ctx.Err() == context.Canceled || errors.Is(err, context.Canceled) {
 		return buf.String(), exitCodeCanceled, duration, err
+	}
+	// A WaitDelay expiry after the process already exited cleanly (a child kept
+	// an output pipe open) is not a real failure.
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0 {
+		return buf.String(), 0, duration, nil
 	}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		return buf.String(), exitErr.ExitCode(), duration, err
@@ -1765,16 +1861,22 @@ func runCmdStdout(ctx context.Context, args []string, timeout time.Duration) (st
 	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	cmd.WaitDelay = cmdWaitDelay
+	configureProcessGroup(cmd)
 	out, err := cmd.Output()
 	duration := time.Since(start)
 	if err == nil {
 		return string(out), 0, duration, nil
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	// See runCmd: a killed child surfaces as an ExitError, not a context error.
+	if cmdCtx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
 		return string(out), exitCodeTimeout, duration, err
 	}
-	if errors.Is(err, context.Canceled) {
+	if ctx.Err() == context.Canceled || errors.Is(err, context.Canceled) {
 		return string(out), exitCodeCanceled, duration, err
+	}
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0 {
+		return string(out), 0, duration, nil
 	}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		return string(out), exitErr.ExitCode(), duration, err
@@ -1907,7 +2009,6 @@ func printSummary(results []result, unknown []string) {
 	updated := []string{}
 	unchanged := []string{}
 	skippedMissing := []string{}
-	skippedBun := []string{}
 	skippedCode := []string{}
 	skippedManual := []string{}
 	failed := []string{}
@@ -1920,8 +2021,6 @@ func printSummary(results []result, unknown []string) {
 			unchanged = append(unchanged, res.Agent.Name)
 		case statusSkipped:
 			switch res.Reason {
-			case reasonMissingBun:
-				skippedBun = append(skippedBun, res.Agent.Name)
 			case reasonMissingCode:
 				skippedCode = append(skippedCode, res.Agent.Name)
 			case reasonManualInstall:
@@ -1937,7 +2036,6 @@ func printSummary(results []result, unknown []string) {
 	printSummaryLine("updated", updated)
 	printSummaryLine("unchanged", unchanged)
 	printSummaryLine("skipped (missing)", skippedMissing)
-	printSummaryLine("skipped (missing bun)", skippedBun)
 	printSummaryLine("skipped (missing vscode)", skippedCode)
 	printSummaryLine("skipped (manual install)", skippedManual)
 	if len(unknown) > 0 {
