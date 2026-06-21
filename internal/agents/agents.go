@@ -1,23 +1,24 @@
 package agents
 
 type UpdateStrategy struct {
-	Kind         string
-	Command      []string
-	Package      string
-	ExtensionID  string
-	Binary       string
-	VersionCmd   []string
-	HelpContains string
+	Kind         string   `json:"kind"`
+	Command      []string `json:"command,omitempty"`
+	Package      string   `json:"package,omitempty"`
+	ExtensionID  string   `json:"extensionId,omitempty"`
+	Binary       string   `json:"binary,omitempty"`
+	VersionCmd   []string `json:"versionCmd,omitempty"`
+	HelpContains string   `json:"helpContains,omitempty"`
 }
 
-// Agent defines how to update and version a CLI tool.
+// Agent defines how to update and version a CLI tool. The JSON tags let users
+// describe their own agents in a config file (see cmd/uca loadConfigAgents).
 type Agent struct {
-	Name        string
-	Binary      string
-	VersionCmd  []string
-	ExtensionID string
-	Aliases     []string
-	Strategies  []UpdateStrategy
+	Name        string           `json:"name"`
+	Binary      string           `json:"binary,omitempty"`
+	VersionCmd  []string         `json:"versionCmd,omitempty"`
+	ExtensionID string           `json:"extensionId,omitempty"`
+	Aliases     []string         `json:"aliases,omitempty"`
+	Strategies  []UpdateStrategy `json:"strategies,omitempty"`
 }
 
 const (
@@ -31,6 +32,18 @@ const (
 	KindUv     = "uv"
 	KindVSCode = "vscode"
 )
+
+// ValidKind reports whether kind is a recognized update-strategy kind. Used to
+// validate user-supplied config so a typo'd kind fails loudly instead of being
+// silently dropped by the resolver.
+func ValidKind(kind string) bool {
+	switch kind {
+	case KindNative, KindBun, KindBrew, KindNpm, KindPnpm, KindYarn, KindPip, KindUv, KindVSCode:
+		return true
+	default:
+		return false
+	}
+}
 
 func nodePackageStrategies(pkg string) []UpdateStrategy {
 	return []UpdateStrategy{

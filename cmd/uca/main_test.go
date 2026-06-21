@@ -413,6 +413,88 @@ func TestApplyEnvDefaultsIgnoresInvalid(t *testing.T) {
 	}
 }
 
+func TestParseConfigAgents(t *testing.T) {
+	good := `{"agents":[{"name":"foo","binary":"foo","strategies":[{"kind":"npm","package":"foo-pkg"}]}]}`
+	got, err := parseConfigAgents([]byte(good), "cfg")
+	if err != nil {
+		t.Fatalf("parseConfigAgents(good) err = %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "foo" || got[0].Strategies[0].Package != "foo-pkg" {
+		t.Fatalf("parseConfigAgents(good) = %#v", got)
+	}
+
+	if _, err := parseConfigAgents([]byte(`{"agents":[{"naem":"typo"}]}`), "cfg"); err == nil {
+		t.Fatal("unknown field should error")
+	}
+	if _, err := parseConfigAgents([]byte(`{"agents":[{"binary":"x"}]}`), "cfg"); err == nil {
+		t.Fatal("missing name should error")
+	}
+	if _, err := parseConfigAgents([]byte(`not json`), "cfg"); err == nil {
+		t.Fatal("invalid json should error")
+	}
+	// An unknown strategy kind fails loudly rather than being silently dropped.
+	if _, err := parseConfigAgents([]byte(`{"agents":[{"name":"x","strategies":[{"kind":"cargo"}]}]}`), "cfg"); err == nil {
+		t.Fatal("unknown strategy kind should error")
+	}
+	// encoding/json matches keys case-insensitively, so a case-variant of a real
+	// key is accepted (documented behavior, not flagged by DisallowUnknownFields).
+	if _, err := parseConfigAgents([]byte(`{"agents":[{"NAME":"x"}]}`), "cfg"); err != nil {
+		t.Fatalf("case-variant key should be accepted; got %v", err)
+	}
+}
+
+func TestFilterAgentsUserAgentUppercaseTargetable(t *testing.T) {
+	all := append(agents.Default(), agents.Agent{Name: "MyTool", Binary: "mytool"})
+	selected, unknown := filterAgents(all, "mytool", "")
+	if len(unknown) != 0 {
+		t.Fatalf("unknown = %#v, want none", unknown)
+	}
+	if len(selected) != 1 || selected[0].Name != "MyTool" {
+		t.Fatalf("--only mytool selected %#v, want the uppercase-named user agent", agentNames(selected))
+	}
+}
+
+func TestMergeAgents(t *testing.T) {
+	base := []agents.Agent{{Name: "claude"}, {Name: "codex"}}
+	user := []agents.Agent{
+		{Name: "Claude", Binary: "custom-claude"}, // overrides built-in (case-insensitive)
+		{Name: "mytool", Binary: "mytool"},        // new
+	}
+	merged := mergeAgents(base, user)
+	if len(merged) != 3 {
+		t.Fatalf("len(merged) = %d, want 3", len(merged))
+	}
+	if merged[0].Name != "Claude" || merged[0].Binary != "custom-claude" {
+		t.Fatalf("override failed: merged[0] = %#v", merged[0])
+	}
+	if merged[2].Name != "mytool" {
+		t.Fatalf("append failed: merged[2] = %#v", merged[2])
+	}
+}
+
+func TestLoadConfigAgentsFromFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"agents":[{"name":"mytool","binary":"mytool"}]}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("UCA_CONFIG", path)
+	got, err := loadConfigAgents()
+	if err != nil {
+		t.Fatalf("loadConfigAgents err = %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "mytool" {
+		t.Fatalf("loadConfigAgents = %#v", got)
+	}
+
+	// A non-existent config is not an error.
+	t.Setenv("UCA_CONFIG", filepath.Join(dir, "does-not-exist.json"))
+	got, err = loadConfigAgents()
+	if err != nil || got != nil {
+		t.Fatalf("missing config: got %#v, err %v; want nil,nil", got, err)
+	}
+}
+
 func TestValidateOptions(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -848,7 +930,7 @@ func TestBuildCheckReport(t *testing.T) {
 }
 
 func TestKnownAgentNamesSorted(t *testing.T) {
-	got := knownAgentNames()
+	got := knownAgentNames(agents.Default())
 	for _, name := range []string{"amp", "claude", "codex", "cursor"} {
 		if !strings.Contains(got, name) {
 			t.Fatalf("knownAgentNames() = %q, missing %q", got, name)
@@ -856,6 +938,11 @@ func TestKnownAgentNamesSorted(t *testing.T) {
 	}
 	if !strings.Contains(got, "aider, amp") {
 		t.Fatalf("knownAgentNames() not sorted: %q", got)
+	}
+	// user-defined agents appear too
+	custom := append(agents.Default(), agents.Agent{Name: "zzcustom"})
+	if !strings.Contains(knownAgentNames(custom), "zzcustom") {
+		t.Fatal("knownAgentNames should include user-defined agents")
 	}
 }
 
