@@ -921,7 +921,7 @@ func TestResolveUpdateBrew(t *testing.T) {
 func TestResolveUpdatePip(t *testing.T) {
 	// uv absent, pip present -> pip strategy (the fallback after uv).
 	_, env := fakePathEnv(t, map[string]string{
-		"python3": "#!/bin/sh\nif [ \"$3\" = \"show\" ]; then exit 0; fi\nexit 1\n",
+		"python3": "#!/bin/sh\nif [ \"$3\" = \"list\" ]; then echo \"aider-chat==1.2.3\"; exit 0; fi\nexit 1\n",
 	})
 	env.hasPython = true
 	resolved := resolveUpdate(defaultAgent(t, "aider"), env)
@@ -931,6 +931,17 @@ func TestResolveUpdatePip(t *testing.T) {
 	}
 	if resolved.method != agents.KindPip {
 		t.Fatalf("pip method = %q", resolved.method)
+	}
+}
+
+func TestPipHasNormalizesNames(t *testing.T) {
+	// pip canonicalizes names (case-insensitive, "_"->"-"); detection must match.
+	_, env := fakePathEnv(t, map[string]string{
+		"python3": "#!/bin/sh\nif [ \"$3\" = \"list\" ]; then echo \"Aider_Chat==1.0.0\"; exit 0; fi\nexit 1\n",
+	})
+	env.hasPython = true
+	if !env.pipHas("aider-chat") {
+		t.Fatal("pipHas(aider-chat) = false, want true (name normalization)")
 	}
 }
 
@@ -1031,6 +1042,30 @@ func TestRunAllWithEventsBatchesNodeUpdates(t *testing.T) {
 	for _, res := range results {
 		if res.Status != statusUnchanged {
 			t.Fatalf("%s status = %q, want unchanged", res.Agent.Name, res.Status)
+		}
+	}
+}
+
+func TestRunAllWithEventsCanceledKeepsPerAgentResults(t *testing.T) {
+	// A context canceled before scheduling must not collapse every unscheduled
+	// agent onto results[0]; each agent keeps its own slot (as skipped).
+	env := nodeIntegrationEnv(t, map[string]string{
+		"npm": "#!/bin/sh\nexit 0\n",
+		"one": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
+		"two": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	results := runAllWithEvents(ctx, nodeTestAgents(), env, options{}, nil)
+	if len(results) != 2 {
+		t.Fatalf("len(results) = %d, want 2", len(results))
+	}
+	if results[0].Agent.Name != "one" || results[1].Agent.Name != "two" {
+		t.Fatalf("results collapsed: [0]=%q [1]=%q", results[0].Agent.Name, results[1].Agent.Name)
+	}
+	for _, res := range results {
+		if res.Status != statusSkipped {
+			t.Fatalf("%s status = %q, want skipped", res.Agent.Name, res.Status)
 		}
 	}
 }

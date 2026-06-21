@@ -135,6 +135,9 @@ func main() {
 		} else {
 			printCheck(checkResults, unknown, opts)
 		}
+		if ctx.Err() == context.Canceled {
+			os.Exit(130)
+		}
 		if hasOutdated(checkResults) {
 			os.Exit(10)
 		}
@@ -159,6 +162,11 @@ func main() {
 		printSummary(results, unknown)
 	}
 
+	// A user interrupt (Ctrl-C / SIGTERM) exits with the conventional 130 so
+	// scripts can distinguish cancellation from an agent-update failure (1).
+	if ctx.Err() == context.Canceled {
+		os.Exit(130)
+	}
 	if hasFailures(results) {
 		os.Exit(1)
 	}
@@ -487,24 +495,45 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 	results := make([]result, len(selected))
 	works := make([]agentWork, len(selected))
 
+	// Resolve agents concurrently: each resolveUpdate may shell out (native help
+	// probe, brew/pip/uv detection) and trigger the once-loaders, so running them
+	// in parallel makes detection ~max(slowest) instead of the serial sum. The
+	// loaders are sync.Once/mutex-guarded, so this is safe.
+	// Seed identity fields up front so an entry left unscheduled by a mid-loop
+	// cancellation still maps to its own index (rather than collapsing onto the
+	// zero-value index 0) in the downstream emission loops.
 	for i, agent := range selected {
-		resolved := resolveUpdate(agent, env)
-		show := resolved.cmd != nil || resolved.reason == reasonManualInstall
-		work := agentWork{
-			agent:           agent,
-			index:           i,
-			show:            show,
-			method:          resolved.method,
-			explain:         resolved.detail,
-			reason:          resolved.reason,
-			versionCmd:      resolved.versionCmd,
-			updateCmdSingle: resolved.cmd,
-		}
-		if isNodeKind(resolved.method) {
-			work.nodePackageName = nodePackageName(agent.Strategies)
-		}
-		works[i] = work
+		works[i] = agentWork{agent: agent, index: i}
 	}
+	var resolveWG sync.WaitGroup
+	resolveSem := make(chan struct{}, resolveConcurrency)
+	for i, agent := range selected {
+		if ctx.Err() != nil {
+			break // user interrupted during detection; stop scheduling more work
+		}
+		resolveWG.Add(1)
+		go func(i int, agent agents.Agent) {
+			defer resolveWG.Done()
+			resolveSem <- struct{}{}
+			defer func() { <-resolveSem }()
+			resolved := resolveUpdate(agent, env)
+			work := agentWork{
+				agent:           agent,
+				index:           i,
+				show:            resolved.cmd != nil || resolved.reason == reasonManualInstall,
+				method:          resolved.method,
+				explain:         resolved.detail,
+				reason:          resolved.reason,
+				versionCmd:      resolved.versionCmd,
+				updateCmdSingle: resolved.cmd,
+			}
+			if isNodeKind(resolved.method) {
+				work.nodePackageName = nodePackageName(agent.Strategies)
+			}
+			works[i] = work
+		}(i, agent)
+	}
+	resolveWG.Wait()
 
 	// Build tasks (batch node updates by manager kind).
 	tasks := []updateTask{}
@@ -617,6 +646,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 const (
 	dryRunPreviewBudget      = 12 * time.Second
 	dryRunPreviewConcurrency = 8
+	resolveConcurrency       = 16
 )
 
 // dryRunResults computes the dry-run preview. It emits all detect events first
@@ -990,6 +1020,12 @@ func runAllWithUI(ctx context.Context, selected []agents.Agent, env *envState, o
 	}()
 	go func() {
 		env.uvOnce.Do(env.loadUvTools)
+	}()
+	go func() {
+		env.brewOnce.Do(env.loadBrewFormulae)
+	}()
+	go func() {
+		env.pipOnce.Do(env.loadPipPkgs)
 	}()
 	go func() {
 		env.codeOnce.Do(env.loadCodeExtensions)
@@ -2250,7 +2286,11 @@ func isSafeNpmRenameTarget(path, dest string) bool {
 	return true
 }
 
-const detectCmdTimeout = 30 * time.Second
+// detectCmdTimeout bounds each detection subprocess. These are local registry /
+// manager metadata reads, so a tight bound keeps startup responsive on a degraded
+// environment (e.g. a manager hung behind a dead proxy) without affecting healthy
+// runs, where they return in well under a second.
+const detectCmdTimeout = 10 * time.Second
 
 func runCmdStdout(ctx context.Context, args []string, timeout time.Duration) (string, int, time.Duration, error) {
 	if ctx == nil {
@@ -2700,6 +2740,10 @@ type envState struct {
 	codeExts     map[string]string
 	helpChecks   map[string]bool
 	latestCache  map[string]string
+	brewOnce     sync.Once
+	brewFormulae map[string]bool
+	pipOnce      sync.Once
+	pipPkgs      map[string]bool
 }
 
 func newEnv(ctx context.Context) *envState {
@@ -2893,7 +2937,10 @@ func (e *envState) loadNpmBin() {
 	if !e.hasNpm {
 		return
 	}
-	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"npm", "bin", "-g"}, detectCmdTimeout)
+	// Both probes share one budget so a hung npm can't burn two full timeouts.
+	probeCtx, cancel := context.WithTimeout(e.baseCtx(), detectCmdTimeout)
+	defer cancel()
+	out, exitCode, _, _ := runCmdStdout(probeCtx, []string{"npm", "bin", "-g"}, 0)
 	if exitCode == 0 {
 		if dir := strings.TrimSpace(out); dir != "" {
 			e.npmBin = dir
@@ -2902,7 +2949,7 @@ func (e *envState) loadNpmBin() {
 	}
 
 	// npm v11 removed `npm bin`, but `npm prefix -g` still works.
-	prefixOut, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"npm", "prefix", "-g"}, detectCmdTimeout)
+	prefixOut, exitCode, _, _ := runCmdStdout(probeCtx, []string{"npm", "prefix", "-g"}, 0)
 	if exitCode != 0 {
 		return
 	}
@@ -3192,16 +3239,59 @@ func (e *envState) brewHas(formula string) bool {
 	if !e.hasBrew {
 		return false
 	}
-	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"brew", "list", "--formula", "--versions", formula}, detectCmdTimeout)
-	return exitCode == 0 && strings.TrimSpace(out) != ""
+	e.brewOnce.Do(e.loadBrewFormulae)
+	return e.brewFormulae[formula]
+}
+
+func (e *envState) loadBrewFormulae() {
+	e.brewFormulae = map[string]bool{}
+	if !e.hasBrew {
+		return
+	}
+	// One `brew list` instead of a `brew list <formula>` per agent (brew is slow
+	// to cold-start); each line is "<formula> <version> [more versions]".
+	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"brew", "list", "--formula", "--versions"}, detectCmdTimeout)
+	if exitCode != 0 {
+		return
+	}
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		if fields := strings.Fields(scanner.Text()); len(fields) > 0 {
+			e.brewFormulae[fields[0]] = true
+		}
+	}
+}
+
+func normalizePipName(name string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(name)), "_", "-")
 }
 
 func (e *envState) pipHas(pkg string) bool {
 	if !e.hasPython {
 		return false
 	}
-	_, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"python3", "-m", "pip", "show", pkg}, detectCmdTimeout)
-	return exitCode == 0
+	e.pipOnce.Do(e.loadPipPkgs)
+	return e.pipPkgs[normalizePipName(pkg)]
+}
+
+func (e *envState) loadPipPkgs() {
+	e.pipPkgs = map[string]bool{}
+	if !e.hasPython {
+		return
+	}
+	// One `pip list` instead of a `pip show <pkg>` per agent. Names are normalized
+	// (lowercase, "_"->"-") to match pip's own canonicalization.
+	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"python3", "-m", "pip", "list", "--format", "freeze"}, detectCmdTimeout)
+	if exitCode != 0 {
+		return
+	}
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if i := strings.Index(line, "=="); i > 0 {
+			e.pipPkgs[normalizePipName(line[:i])] = true
+		}
+	}
 }
 
 func (e *envState) vscodeHas(extID string) bool {
