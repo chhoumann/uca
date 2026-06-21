@@ -38,6 +38,7 @@ type options struct {
 	Verbose     bool
 	Quiet       bool
 	DryRun      bool
+	Check       bool
 	Explain     bool
 	JSON        bool
 	Only        string
@@ -102,6 +103,20 @@ func main() {
 	all := agents.Default()
 	selected, unknown := filterAgents(all, opts.Only, opts.Skip)
 	if len(selected) == 0 {
+		if opts.Check {
+			// Keep --check's own output schema, and signal a typo'd selection
+			// (unknown names) with a non-zero exit so it isn't mistaken for "all
+			// healthy".
+			if opts.JSON {
+				printCheckJSON(nil, unknown)
+			} else {
+				fmt.Fprintln(os.Stdout, noSelectionMessage(unknown))
+			}
+			if len(unknown) > 0 {
+				os.Exit(2)
+			}
+			return
+		}
 		if opts.JSON {
 			printJSON(nil, unknown, opts)
 		} else {
@@ -112,6 +127,20 @@ func main() {
 	}
 
 	env := newEnv(ctx)
+
+	if opts.Check {
+		checkResults := runCheck(ctx, selected, env)
+		if opts.JSON {
+			printCheckJSON(checkResults, unknown)
+		} else {
+			printCheck(checkResults, unknown, opts)
+		}
+		if hasOutdated(checkResults) {
+			os.Exit(10)
+		}
+		return
+	}
+
 	uiEnabled := shouldShowUI(opts)
 	results := runAll(ctx, selected, env, opts, uiEnabled)
 
@@ -154,6 +183,7 @@ func parseFlags(args []string) (options, error) {
 	fs.BoolVar(&opts.Quiet, "quiet", false, "summary only")
 	fs.BoolVar(&opts.DryRun, "n", false, "print commands without executing")
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "print commands without executing")
+	fs.BoolVar(&opts.Check, "check", false, "report which agents are outdated, do not update")
 	fs.BoolVar(&opts.Explain, "explain", false, "explain detection and update method")
 	fs.BoolVar(&opts.JSON, "json", false, "emit machine-readable JSON (implies no live UI)")
 	fs.StringVar(&opts.Only, "only", "", "comma-separated agent list")
@@ -182,9 +212,19 @@ func validateOptions(opts options) error {
 
 func noSelectionMessage(unknown []string) string {
 	if len(unknown) > 0 {
-		return "no agents selected (unknown: " + strings.Join(unknown, " ") + ")"
+		return fmt.Sprintf("no agents selected (unknown: %s; valid: %s)", strings.Join(unknown, " "), knownAgentNames())
 	}
 	return "no agents selected"
+}
+
+func knownAgentNames() string {
+	all := agents.Default()
+	names := make([]string, 0, len(all))
+	for _, a := range all {
+		names = append(names, a.Name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 func usage() {
@@ -206,6 +246,7 @@ Options:
   -v, --verbose     show update command output for each agent
   -q, --quiet       suppress per-agent version lines (summary only)
   -n, --dry-run     print commands that would run, do not execute
+      --check       report which agents are outdated, do not update (exit 10 if any are)
       --explain     show detection details and chosen update method
       --json        emit machine-readable JSON (implies no live UI)
       --only LIST   comma-separated agent list to include
@@ -216,7 +257,7 @@ Options:
 Examples:
   uca                      update every detected agent
   uca -n --only claude     preview the claude update only
-  uca --explain            show how each agent was detected
+  uca --check              report which agents are outdated (no changes)
   uca --json | jq .        machine-readable results
 
 Note: 'agent' is accepted as an alias for cursor in --only/--skip.
@@ -349,6 +390,10 @@ type resolvedUpdate struct {
 	method     string
 	detail     string
 	versionCmd []string
+	// pkg is the package/formula identifier the update targets, used by --check
+	// to look up the latest available version. Empty when latest is not knowable
+	// (e.g. native updaters and VS Code extensions).
+	pkg string
 }
 
 type updateTask struct {
@@ -1346,27 +1391,27 @@ func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
 					continue
 				}
 				detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
-				return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail}
+				return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package}
 			}
 			if packageManager != "" {
 				if packageManager != strat.Kind {
 					continue
 				}
 				detail = fmt.Sprintf("%s global package %s installed; matched by package list; updating via %s", strat.Kind, strat.Package, strat.Kind)
-				return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail}
+				return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package}
 			}
 			if !env.nodeBinHasBinary(strat.Kind, agent.Binary) {
 				continue
 			}
 			detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
-			return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail}
+			return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package}
 		case agents.KindBrew:
 			if !env.hasBrew {
 				continue
 			}
 			if env.brewHas(strat.Package) {
 				detail = fmt.Sprintf("brew formula %s installed", strat.Package)
-				return resolvedUpdate{cmd: []string{"brew", "upgrade", strat.Package}, method: strat.Kind, detail: detail}
+				return resolvedUpdate{cmd: []string{"brew", "upgrade", strat.Package}, method: strat.Kind, detail: detail, pkg: strat.Package}
 			}
 		case agents.KindPip:
 			if !env.hasPython {
@@ -1374,7 +1419,7 @@ func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
 			}
 			if env.pipHas(strat.Package) {
 				detail = fmt.Sprintf("pip package %s installed", strat.Package)
-				return resolvedUpdate{cmd: []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", strat.Package}, method: strat.Kind, detail: detail}
+				return resolvedUpdate{cmd: []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", strat.Package}, method: strat.Kind, detail: detail, pkg: strat.Package}
 			}
 		case agents.KindUv:
 			if !env.hasUv {
@@ -1382,7 +1427,7 @@ func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
 			}
 			if env.uvHas(strat.Package) {
 				detail = fmt.Sprintf("uv tool %s installed", strat.Package)
-				return resolvedUpdate{cmd: []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@latest"}, method: strat.Kind, detail: detail}
+				return resolvedUpdate{cmd: []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@latest"}, method: strat.Kind, detail: detail, pkg: strat.Package}
 			}
 		case agents.KindVSCode:
 			if env.codeCmd == "" {
@@ -1654,6 +1699,207 @@ func parseLatestVersionOutput(out string) string {
 		}
 	}
 	return ""
+}
+
+// latestVersion returns the latest available version for an update method, or ""
+// when it is not cheaply/reliably knowable (native updaters, VS Code extensions,
+// and pip/uv tools, which lack a stable, banner-free CLI query). Used by --check.
+func (e *envState) latestVersion(ctx context.Context, method, pkg string) string {
+	switch method {
+	case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun:
+		return e.nodeLatestVersion(ctx, method, pkg)
+	case agents.KindBrew:
+		return e.brewLatest(ctx, pkg)
+	default:
+		return ""
+	}
+}
+
+func (e *envState) brewLatest(ctx context.Context, formula string) string {
+	if formula == "" {
+		return ""
+	}
+	out, exitCode, _, _ := runCmdStdout(ctx, []string{"brew", "info", "--json=v2", formula}, latestVersionCmdTimeout)
+	if exitCode != 0 {
+		return ""
+	}
+	return parseBrewLatest(out)
+}
+
+func parseBrewLatest(out string) string {
+	var payload struct {
+		Formulae []struct {
+			Versions struct {
+				Stable string `json:"stable"`
+			} `json:"versions"`
+		} `json:"formulae"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		return ""
+	}
+	if len(payload.Formulae) == 0 {
+		return ""
+	}
+	if token, ok := extractVersionToken(payload.Formulae[0].Versions.Stable); ok {
+		return token
+	}
+	return ""
+}
+
+type checkState string
+
+const (
+	checkUpToDate checkState = "up-to-date"
+	checkOutdated checkState = "outdated"
+	checkUnknown  checkState = "unknown"
+	checkMissing  checkState = "missing"
+)
+
+type checkResult struct {
+	Agent   agents.Agent
+	Method  string
+	State   checkState
+	Current string
+	Latest  string
+	Reason  string
+}
+
+// splitVersion strips a leading "v" and build metadata (which semver says must
+// be ignored for precedence), then separates the numeric base from any
+// prerelease tail.
+func splitVersion(v string) (base, pre string) {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	if i := strings.IndexByte(v, '+'); i >= 0 {
+		v = v[:i]
+	}
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		return v[:i], v[i+1:]
+	}
+	return v, ""
+}
+
+func numericComponents(base string) []int {
+	parts := strings.Split(base, ".")
+	out := make([]int, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			n = 0
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// compareSemver orders two version tokens: <0 if a is older, 0 if equal, >0 if a
+// is newer. It compares numeric base components (missing trailing components are
+// zero, so "1.2" == "1.2.0"); on an equal base, a release outranks a prerelease.
+// This is intentionally lightweight (no semver dependency) and good enough for a
+// dist-tag/stable comparison.
+func compareSemver(a, b string) int {
+	abase, apre := splitVersion(a)
+	bbase, bpre := splitVersion(b)
+	ac, bc := numericComponents(abase), numericComponents(bbase)
+	for i := 0; i < len(ac) || i < len(bc); i++ {
+		var x, y int
+		if i < len(ac) {
+			x = ac[i]
+		}
+		if i < len(bc) {
+			y = bc[i]
+		}
+		if x != y {
+			if x < y {
+				return -1
+			}
+			return 1
+		}
+	}
+	switch {
+	case apre == "" && bpre == "":
+		return 0
+	case apre == "": // a is a release, b a prerelease of the same base -> a newer
+		return 1
+	case bpre == "": // a is a prerelease, b the released version -> a older
+		return -1
+	case apre == bpre:
+		return 0
+	case apre < bpre:
+		return -1
+	default:
+		return 1
+	}
+}
+
+// compareVersions decides an agent's check state. It treats "current >= latest"
+// as up-to-date (so a build that is newer than the published latest is not
+// falsely flagged) and only "current strictly older than latest" as outdated.
+func compareVersions(current, latest string) checkState {
+	if strings.TrimSpace(latest) == "" {
+		return checkUnknown
+	}
+	curToken, ok := extractVersionToken(current)
+	if !ok {
+		return checkUnknown
+	}
+	latToken, ok := extractVersionToken(latest)
+	if !ok {
+		latToken = latest
+	}
+	if compareSemver(curToken, latToken) < 0 {
+		return checkOutdated
+	}
+	return checkUpToDate
+}
+
+const (
+	checkConcurrency = 8
+	checkBudget      = 15 * time.Second
+)
+
+// runCheck resolves every selected agent and compares its installed version to
+// the latest available one, without changing anything. Lookups run concurrently
+// under a shared budget.
+func runCheck(ctx context.Context, selected []agents.Agent, env *envState) []checkResult {
+	results := make([]checkResult, len(selected))
+	checkCtx, cancel := context.WithTimeout(ctx, checkBudget)
+	defer cancel()
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, checkConcurrency)
+	for i, agent := range selected {
+		wg.Add(1)
+		go func(i int, agent agents.Agent) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			resolved := resolveUpdate(agent, env)
+			res := checkResult{Agent: agent, Method: resolved.method}
+			if resolved.cmd == nil {
+				res.State = checkMissing
+				res.Reason = resolved.reason
+				if res.Reason == "" {
+					res.Reason = reasonMissing
+				}
+				results[i] = res
+				return
+			}
+			res.Current = getVersion(checkCtx, agent, env, resolved.method, resolved.versionCmd)
+			res.Latest = env.latestVersion(checkCtx, resolved.method, resolved.pkg)
+			res.State = compareVersions(res.Current, res.Latest)
+			results[i] = res
+		}(i, agent)
+	}
+	wg.Wait()
+	return results
+}
+
+func hasOutdated(results []checkResult) bool {
+	for _, res := range results {
+		if res.State == checkOutdated {
+			return true
+		}
+	}
+	return false
 }
 
 func runVersionCmd(ctx context.Context, args []string) string {
@@ -2220,6 +2466,91 @@ func printJSON(results []result, unknown []string, opts options) {
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(buildReport(results, unknown, opts)); err != nil {
 		fmt.Fprintf(os.Stderr, "uca: failed to encode JSON: %v\n", err)
+	}
+}
+
+type jsonCheckAgent struct {
+	Name    string `json:"name"`
+	Method  string `json:"method,omitempty"`
+	State   string `json:"state"`
+	Current string `json:"current,omitempty"`
+	Latest  string `json:"latest,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+type jsonCheckReport struct {
+	Agents       []jsonCheckAgent `json:"agents"`
+	UnknownNames []string         `json:"unknownNames,omitempty"`
+	Summary      map[string]int   `json:"summary"`
+}
+
+func buildCheckReport(results []checkResult, unknown []string) jsonCheckReport {
+	report := jsonCheckReport{
+		Agents:       make([]jsonCheckAgent, 0, len(results)),
+		UnknownNames: unknown,
+		Summary:      map[string]int{},
+	}
+	for _, res := range results {
+		report.Agents = append(report.Agents, jsonCheckAgent{
+			Name:    res.Agent.Name,
+			Method:  res.Method,
+			State:   string(res.State),
+			Current: res.Current,
+			Latest:  res.Latest,
+			Reason:  res.Reason,
+		})
+		report.Summary[string(res.State)]++
+	}
+	return report
+}
+
+func printCheckJSON(results []checkResult, unknown []string) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(buildCheckReport(results, unknown)); err != nil {
+		fmt.Fprintf(os.Stderr, "uca: failed to encode JSON: %v\n", err)
+	}
+}
+
+func printCheck(results []checkResult, unknown []string, opts options) {
+	nameWidth := 0
+	for _, res := range results {
+		if len(res.Agent.Name) > nameWidth {
+			nameWidth = len(res.Agent.Name)
+		}
+	}
+	upToDate, outdated, unknownCnt, missing := []string{}, []string{}, []string{}, []string{}
+	for _, res := range results {
+		var detail string
+		switch res.State {
+		case checkOutdated:
+			detail = fmt.Sprintf("outdated (%s -> %s)", safeVersion(res.Current), safeVersion(res.Latest))
+			outdated = append(outdated, res.Agent.Name)
+		case checkUpToDate:
+			detail = fmt.Sprintf("up-to-date (%s)", safeVersion(res.Current))
+			upToDate = append(upToDate, res.Agent.Name)
+		case checkMissing:
+			detail = res.Reason
+			if detail == "" {
+				detail = reasonMissing
+			}
+			missing = append(missing, res.Agent.Name)
+		default: // unknown
+			detail = fmt.Sprintf("%s (latest unknown)", safeVersion(res.Current))
+			unknownCnt = append(unknownCnt, res.Agent.Name)
+		}
+		if opts.Explain && res.Method != "" {
+			detail = fmt.Sprintf("%s [%s]", detail, methodLabel(res.Method))
+		}
+		fmt.Fprintf(os.Stdout, "%-*s  %s\n", nameWidth, res.Agent.Name, detail)
+	}
+	printSummaryLine("outdated", outdated)
+	printSummaryLine("up-to-date", upToDate)
+	printSummaryLine("unknown", unknownCnt)
+	printSummaryLine("missing", missing)
+	if len(unknown) > 0 {
+		printSummaryLine("skipped (unknown)", unknown)
 	}
 }
 
