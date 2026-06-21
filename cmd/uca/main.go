@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -23,6 +22,7 @@ import (
 	"time"
 
 	"github.com/chhoumann/uca/internal/agents"
+	"github.com/chhoumann/uca/internal/version"
 	"github.com/mattn/go-runewidth"
 	"golang.org/x/term"
 )
@@ -67,7 +67,7 @@ const (
 	statusFailed    = "failed"
 )
 
-var version = "dev"
+var buildVersion = "dev"
 
 const (
 	reasonMissing       = "missing"
@@ -91,7 +91,7 @@ func main() {
 		return
 	}
 	if opts.Version {
-		fmt.Fprintln(os.Stdout, version)
+		fmt.Fprintln(os.Stdout, buildVersion)
 		return
 	}
 	if err := validateOptions(opts); err != nil {
@@ -864,7 +864,7 @@ func dryRunResults(ctx context.Context, works []agentWork, env *envState, result
 			res.After = res.Before
 			if isNodeKind(work.method) {
 				if latest := env.nodeLatestVersion(previewCtx, work.method, work.nodePackageName); latest != "" {
-					if formatted := formatVersionWithToken(res.Before, latest); formatted != "" {
+					if formatted := version.FormatWithToken(res.Before, latest); formatted != "" {
 						res.After = formatted
 					} else {
 						res.After = latest
@@ -926,7 +926,7 @@ func runTask(ctx context.Context, task updateTask, env *envState, opts options, 
 				if latest == "" {
 					return
 				}
-				after := formatVersionWithToken(before, latest)
+				after := version.FormatWithToken(before, latest)
 				if after == "" {
 					after = latest
 				}
@@ -1761,38 +1761,6 @@ func getVersion(ctx context.Context, agent agents.Agent, env *envState, method s
 
 const latestVersionCmdTimeout = 12 * time.Second
 
-var semverTokenRe = regexp.MustCompile(`(?i)\bv?\d+\.\d+(?:\.\d+)?(?:-[0-9a-z.-]+)?(?:\+[0-9a-z.-]+)?\b`)
-
-func extractVersionToken(s string) (string, bool) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "", false
-	}
-	if match := semverTokenRe.FindString(s); match != "" {
-		return match, true
-	}
-	return "", false
-}
-
-func formatVersionWithToken(before, newVersion string) string {
-	newVersion = strings.TrimSpace(newVersion)
-	if newVersion == "" {
-		return ""
-	}
-	before = strings.TrimSpace(before)
-	if before == "" || before == "unknown" {
-		return newVersion
-	}
-	token, ok := extractVersionToken(before)
-	if !ok {
-		return newVersion
-	}
-	if strings.HasPrefix(token, "v") && !strings.HasPrefix(newVersion, "v") {
-		newVersion = "v" + newVersion
-	}
-	return strings.Replace(before, token, newVersion, 1)
-}
-
 // nodeLatestVersion returns the registry "latest" for a node package, memoized
 // per (kind,pkg) so the dry-run preview and the live preview don't re-query the
 // same package. Only successful (non-empty) results are cached, so a transient
@@ -1852,58 +1820,11 @@ func queryNodeLatestVersion(ctx context.Context, kind, pkg string) string {
 	// object. Parse the top-level version explicitly so a dependency's version in
 	// the manifest can't be mistaken for the package's own.
 	if kind == agents.KindBun {
-		if v := parseBunVersionJSON(out); v != "" {
+		if v := version.ParseBunJSON(out); v != "" {
 			return v
 		}
 	}
-	return parseLatestVersionOutput(out)
-}
-
-func parseBunVersionJSON(out string) string {
-	trimmed := strings.TrimSpace(out)
-	if trimmed == "" {
-		return ""
-	}
-	var scalar string
-	if err := json.Unmarshal([]byte(trimmed), &scalar); err == nil {
-		if token, ok := extractVersionToken(scalar); ok {
-			return token
-		}
-	}
-	var obj struct {
-		Version string `json:"version"`
-	}
-	if err := json.Unmarshal([]byte(trimmed), &obj); err == nil && obj.Version != "" {
-		if token, ok := extractVersionToken(obj.Version); ok {
-			return token
-		}
-	}
-	return ""
-}
-
-// parseLatestVersionOutput pulls the version out of a registry query's stdout.
-// It prefers a line whose entire content is a single version token — the normal
-// single-field output of `npm view dist-tags.latest` and friends — so advisory
-// banner lines are ignored whether the tool prints them before or after the
-// version. It only falls back to an embedded token when no standalone line exists.
-func parseLatestVersionOutput(out string) string {
-	lines := strings.Split(out, "\n")
-	for _, line := range lines {
-		s := strings.Trim(strings.TrimSpace(line), "\"'")
-		if s == "" {
-			continue
-		}
-		if token, ok := extractVersionToken(s); ok && token == s {
-			return token
-		}
-	}
-	for _, line := range lines {
-		s := strings.Trim(strings.TrimSpace(line), "\"'")
-		if token, ok := extractVersionToken(s); ok {
-			return token
-		}
-	}
-	return ""
+	return version.ParseLatest(out)
 }
 
 // latestVersion returns the latest available version for an update method, or ""
@@ -1928,27 +1849,7 @@ func (e *envState) brewLatest(ctx context.Context, formula string) string {
 	if exitCode != 0 {
 		return ""
 	}
-	return parseBrewLatest(out)
-}
-
-func parseBrewLatest(out string) string {
-	var payload struct {
-		Formulae []struct {
-			Versions struct {
-				Stable string `json:"stable"`
-			} `json:"versions"`
-		} `json:"formulae"`
-	}
-	if err := json.Unmarshal([]byte(out), &payload); err != nil {
-		return ""
-	}
-	if len(payload.Formulae) == 0 {
-		return ""
-	}
-	if token, ok := extractVersionToken(payload.Formulae[0].Versions.Stable); ok {
-		return token
-	}
-	return ""
+	return version.ParseBrewLatest(out)
 }
 
 type checkState string
@@ -1969,73 +1870,6 @@ type checkResult struct {
 	Reason  string
 }
 
-// splitVersion strips a leading "v" and build metadata (which semver says must
-// be ignored for precedence), then separates the numeric base from any
-// prerelease tail.
-func splitVersion(v string) (base, pre string) {
-	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
-	if i := strings.IndexByte(v, '+'); i >= 0 {
-		v = v[:i]
-	}
-	if i := strings.IndexByte(v, '-'); i >= 0 {
-		return v[:i], v[i+1:]
-	}
-	return v, ""
-}
-
-func numericComponents(base string) []int {
-	parts := strings.Split(base, ".")
-	out := make([]int, 0, len(parts))
-	for _, p := range parts {
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			n = 0
-		}
-		out = append(out, n)
-	}
-	return out
-}
-
-// compareSemver orders two version tokens: <0 if a is older, 0 if equal, >0 if a
-// is newer. It compares numeric base components (missing trailing components are
-// zero, so "1.2" == "1.2.0"); on an equal base, a release outranks a prerelease.
-// This is intentionally lightweight (no semver dependency) and good enough for a
-// dist-tag/stable comparison.
-func compareSemver(a, b string) int {
-	abase, apre := splitVersion(a)
-	bbase, bpre := splitVersion(b)
-	ac, bc := numericComponents(abase), numericComponents(bbase)
-	for i := 0; i < len(ac) || i < len(bc); i++ {
-		var x, y int
-		if i < len(ac) {
-			x = ac[i]
-		}
-		if i < len(bc) {
-			y = bc[i]
-		}
-		if x != y {
-			if x < y {
-				return -1
-			}
-			return 1
-		}
-	}
-	switch {
-	case apre == "" && bpre == "":
-		return 0
-	case apre == "": // a is a release, b a prerelease of the same base -> a newer
-		return 1
-	case bpre == "": // a is a prerelease, b the released version -> a older
-		return -1
-	case apre == bpre:
-		return 0
-	case apre < bpre:
-		return -1
-	default:
-		return 1
-	}
-}
-
 // compareVersions decides an agent's check state. It treats "current >= latest"
 // as up-to-date (so a build that is newer than the published latest is not
 // falsely flagged) and only "current strictly older than latest" as outdated.
@@ -2043,15 +1877,15 @@ func compareVersions(current, latest string) checkState {
 	if strings.TrimSpace(latest) == "" {
 		return checkUnknown
 	}
-	curToken, ok := extractVersionToken(current)
+	curToken, ok := version.ExtractToken(current)
 	if !ok {
 		return checkUnknown
 	}
-	latToken, ok := extractVersionToken(latest)
+	latToken, ok := version.ExtractToken(latest)
 	if !ok {
 		latToken = latest
 	}
-	if compareSemver(curToken, latToken) < 0 {
+	if version.Compare(curToken, latToken) < 0 {
 		return checkOutdated
 	}
 	return checkUpToDate
@@ -2122,60 +1956,7 @@ func runVersionCmd(ctx context.Context, args []string) string {
 	if err != nil {
 		return "unknown"
 	}
-	return parseVersionOutput(string(out))
-}
-
-func parseVersionOutput(out string) string {
-	trimmed := strings.TrimSpace(out)
-	if trimmed == "" {
-		return "unknown"
-	}
-	lines := strings.Split(trimmed, "\n")
-	first := ""
-	versionOnly := ""
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if first == "" {
-			first = line
-		}
-		if isVersionOnlyLine(line) {
-			versionOnly = line
-		}
-	}
-	if versionOnly != "" {
-		return versionOnly
-	}
-	if first != "" {
-		return first
-	}
-	return "unknown"
-}
-
-func isVersionOnlyLine(line string) bool {
-	if strings.ContainsAny(line, " \t") {
-		return false
-	}
-	if strings.HasPrefix(line, "v") {
-		line = line[1:]
-	}
-	parts := strings.Split(line, ".")
-	if len(parts) < 2 {
-		return false
-	}
-	for _, part := range parts {
-		if part == "" {
-			return false
-		}
-		for _, r := range part {
-			if r < '0' || r > '9' {
-				return false
-			}
-		}
-	}
-	return true
+	return version.ParseOutput(string(out))
 }
 
 const (
