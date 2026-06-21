@@ -362,6 +362,134 @@ func newTestEnv() *envState {
 	}
 }
 
+func TestValidateOptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    options
+		wantErr bool
+	}{
+		{name: "ok_default", opts: options{}, wantErr: false},
+		{name: "ok_serial", opts: options{Serial: true}, wantErr: false},
+		{name: "ok_parallel", opts: options{Parallel: true}, wantErr: false},
+		{name: "ok_concurrency_zero", opts: options{Concurrency: 0}, wantErr: false},
+		{name: "serial_and_parallel", opts: options{Serial: true, Parallel: true}, wantErr: true},
+		{name: "negative_concurrency", opts: options{Concurrency: -1}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateOptions(tt.opts)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateOptions(%#v) err = %v, wantErr %v", tt.opts, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseFlagsReportsUnknownFlag(t *testing.T) {
+	if _, err := parseFlags([]string{"--definitely-not-a-flag"}); err == nil {
+		t.Fatal("parseFlags() with unknown flag returned nil error, want error")
+	}
+	opts, err := parseFlags([]string{"--serial", "-n", "--only", "claude"})
+	if err != nil {
+		t.Fatalf("parseFlags() valid args err = %v", err)
+	}
+	if !opts.Serial || !opts.DryRun || opts.Only != "claude" {
+		t.Fatalf("parseFlags() parsed = %#v, want Serial/DryRun/Only=claude", opts)
+	}
+}
+
+func TestFilterAgentsOnlyAllUnknownSelectsNone(t *testing.T) {
+	defaults := agents.Default()
+
+	// A typo where every --only entry is unknown must select ZERO agents, not all.
+	selected, unknown := filterAgents(defaults, "bogus", "")
+	if len(selected) != 0 {
+		t.Fatalf("--only bogus selected %#v, want none", agentNames(selected))
+	}
+	if !reflect.DeepEqual(unknown, []string{"bogus"}) {
+		t.Fatalf("--only bogus unknown = %#v, want [bogus]", unknown)
+	}
+
+	// No --only given selects everything.
+	selected, _ = filterAgents(defaults, "", "")
+	if len(selected) != len(defaults) {
+		t.Fatalf("empty --only selected %d, want all %d", len(selected), len(defaults))
+	}
+
+	// A known + unknown mix still selects the known one.
+	selected, unknown = filterAgents(defaults, "claude,bogus", "")
+	if len(selected) != 1 || selected[0].Name != "claude" {
+		t.Fatalf("--only claude,bogus selected %#v, want [claude]", agentNames(selected))
+	}
+	if !reflect.DeepEqual(unknown, []string{"bogus"}) {
+		t.Fatalf("--only claude,bogus unknown = %#v, want [bogus]", unknown)
+	}
+}
+
+func TestEffectiveConcurrencyNonPositive(t *testing.T) {
+	// --safe must win over a non-positive --concurrency rather than being
+	// silently overridden into unlimited.
+	if got := effectiveConcurrency(options{Safe: true, Concurrency: -1}, 8); got != 1 {
+		t.Fatalf("safe + negative concurrency = %d, want 1", got)
+	}
+	if got := effectiveConcurrency(options{Concurrency: -5}, 6); got != 6 {
+		t.Fatalf("negative concurrency (no safe) = %d, want numTasks 6", got)
+	}
+}
+
+func TestRecolorIconDoesNotCorruptName(t *testing.T) {
+	// droid in dry-run: ASCII icon is "dr", which also starts the name "droid".
+	row := uiRow{name: "droid", status: statusUpdated, reason: "dry-run", before: "1.0.0", after: "1.0.0"}
+	r := &uiRenderer{width: 200, useColor: true, useUnicode: false}
+
+	line := formatRow(row, len(row.name), options{}, r)
+
+	if !strings.Contains(line, "droid \x1b[35mdr\x1b[0m") {
+		t.Fatalf("formatRow() did not color the icon at its position; got %q", line)
+	}
+	if strings.Contains(line, "\x1b[35mdr\x1b[0moid") {
+		t.Fatalf("formatRow() corrupted the name by coloring 'dr' inside 'droid'; got %q", line)
+	}
+}
+
+func TestFormatRowUsesAsciiArrowWithoutUnicode(t *testing.T) {
+	row := uiRow{name: "codex", status: statusUpdated, before: "1.0.0", after: "1.1.0"}
+	r := &uiRenderer{width: 200, useColor: false, useUnicode: false}
+
+	line := formatRow(row, len(row.name), options{}, r)
+	if !strings.Contains(line, "1.0.0 -> 1.1.0") {
+		t.Fatalf("formatRow() ASCII should use '->'; got %q", line)
+	}
+	if strings.Contains(line, "→") {
+		t.Fatalf("formatRow() leaked a unicode arrow under !useUnicode; got %q", line)
+	}
+}
+
+func TestRenderDashboardSuppressesDetectingAfterCompletion(t *testing.T) {
+	r := &uiRenderer{width: 200, useColor: false, useUnicode: false}
+	start := time.Now()
+	rows := []uiRow{
+		{name: "claude", status: statusUpdated, visible: true, before: "1", after: "1"},
+		{name: "codex", status: "pending", visible: true},
+	}
+	// detected (1) < total (2) but one visible row already completed: the
+	// "detecting" suffix must not be shown (it is misleading at that point).
+	out := renderDashboard(rows, 6, start, options{}, r, 1, 2)
+	if strings.Contains(out, "detecting") {
+		t.Fatalf("renderDashboard showed 'detecting' after a row completed; got %q", out)
+	}
+
+	// While nothing has completed yet, detection progress is still advertised.
+	pending := []uiRow{
+		{name: "claude", status: "pending", visible: true},
+		{name: "codex", status: "pending", visible: true},
+	}
+	out = renderDashboard(pending, 6, start, options{}, r, 1, 2)
+	if !strings.Contains(out, "detecting 1/2") {
+		t.Fatalf("renderDashboard should advertise detection progress before completion; got %q", out)
+	}
+}
+
 func TestShouldRetryNpm(t *testing.T) {
 	tests := []struct {
 		name   string
