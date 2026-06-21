@@ -202,7 +202,58 @@ func parseFlags(args []string) (options, error) {
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
+	applyEnvDefaults(&opts, fs)
 	return opts, nil
+}
+
+// applyEnvDefaults seeds options from UCA_* environment variables for any flag
+// the user did not pass explicitly, so a persistent default (e.g. always
+// --serial, or a standing --skip list) can be set without a shell alias. Flags
+// always win over the environment; invalid values are ignored (the built-in
+// default stands). Resulting values still go through validateOptions.
+func applyEnvDefaults(opts *options, fs *flag.FlagSet) {
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
+	if !set["timeout"] {
+		if v := os.Getenv("UCA_TIMEOUT"); v != "" {
+			if d, err := time.ParseDuration(v); err == nil {
+				opts.Timeout = d
+			}
+		}
+	}
+	if !set["concurrency"] {
+		if v := os.Getenv("UCA_CONCURRENCY"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				opts.Concurrency = n
+			}
+		}
+	}
+	if !set["only"] {
+		if v := os.Getenv("UCA_ONLY"); v != "" {
+			opts.Only = v
+		}
+	}
+	if !set["skip"] {
+		if v := os.Getenv("UCA_SKIP"); v != "" {
+			opts.Skip = v
+		}
+	}
+	if !set["serial"] && envIsTrue(os.Getenv("UCA_SERIAL")) {
+		opts.Serial = true
+	}
+	if !set["safe"] && envIsTrue(os.Getenv("UCA_SAFE")) {
+		opts.Safe = true
+	}
+}
+
+func envIsTrue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // validateOptions rejects flag combinations that are contradictory or
@@ -267,6 +318,9 @@ Examples:
   uca -n --only claude     preview the claude update only
   uca --check              report which agents are outdated (no changes)
   uca --json | jq .        machine-readable results
+
+Environment (used as defaults; flags override):
+  UCA_TIMEOUT, UCA_CONCURRENCY, UCA_ONLY, UCA_SKIP, UCA_SERIAL, UCA_SAFE
 
 Note: 'agent' is accepted as an alias for cursor in --only/--skip.
 `)
