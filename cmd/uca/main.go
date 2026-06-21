@@ -537,6 +537,9 @@ type agentWork struct {
 	reason          string
 	versionCmd      []string
 	nodePackageName string
+	// nodePackageVersion is the pinned version (empty = @latest). A pinned node
+	// agent is excluded from batching, since the batch assumes a uniform @latest.
+	nodePackageVersion string
 	// updateCmd is the final command to run (may be a batch command).
 	updateCmd []string
 	// updateCmdSingle is the per-agent command (used for fallback when batch updates fail).
@@ -553,6 +556,8 @@ type resolvedUpdate struct {
 	// to look up the latest available version. Empty when latest is not knowable
 	// (e.g. native updaters and VS Code extensions).
 	pkg string
+	// version is the pinned version for the resolved strategy (empty = @latest).
+	version string
 }
 
 type updateTask struct {
@@ -680,6 +685,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 			}
 			if isNodeKind(resolved.method) {
 				work.nodePackageName = nodePackageName(agent.Strategies)
+				work.nodePackageVersion = resolved.version
 			}
 			works[i] = work
 		}(i, agent)
@@ -707,7 +713,9 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 		batchIndexes := make([]int, 0, len(indexes))
 		for _, idx := range indexes {
 			pkg := strings.TrimSpace(works[idx].nodePackageName)
-			if pkg == "" {
+			// A version-pinned agent can't join the @latest batch — run it on its
+			// own with its pinned single command.
+			if pkg == "" || works[idx].nodePackageVersion != "" {
 				works[idx].updateCmd = works[idx].updateCmdSingle
 				tasks = append(tasks, updateTask{kind: kind, cmd: works[idx].updateCmd, agents: []agentWork{works[idx]}})
 				continue
@@ -1578,14 +1586,14 @@ func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
 					continue
 				}
 				detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
-				return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package}
+				return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package, version: strat.Version}
 			}
 			if packageManager != "" {
 				if packageManager != strat.Kind {
 					continue
 				}
 				detail = fmt.Sprintf("%s global package %s installed; matched by package list; updating via %s", strat.Kind, strat.Package, strat.Kind)
-				return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package}
+				return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package, version: strat.Version}
 			}
 			if !env.nodeBinHasBinary(strat.Kind, agent.Binary) {
 				continue
@@ -1614,7 +1622,7 @@ func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
 			}
 			if env.uvHas(strat.Package) {
 				detail = fmt.Sprintf("uv tool %s installed", strat.Package)
-				return resolvedUpdate{cmd: []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@latest"}, method: strat.Kind, detail: detail, pkg: strat.Package}
+				return resolvedUpdate{cmd: []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@" + versionSpec(strat.Version)}, method: strat.Kind, detail: detail, pkg: strat.Package}
 			}
 		case agents.KindVSCode:
 			if env.codeCmd == "" {
@@ -1685,21 +1693,31 @@ func nativeStrategyHelpMatches(env *envState, binary, contains string) bool {
 	return ok
 }
 
+// versionSpec returns the version selector for a package spec: a pinned version
+// when set, otherwise "latest" (forced to avoid getting stuck on old
+// minor/prerelease versions, common for 0.x CLIs).
+func versionSpec(v string) string {
+	if s := strings.TrimSpace(v); s != "" {
+		return s
+	}
+	return "latest"
+}
+
 func nodeUpdateCommand(strat agents.UpdateStrategy) []string {
 	if len(strat.Command) > 0 {
 		return strat.Command
 	}
+	spec := strat.Package + "@" + versionSpec(strat.Version)
 	switch strat.Kind {
 	case agents.KindNpm:
-		// Force `@latest` to avoid getting stuck on old minor/prerelease versions (common for 0.x CLIs).
-		// `npm update -g` does not accept `pkg@latest` specs, so we use install.
-		return []string{"npm", "install", "-g", strat.Package + "@latest"}
+		// `npm update -g` does not accept `pkg@version` specs, so we use install.
+		return []string{"npm", "install", "-g", spec}
 	case agents.KindPnpm:
-		return []string{"pnpm", "add", "-g", strat.Package + "@latest"}
+		return []string{"pnpm", "add", "-g", spec}
 	case agents.KindYarn:
-		return []string{"yarn", "global", "add", strat.Package + "@latest"}
+		return []string{"yarn", "global", "add", spec}
 	case agents.KindBun:
-		return []string{"bun", "add", "-g", strat.Package + "@latest"}
+		return []string{"bun", "add", "-g", spec}
 	default:
 		return strat.Command
 	}
