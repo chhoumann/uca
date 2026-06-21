@@ -1473,6 +1473,67 @@ func TestIsNpmGlobalMutate(t *testing.T) {
 	}
 }
 
+func TestNodeUpdateCommandPinnedVersion(t *testing.T) {
+	got := nodeUpdateCommand(agents.UpdateStrategy{Kind: agents.KindNpm, Package: "pkg", Version: "1.2.3"})
+	want := []string{"npm", "install", "-g", "pkg@1.2.3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pinned nodeUpdateCommand = %#v, want %#v", got, want)
+	}
+	// Empty version still resolves to @latest.
+	got = nodeUpdateCommand(agents.UpdateStrategy{Kind: agents.KindBun, Package: "pkg"})
+	if !reflect.DeepEqual(got, []string{"bun", "add", "-g", "pkg@latest"}) {
+		t.Fatalf("unpinned nodeUpdateCommand = %#v", got)
+	}
+}
+
+func TestRunAllWithEventsExcludesPinnedFromBatch(t *testing.T) {
+	dir := t.TempDir()
+	record := filepath.Join(dir, "npm-calls.txt")
+	env := nodeIntegrationEnv(t, map[string]string{
+		"npm":   "#!/bin/sh\ncase \"$1\" in\n  install) echo \"$@\" >> '" + record + "' ;;\nesac\nexit 0\n",
+		"one":   "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
+		"two":   "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
+		"three": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
+	})
+	env.npmPkgs["pkg-three"] = true
+	list := []agents.Agent{
+		{Name: "one", Binary: "one", VersionCmd: []string{"one", "--version"}, Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-one", Version: "9.9.9"}}},
+		{Name: "two", Binary: "two", VersionCmd: []string{"two", "--version"}, Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-two"}}},
+		{Name: "three", Binary: "three", VersionCmd: []string{"three", "--version"}, Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-three"}}},
+	}
+	runAllWithEvents(context.Background(), list, env, options{}, nil)
+
+	calls := strings.Split(strings.TrimSpace(string(mustRead(t, record))), "\n")
+	var pinned, batch bool
+	for _, c := range calls {
+		if c == "install -g pkg-one@9.9.9" {
+			pinned = true
+		}
+		// the two unpinned agents batch together (package order is sorted)
+		if strings.Contains(c, "pkg-two@latest") && strings.Contains(c, "pkg-three@latest") {
+			batch = true
+		}
+		if strings.Contains(c, "pkg-one") && strings.Contains(c, "pkg-two") {
+			t.Fatalf("pinned agent was batched: %q", c)
+		}
+	}
+	if !pinned {
+		t.Fatalf("missing pinned single call; calls=%q", calls)
+	}
+	if !batch {
+		t.Fatalf("missing batched @latest call; calls=%q", calls)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return data
+}
+
 func TestNodeUpdateCommand_UsesLatestTag(t *testing.T) {
 	tests := []struct {
 		name  string
