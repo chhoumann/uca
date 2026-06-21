@@ -100,7 +100,11 @@ func main() {
 		os.Exit(2)
 	}
 
-	all := agents.Default()
+	all, err := loadAgents()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "uca: %v\n", err)
+		os.Exit(2)
+	}
 	selected, unknown := filterAgents(all, opts.Only, opts.Skip)
 	if len(selected) == 0 {
 		if opts.Check {
@@ -110,7 +114,7 @@ func main() {
 			if opts.JSON {
 				printCheckJSON(nil, unknown)
 			} else {
-				fmt.Fprintln(os.Stdout, noSelectionMessage(unknown))
+				fmt.Fprintln(os.Stdout, noSelectionMessage(unknown, all))
 			}
 			if len(unknown) > 0 {
 				os.Exit(2)
@@ -120,7 +124,7 @@ func main() {
 		if opts.JSON {
 			printJSON(nil, unknown, opts)
 		} else {
-			fmt.Fprintln(os.Stdout, noSelectionMessage(unknown))
+			fmt.Fprintln(os.Stdout, noSelectionMessage(unknown, all))
 			printSummary(nil, unknown)
 		}
 		return
@@ -269,21 +273,107 @@ func validateOptions(opts options) error {
 	return nil
 }
 
-func noSelectionMessage(unknown []string) string {
+func noSelectionMessage(unknown []string, all []agents.Agent) string {
 	if len(unknown) > 0 {
-		return fmt.Sprintf("no agents selected (unknown: %s; valid: %s)", strings.Join(unknown, " "), knownAgentNames())
+		return fmt.Sprintf("no agents selected (unknown: %s; valid: %s)", strings.Join(unknown, " "), knownAgentNames(all))
 	}
 	return "no agents selected"
 }
 
-func knownAgentNames() string {
-	all := agents.Default()
+func knownAgentNames(all []agents.Agent) string {
 	names := make([]string, 0, len(all))
 	for _, a := range all {
 		names = append(names, a.Name)
 	}
 	sort.Strings(names)
 	return strings.Join(names, ", ")
+}
+
+// loadAgents returns the built-in agents merged with any user-defined agents from
+// the optional config file. A malformed config is a hard error (fail fast rather
+// than silently ignoring something the user wrote).
+func loadAgents() ([]agents.Agent, error) {
+	base := agents.Default()
+	user, err := loadConfigAgents()
+	if err != nil {
+		return nil, err
+	}
+	if len(user) == 0 {
+		return base, nil
+	}
+	return mergeAgents(base, user), nil
+}
+
+// configPath resolves the optional config file: $UCA_CONFIG if set, else
+// <user-config-dir>/uca/config.json. Empty when no location can be determined.
+func configPath() string {
+	if p := strings.TrimSpace(os.Getenv("UCA_CONFIG")); p != "" {
+		return p
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "uca", "config.json")
+}
+
+func loadConfigAgents() ([]agents.Agent, error) {
+	path := configPath()
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil // no config is the normal case
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+	return parseConfigAgents(data, path)
+}
+
+func parseConfigAgents(data []byte, path string) ([]agents.Agent, error) {
+	var cfg struct {
+		Agents []agents.Agent `json:"agents"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	// Surface keys that match no field. (encoding/json still matches known fields
+	// case-insensitively, so a case-variant of a real key is accepted, not flagged.)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	for i, a := range cfg.Agents {
+		if strings.TrimSpace(a.Name) == "" {
+			return nil, fmt.Errorf("parse config %s: agent #%d is missing a name", path, i+1)
+		}
+		for j, s := range a.Strategies {
+			if !agents.ValidKind(s.Kind) {
+				return nil, fmt.Errorf("parse config %s: agent %q strategy #%d has unknown kind %q", path, a.Name, j+1, s.Kind)
+			}
+		}
+	}
+	return cfg.Agents, nil
+}
+
+// mergeAgents appends user-defined agents to the built-ins; a user agent whose
+// name matches a built-in (case-insensitively) overrides it.
+func mergeAgents(base, user []agents.Agent) []agents.Agent {
+	out := append([]agents.Agent(nil), base...)
+	idx := make(map[string]int, len(out))
+	for i, a := range out {
+		idx[strings.ToLower(a.Name)] = i
+	}
+	for _, ua := range user {
+		key := strings.ToLower(ua.Name)
+		if i, ok := idx[key]; ok {
+			out[i] = ua
+		} else {
+			idx[key] = len(out)
+			out = append(out, ua)
+		}
+	}
+	return out
 }
 
 func usage() {
@@ -322,6 +412,11 @@ Examples:
 Environment (used as defaults; flags override):
   UCA_TIMEOUT, UCA_CONCURRENCY, UCA_ONLY, UCA_SKIP, UCA_SERIAL, UCA_SAFE
 
+Config: define extra agents in <user-config-dir>/uca/config.json (or $UCA_CONFIG),
+  e.g. {"agents":[{"name":"x","binary":"x","versionCmd":["x","--version"],
+  "strategies":[{"kind":"npm","package":"x"}]}]}. Same-name entries override
+  built-ins; a node strategy is per-manager, so list each manager you use.
+
 Note: 'agent' is accepted as an alias for cursor in --only/--skip.
 `)
 }
@@ -358,7 +453,9 @@ func filterAgents(all []agents.Agent, onlyRaw, skipRaw string) ([]agents.Agent, 
 
 	selected := make([]agents.Agent, 0, len(all))
 	for _, agent := range all {
-		name := agent.Name
+		// only/skip are keyed by lowercased canonical names; match the same way
+		// so a user-defined agent with an uppercase name is still targetable.
+		name := strings.ToLower(agent.Name)
 		if onlyProvided && !only[name] {
 			continue
 		}
