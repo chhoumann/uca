@@ -9,7 +9,7 @@ builds:
   - main: ./cmd/uca
     binary: uca
     ldflags:
-      - -s -w -X main.version={{ .Version }}
+      - -s -w -X main.buildVersion={{ .Version }}
     env:
       - CGO_ENABLED=0
     goos:
