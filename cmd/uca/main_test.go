@@ -628,6 +628,243 @@ func TestJSONStatus(t *testing.T) {
 	}
 }
 
+func TestApplyEvent(t *testing.T) {
+	// detect of a manual-install agent -> visible, shown as skipped.
+	row := uiRow{}
+	applyEvent(&row, updateEvent{Phase: phaseDetect, Show: true, Result: result{Status: statusSkipped, Reason: reasonManualInstall, Method: agents.KindNative}})
+	if !row.visible || row.status != statusSkipped || row.reason != reasonManualInstall {
+		t.Fatalf("detect(manual) row = %+v", row)
+	}
+
+	// detect of a normal updatable agent -> pending.
+	row = uiRow{}
+	applyEvent(&row, updateEvent{Phase: phaseDetect, Show: true, Result: result{Method: agents.KindNpm, Before: "1.0.0"}})
+	if !row.visible || row.status != "pending" || row.before != "1.0.0" {
+		t.Fatalf("detect(normal) row = %+v", row)
+	}
+
+	// start -> updating, target version captured.
+	start := time.Now()
+	applyEvent(&row, updateEvent{Phase: phaseStart, Time: start, Result: result{Before: "1.0.0", After: "1.1.0", Method: agents.KindNpm}})
+	if row.status != "updating" || row.after != "1.1.0" || row.start != start {
+		t.Fatalf("start row = %+v", row)
+	}
+
+	// finish -> final status + duration.
+	applyEvent(&row, updateEvent{Phase: phaseFinish, Result: result{Status: statusUpdated, Before: "1.0.0", After: "1.1.0", Duration: 3 * time.Second}})
+	if row.status != statusUpdated || row.duration != 3*time.Second {
+		t.Fatalf("finish row = %+v", row)
+	}
+}
+
+func TestRenderFrameBootVsDashboard(t *testing.T) {
+	r := &uiRenderer{width: 200, useColor: false, useUnicode: false}
+	start := time.Now()
+
+	// detected < total and no visible row yet -> boot line only.
+	rows := []uiRow{{name: "a", visible: false}, {name: "b", visible: false}}
+	boot := renderFrame(rows, 1, start, options{}, r, 0, 2)
+	if !strings.Contains(boot, "detecting 0/2") {
+		t.Fatalf("boot frame missing 'detecting 0/2': %q", boot)
+	}
+	if strings.Contains(boot, "\na ") {
+		t.Fatalf("boot frame should not render rows: %q", boot)
+	}
+
+	// detected < total with a visible row -> dashboard, still advertising detection.
+	rows[0].visible = true
+	rows[0].status = "pending"
+	dash := renderFrame(rows, 1, start, options{}, r, 1, 2)
+	if !strings.Contains(dash, "uca") || !strings.Contains(dash, "detecting 1/2") {
+		t.Fatalf("partial dashboard = %q", dash)
+	}
+
+	// all detected -> dashboard with no detecting suffix.
+	full := renderFrame(rows, 1, start, options{}, r, 2, 2)
+	if strings.Contains(full, "detecting") {
+		t.Fatalf("full dashboard should not show 'detecting': %q", full)
+	}
+}
+
+func writeExec(t *testing.T, dir, name, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+func fakePathEnv(t *testing.T, scripts map[string]string) (string, *envState) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script PATH fixtures are POSIX-only")
+	}
+	dir := t.TempDir()
+	for name, body := range scripts {
+		writeExec(t, dir, name, body)
+	}
+	t.Setenv("PATH", dir)
+	return dir, &envState{ctx: context.Background(), binPathCache: map[string]string{}, helpChecks: map[string]bool{}}
+}
+
+func TestResolveUpdateBrew(t *testing.T) {
+	_, env := fakePathEnv(t, map[string]string{
+		"brew": "#!/bin/sh\ncase \"$1\" in\n  list) echo \"copilot-cli 1.2.3\" ;;\nesac\n",
+	})
+	env.hasBrew = true
+	resolved := resolveUpdate(defaultAgent(t, "copilot"), env)
+	if !reflect.DeepEqual(resolved.cmd, []string{"brew", "upgrade", "copilot-cli"}) {
+		t.Fatalf("brew cmd = %#v", resolved.cmd)
+	}
+	if resolved.method != agents.KindBrew {
+		t.Fatalf("brew method = %q", resolved.method)
+	}
+}
+
+func TestResolveUpdatePip(t *testing.T) {
+	// uv absent, pip present -> pip strategy (the fallback after uv).
+	_, env := fakePathEnv(t, map[string]string{
+		"python3": "#!/bin/sh\nif [ \"$3\" = \"show\" ]; then exit 0; fi\nexit 1\n",
+	})
+	env.hasPython = true
+	resolved := resolveUpdate(defaultAgent(t, "aider"), env)
+	want := []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", "aider-chat"}
+	if !reflect.DeepEqual(resolved.cmd, want) {
+		t.Fatalf("pip cmd = %#v, want %#v", resolved.cmd, want)
+	}
+	if resolved.method != agents.KindPip {
+		t.Fatalf("pip method = %q", resolved.method)
+	}
+}
+
+func TestResolveUpdateUv(t *testing.T) {
+	// uv present -> uv strategy (preferred over pip).
+	_, env := fakePathEnv(t, map[string]string{
+		"uv": "#!/bin/sh\necho \"aider-chat v1.2.3\"\n",
+	})
+	env.hasUv = true
+	resolved := resolveUpdate(defaultAgent(t, "aider"), env)
+	want := []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", "aider-chat@latest"}
+	if !reflect.DeepEqual(resolved.cmd, want) {
+		t.Fatalf("uv cmd = %#v, want %#v", resolved.cmd, want)
+	}
+	if resolved.method != agents.KindUv {
+		t.Fatalf("uv method = %q", resolved.method)
+	}
+}
+
+func TestResolveUpdateVSCode(t *testing.T) {
+	_, env := fakePathEnv(t, map[string]string{
+		"code": "#!/bin/sh\necho \"RooVeterinaryInc.roo-cline@1.2.3\"\n",
+	})
+	env.codeCmd = "code"
+	resolved := resolveUpdate(defaultAgent(t, "roocode"), env)
+	want := []string{"code", "--install-extension", "RooVeterinaryInc.roo-cline", "--force"}
+	if !reflect.DeepEqual(resolved.cmd, want) {
+		t.Fatalf("vscode cmd = %#v, want %#v", resolved.cmd, want)
+	}
+	if resolved.method != agents.KindVSCode {
+		t.Fatalf("vscode method = %q", resolved.method)
+	}
+}
+
+func TestResolveUpdateVSCodeMissingCode(t *testing.T) {
+	_, env := fakePathEnv(t, map[string]string{})
+	env.codeCmd = "" // no VS Code CLI
+	resolved := resolveUpdate(defaultAgent(t, "roocode"), env)
+	if resolved.cmd != nil || resolved.reason != reasonMissingCode {
+		t.Fatalf("missing-code resolved = %#v (reason %q), want reasonMissingCode", resolved.cmd, resolved.reason)
+	}
+}
+
+func TestResolveUpdateManualInstall(t *testing.T) {
+	// Binary present but no supported install method -> manual.
+	_, env := fakePathEnv(t, map[string]string{
+		"gemini": "#!/bin/sh\n",
+	})
+	resolved := resolveUpdate(defaultAgent(t, "gemini"), env)
+	if resolved.cmd != nil || resolved.reason != reasonManualInstall {
+		t.Fatalf("manual resolved = %#v (reason %q), want reasonManualInstall", resolved.cmd, resolved.reason)
+	}
+}
+
+func nodeIntegrationEnv(t *testing.T, scripts map[string]string) *envState {
+	t.Helper()
+	_, env := fakePathEnv(t, scripts)
+	env.hasNpm = true
+	// Pre-seed npm detection so resolveUpdate doesn't shell out to `npm bin -g`
+	// etc. (which would pollute the recorded npm calls). A dummy bin dir won't
+	// match any agent's bin dir, so detection falls to the package list.
+	env.npmBin = t.TempDir()
+	env.npmBinOnce.Do(func() {})
+	env.npmPkgs = map[string]bool{"pkg-one": true, "pkg-two": true}
+	env.npmPkgOnce.Do(func() {})
+	return env
+}
+
+func nodeTestAgents() []agents.Agent {
+	return []agents.Agent{
+		{Name: "one", Binary: "one", VersionCmd: []string{"one", "--version"}, Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-one"}}},
+		{Name: "two", Binary: "two", VersionCmd: []string{"two", "--version"}, Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-two"}}},
+	}
+}
+
+func TestRunAllWithEventsBatchesNodeUpdates(t *testing.T) {
+	dir := t.TempDir()
+	record := filepath.Join(dir, "npm-calls.txt")
+	env := nodeIntegrationEnv(t, map[string]string{
+		"npm": "#!/bin/sh\ncase \"$1\" in\n  install) echo \"$@\" >> '" + record + "' ;;\nesac\nexit 0\n",
+		"one": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
+		"two": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
+	})
+
+	results := runAllWithEvents(context.Background(), nodeTestAgents(), env, options{}, nil)
+
+	data, _ := os.ReadFile(record)
+	calls := strings.TrimSpace(string(data))
+	if calls == "" {
+		t.Fatal("npm install was never invoked")
+	}
+	if strings.Contains(calls, "\n") {
+		t.Fatalf("expected ONE batched npm call, got:\n%s", calls)
+	}
+	if calls != "install -g pkg-one@latest pkg-two@latest" {
+		t.Fatalf("batch call = %q", calls)
+	}
+	for _, res := range results {
+		if res.Status != statusUnchanged {
+			t.Fatalf("%s status = %q, want unchanged", res.Agent.Name, res.Status)
+		}
+	}
+}
+
+func TestRunAllWithEventsBatchFailureFallsBackPerPackage(t *testing.T) {
+	dir := t.TempDir()
+	record := filepath.Join(dir, "npm-calls.txt")
+	// The batch (>1 package) fails; each single-package retry succeeds.
+	env := nodeIntegrationEnv(t, map[string]string{
+		"npm": "#!/bin/sh\ncase \"$1\" in\n  install)\n    echo \"$@\" >> '" + record + "'\n    if [ $# -gt 3 ]; then exit 1; fi\n    exit 0 ;;\nesac\nexit 0\n",
+		"one": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
+		"two": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
+	})
+
+	results := runAllWithEvents(context.Background(), nodeTestAgents(), env, options{}, nil)
+
+	data, _ := os.ReadFile(record)
+	calls := string(data)
+	if !strings.Contains(calls, "install -g pkg-one@latest pkg-two@latest") {
+		t.Fatalf("expected a batch attempt, calls:\n%s", calls)
+	}
+	if !strings.Contains(calls, "install -g pkg-one@latest\n") || !strings.Contains(calls, "install -g pkg-two@latest\n") {
+		t.Fatalf("expected per-package fallback calls, calls:\n%s", calls)
+	}
+	// Both fell back to a successful single update -> not failed.
+	for _, res := range results {
+		if res.Status == statusFailed {
+			t.Fatalf("%s unexpectedly failed after fallback", res.Agent.Name)
+		}
+	}
+}
+
 func TestShouldRetryNpm(t *testing.T) {
 	tests := []struct {
 		name   string
