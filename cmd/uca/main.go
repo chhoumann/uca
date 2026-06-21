@@ -39,6 +39,7 @@ type options struct {
 	Quiet       bool
 	DryRun      bool
 	Explain     bool
+	JSON        bool
 	Only        string
 	Skip        string
 	Help        bool
@@ -101,8 +102,12 @@ func main() {
 	all := agents.Default()
 	selected, unknown := filterAgents(all, opts.Only, opts.Skip)
 	if len(selected) == 0 {
-		fmt.Fprintln(os.Stdout, noSelectionMessage(unknown))
-		printSummary(nil, unknown)
+		if opts.JSON {
+			printJSON(nil, unknown, opts)
+		} else {
+			fmt.Fprintln(os.Stdout, noSelectionMessage(unknown))
+			printSummary(nil, unknown)
+		}
 		return
 	}
 
@@ -110,16 +115,20 @@ func main() {
 	uiEnabled := shouldShowUI(opts)
 	results := runAll(ctx, selected, env, opts, uiEnabled)
 
-	if !uiEnabled {
-		printResults(results, opts)
+	if opts.JSON {
+		printJSON(results, unknown, opts)
 	} else {
-		fmt.Fprintln(os.Stdout)
-		if opts.Explain && !opts.Quiet {
-			printExplainDetails(results)
+		if !uiEnabled {
+			printResults(results, opts)
+		} else {
+			fmt.Fprintln(os.Stdout)
+			if opts.Explain && !opts.Quiet {
+				printExplainDetails(results)
+			}
 		}
+		printLogs(results, opts)
+		printSummary(results, unknown)
 	}
-	printLogs(results, opts)
-	printSummary(results, unknown)
 
 	if hasFailures(results) {
 		os.Exit(1)
@@ -146,6 +155,7 @@ func parseFlags(args []string) (options, error) {
 	fs.BoolVar(&opts.DryRun, "n", false, "print commands without executing")
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "print commands without executing")
 	fs.BoolVar(&opts.Explain, "explain", false, "explain detection and update method")
+	fs.BoolVar(&opts.JSON, "json", false, "emit machine-readable JSON (implies no live UI)")
 	fs.StringVar(&opts.Only, "only", "", "comma-separated agent list")
 	fs.StringVar(&opts.Skip, "skip", "", "comma-separated agent list to exclude")
 	fs.BoolVar(&opts.Help, "h", false, "show help")
@@ -197,10 +207,19 @@ Options:
   -q, --quiet       suppress per-agent version lines (summary only)
   -n, --dry-run     print commands that would run, do not execute
       --explain     show detection details and chosen update method
+      --json        emit machine-readable JSON (implies no live UI)
       --only LIST   comma-separated agent list to include
       --skip LIST   comma-separated agent list to exclude
       --version     show version
   -h, --help        show usage
+
+Examples:
+  uca                      update every detected agent
+  uca -n --only claude     preview the claude update only
+  uca --explain            show how each agent was detected
+  uca --json | jq .        machine-readable results
+
+Note: 'agent' is accepted as an alias for cursor in --only/--skip.
 `)
 }
 
@@ -285,7 +304,7 @@ func parseList(raw string) map[string]bool {
 }
 
 func shouldShowUI(opts options) bool {
-	if opts.Quiet {
+	if opts.Quiet || opts.JSON {
 		return false
 	}
 	if !isTTY(os.Stdout) {
@@ -489,6 +508,11 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 
 	// Emit detect events and handle skipped/dry-run results.
 	now := time.Now()
+
+	if opts.DryRun {
+		return dryRunResults(ctx, works, env, results, events, now)
+	}
+
 	for _, work := range works {
 		res := result{
 			Agent:     work.agent,
@@ -512,39 +536,9 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 			continue
 		}
 
-		if opts.DryRun {
-			// Emit detect first so the UI can render quickly, then populate versions.
-			if events != nil {
-				events <- updateEvent{Index: work.index, Phase: phaseDetect, Result: res, Time: now, Show: work.show}
-			}
-
-			res.Status = statusUpdated
-			res.Reason = "dry-run"
-			res.Before = getVersion(ctx, work.agent, env, work.method, work.versionCmd)
-			res.After = res.Before
-			if isNodeKind(work.method) {
-				if latest := nodeLatestVersion(ctx, work.method, work.nodePackageName); latest != "" {
-					if formatted := formatVersionWithToken(res.Before, latest); formatted != "" {
-						res.After = formatted
-					} else {
-						res.After = latest
-					}
-				}
-			}
-			results[work.index] = res
-			if events != nil {
-				events <- updateEvent{Index: work.index, Phase: phaseFinish, Result: res, Time: now, Show: work.show}
-			}
-			continue
-		}
-
 		if events != nil {
 			events <- updateEvent{Index: work.index, Phase: phaseDetect, Result: res, Time: now, Show: work.show}
 		}
-	}
-
-	if opts.DryRun {
-		return results
 	}
 
 	locker := newManagerLocker()
@@ -572,6 +566,88 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 	close(taskCh)
 	wg.Wait()
 
+	return results
+}
+
+const (
+	dryRunPreviewBudget      = 12 * time.Second
+	dryRunPreviewConcurrency = 8
+)
+
+// dryRunResults computes the dry-run preview. It emits all detect events first
+// (cheap), then fetches current+latest versions concurrently — each is a
+// subprocess / network round-trip — then emits finish events. This keeps
+// `uca -n` fast: wall-clock is ~max(single lookup) instead of the sum across
+// agents (previously the lookups ran fully serially with no budget cap).
+func dryRunResults(ctx context.Context, works []agentWork, env *envState, results []result, events chan<- updateEvent, now time.Time) []result {
+	updatable := make([]*agentWork, 0, len(works))
+	for i := range works {
+		work := &works[i]
+		res := result{
+			Agent:     work.agent,
+			Method:    work.method,
+			Explain:   work.explain,
+			UpdateCmd: cmdString(work.updateCmd),
+		}
+		if work.updateCmdSingle == nil {
+			res.Status = statusSkipped
+			if work.reason == "" {
+				res.Reason = reasonMissing
+			} else {
+				res.Reason = work.reason
+			}
+			results[work.index] = res
+			if events != nil {
+				events <- updateEvent{Index: work.index, Phase: phaseDetect, Result: res, Time: now, Show: work.show}
+				events <- updateEvent{Index: work.index, Phase: phaseFinish, Result: res, Time: now, Show: work.show}
+			}
+			continue
+		}
+		if events != nil {
+			events <- updateEvent{Index: work.index, Phase: phaseDetect, Result: res, Time: now, Show: work.show}
+		}
+		updatable = append(updatable, work)
+	}
+
+	previewCtx, cancel := context.WithTimeout(ctx, dryRunPreviewBudget)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, dryRunPreviewConcurrency)
+	for _, work := range updatable {
+		wg.Add(1)
+		go func(work *agentWork) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			res := result{
+				Agent:     work.agent,
+				Method:    work.method,
+				Explain:   work.explain,
+				UpdateCmd: cmdString(work.updateCmd),
+				Status:    statusUpdated,
+				Reason:    "dry-run",
+			}
+			res.Before = getVersion(previewCtx, work.agent, env, work.method, work.versionCmd)
+			res.After = res.Before
+			if isNodeKind(work.method) {
+				if latest := env.nodeLatestVersion(previewCtx, work.method, work.nodePackageName); latest != "" {
+					if formatted := formatVersionWithToken(res.Before, latest); formatted != "" {
+						res.After = formatted
+					} else {
+						res.After = latest
+					}
+				}
+			}
+			results[work.index] = res
+		}(work)
+	}
+	wg.Wait()
+	cancel()
+
+	if events != nil {
+		for _, work := range updatable {
+			events <- updateEvent{Index: work.index, Phase: phaseFinish, Result: results[work.index], Time: time.Now(), Show: work.show}
+		}
+	}
 	return results
 }
 
@@ -612,7 +688,7 @@ func runTask(ctx context.Context, task updateTask, env *envState, opts options, 
 			wg.Add(1)
 			go func(i int, before, pkg string) {
 				defer wg.Done()
-				latest := nodeLatestVersion(previewCtx, kind, pkg)
+				latest := env.nodeLatestVersion(previewCtx, kind, pkg)
 				if latest == "" {
 					return
 				}
@@ -1467,12 +1543,43 @@ func formatVersionWithToken(before, newVersion string) string {
 	return strings.Replace(before, token, newVersion, 1)
 }
 
-func nodeLatestVersion(ctx context.Context, kind, pkg string) string {
+// nodeLatestVersion returns the registry "latest" for a node package, memoized
+// per (kind,pkg) so the dry-run preview and the live preview don't re-query the
+// same package. Only successful (non-empty) results are cached, so a transient
+// failure does not poison the preview for the rest of the run.
+func (e *envState) nodeLatestVersion(ctx context.Context, kind, pkg string) string {
 	pkg = strings.TrimSpace(pkg)
 	if pkg == "" {
 		return ""
 	}
-	args := []string{}
+	key := kind + "\x00" + pkg
+	e.mu.Lock()
+	if e.latestCache != nil {
+		if v, ok := e.latestCache[key]; ok {
+			e.mu.Unlock()
+			return v
+		}
+	}
+	e.mu.Unlock()
+
+	v := queryNodeLatestVersion(ctx, kind, pkg)
+	if v != "" {
+		e.mu.Lock()
+		if e.latestCache == nil {
+			e.latestCache = map[string]string{}
+		}
+		e.latestCache[key] = v
+		e.mu.Unlock()
+	}
+	return v
+}
+
+// queryNodeLatestVersion runs the manager's registry query and extracts a single
+// semver token. Managers (and wrappers like safe-chain) can emit advisory banner
+// lines on stdout, so the parse prefers a clean standalone version line and fails
+// closed (empty -> no preview) rather than surfacing banner text as a "version".
+func queryNodeLatestVersion(ctx context.Context, kind, pkg string) string {
+	var args []string
 	switch kind {
 	case agents.KindNpm:
 		args = []string{"npm", "view", pkg, "dist-tags.latest"}
@@ -1491,9 +1598,62 @@ func nodeLatestVersion(ctx context.Context, kind, pkg string) string {
 	if exitCode != 0 {
 		return ""
 	}
+	// bun emits JSON: a scalar ("6.0.3") or, on some builds, the full manifest
+	// object. Parse the top-level version explicitly so a dependency's version in
+	// the manifest can't be mistaken for the package's own.
+	if kind == agents.KindBun {
+		if v := parseBunVersionJSON(out); v != "" {
+			return v
+		}
+	}
+	return parseLatestVersionOutput(out)
+}
+
+func parseBunVersionJSON(out string) string {
 	trimmed := strings.TrimSpace(out)
-	trimmed = strings.Trim(trimmed, "\"'")
-	return strings.TrimSpace(trimmed)
+	if trimmed == "" {
+		return ""
+	}
+	var scalar string
+	if err := json.Unmarshal([]byte(trimmed), &scalar); err == nil {
+		if token, ok := extractVersionToken(scalar); ok {
+			return token
+		}
+	}
+	var obj struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &obj); err == nil && obj.Version != "" {
+		if token, ok := extractVersionToken(obj.Version); ok {
+			return token
+		}
+	}
+	return ""
+}
+
+// parseLatestVersionOutput pulls the version out of a registry query's stdout.
+// It prefers a line whose entire content is a single version token — the normal
+// single-field output of `npm view dist-tags.latest` and friends — so advisory
+// banner lines are ignored whether the tool prints them before or after the
+// version. It only falls back to an embedded token when no standalone line exists.
+func parseLatestVersionOutput(out string) string {
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		s := strings.Trim(strings.TrimSpace(line), "\"'")
+		if s == "" {
+			continue
+		}
+		if token, ok := extractVersionToken(s); ok && token == s {
+			return token
+		}
+	}
+	for _, line := range lines {
+		s := strings.Trim(strings.TrimSpace(line), "\"'")
+		if token, ok := extractVersionToken(s); ok {
+			return token
+		}
+	}
+	return ""
 }
 
 func runVersionCmd(ctx context.Context, args []string) string {
@@ -1903,6 +2063,14 @@ func printResults(results []result, opts options) {
 	if opts.Quiet {
 		return
 	}
+	// In dry-run, node agents under one manager share a single batch command.
+	// Group them so the command prints once under all involved agents instead of
+	// repeating the full batch line (with every other agent's package) per agent.
+	// --explain stays per-agent because its detail differs per agent.
+	if opts.DryRun && !opts.Explain {
+		printDryRunPlan(results)
+		return
+	}
 	for _, res := range results {
 		fmt.Fprintln(os.Stdout, formatResult(res, opts))
 		if opts.Explain {
@@ -1911,6 +2079,39 @@ func printResults(results []result, opts options) {
 			}
 		}
 	}
+}
+
+func printDryRunPlan(results []result) {
+	for _, line := range dryRunPlanLines(results) {
+		fmt.Fprintln(os.Stdout, line)
+	}
+}
+
+// dryRunPlanLines renders the dry-run plan, collapsing agents that share a batch
+// command onto a single line (e.g. "codex, opencode, pi: bun add -g ...") so the
+// batch command is shown once rather than repeated per agent.
+func dryRunPlanLines(results []result) []string {
+	lines := make([]string, 0, len(results))
+	printedCmd := map[string]bool{}
+	for i, res := range results {
+		if res.Status != statusUpdated {
+			// skipped / other: print individually, in place.
+			lines = append(lines, formatResult(res, options{DryRun: true}))
+			continue
+		}
+		if printedCmd[res.UpdateCmd] {
+			continue
+		}
+		printedCmd[res.UpdateCmd] = true
+		names := []string{res.Agent.Name}
+		for _, other := range results[i+1:] {
+			if other.Status == statusUpdated && other.UpdateCmd == res.UpdateCmd {
+				names = append(names, other.Agent.Name)
+			}
+		}
+		lines = append(lines, fmt.Sprintf("%s: %s", strings.Join(names, ", "), res.UpdateCmd))
+	}
+	return lines
 }
 
 func printExplainDetails(results []result) {
@@ -1950,6 +2151,76 @@ func formatExplain(res result) string {
 		return ""
 	}
 	return fmt.Sprintf("  info: %s", res.Explain)
+}
+
+type jsonAgentResult struct {
+	Name            string `json:"name"`
+	Method          string `json:"method,omitempty"`
+	Status          string `json:"status"`
+	Reason          string `json:"reason,omitempty"`
+	Before          string `json:"before,omitempty"`
+	After           string `json:"after,omitempty"`
+	DurationSeconds int    `json:"durationSeconds"`
+	UpdateCmd       string `json:"updateCmd,omitempty"`
+	Explain         string `json:"explain,omitempty"`
+}
+
+type jsonReport struct {
+	DryRun       bool              `json:"dryRun"`
+	Agents       []jsonAgentResult `json:"agents"`
+	UnknownNames []string          `json:"unknownNames,omitempty"`
+	Summary      map[string]int    `json:"summary"`
+}
+
+// jsonStatus normalizes the internal status into a stable, self-describing token
+// for machine consumers (dry-run surfaces as its own status rather than
+// "updated" with reason "dry-run").
+func jsonStatus(res result) string {
+	if res.Status == statusUpdated && res.Reason == "dry-run" {
+		return "dry-run"
+	}
+	if res.Status == "" {
+		return "unknown"
+	}
+	return res.Status
+}
+
+func buildReport(results []result, unknown []string, opts options) jsonReport {
+	report := jsonReport{
+		DryRun:       opts.DryRun,
+		Agents:       make([]jsonAgentResult, 0, len(results)),
+		UnknownNames: unknown,
+		Summary:      map[string]int{},
+	}
+	for _, res := range results {
+		status := jsonStatus(res)
+		reason := res.Reason
+		if status == "dry-run" {
+			reason = "" // redundant with the status
+		}
+		report.Agents = append(report.Agents, jsonAgentResult{
+			Name:            res.Agent.Name,
+			Method:          res.Method,
+			Status:          status,
+			Reason:          reason,
+			Before:          res.Before,
+			After:           res.After,
+			DurationSeconds: int(res.Duration.Round(time.Second).Seconds()),
+			UpdateCmd:       res.UpdateCmd,
+			Explain:         res.Explain,
+		})
+		report.Summary[status]++
+	}
+	return report
+}
+
+func printJSON(results []result, unknown []string, opts options) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(buildReport(results, unknown, opts)); err != nil {
+		fmt.Fprintf(os.Stderr, "uca: failed to encode JSON: %v\n", err)
+	}
 }
 
 func safeVersion(v string) string {
@@ -2097,6 +2368,7 @@ type envState struct {
 	codeOnce     sync.Once
 	codeExts     map[string]string
 	helpChecks   map[string]bool
+	latestCache  map[string]string
 }
 
 func newEnv(ctx context.Context) *envState {
