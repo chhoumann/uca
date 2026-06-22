@@ -10,10 +10,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +21,7 @@ import (
 
 	"github.com/chhoumann/uca/internal/agents"
 	"github.com/chhoumann/uca/internal/agentspec"
+	"github.com/chhoumann/uca/internal/detect"
 	runner "github.com/chhoumann/uca/internal/exec"
 	"github.com/chhoumann/uca/internal/ui"
 	"github.com/chhoumann/uca/internal/version"
@@ -133,7 +132,7 @@ func main() {
 		return
 	}
 
-	env := newEnv(ctx)
+	env := detect.New(ctx)
 
 	if opts.Check {
 		checkResults := runCheck(ctx, selected, env)
@@ -524,7 +523,7 @@ func isTTY(file *os.File) bool {
 	return (stat.Mode() & os.ModeCharDevice) != 0
 }
 
-func runAll(ctx context.Context, selected []agents.Agent, env *envState, opts options, uiEnabled bool) []result {
+func runAll(ctx context.Context, selected []agents.Agent, env *detect.Env, opts options, uiEnabled bool) []result {
 	if uiEnabled {
 		return runAllWithUI(ctx, selected, env, opts)
 	}
@@ -609,7 +608,7 @@ func effectiveConcurrency(opts options, numTasks int) int {
 	return numTasks
 }
 
-func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envState, opts options, events chan<- updateEvent) []result {
+func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.Env, opts options, events chan<- updateEvent) []result {
 	results := make([]result, len(selected))
 	works := make([]agentWork, len(selected))
 
@@ -775,7 +774,7 @@ const (
 // subprocess / network round-trip — then emits finish events. This keeps
 // `uca -n` fast: wall-clock is ~max(single lookup) instead of the sum across
 // agents (previously the lookups ran fully serially with no budget cap).
-func dryRunResults(ctx context.Context, works []agentWork, env *envState, results []result, events chan<- updateEvent, now time.Time) []result {
+func dryRunResults(ctx context.Context, works []agentWork, env *detect.Env, results []result, events chan<- updateEvent, now time.Time) []result {
 	updatable := make([]*agentWork, 0, len(works))
 	for i := range works {
 		work := &works[i]
@@ -825,7 +824,7 @@ func dryRunResults(ctx context.Context, works []agentWork, env *envState, result
 			res.Before = getVersion(previewCtx, work.agent, env, work.method, work.versionCmd)
 			res.After = res.Before
 			if agentspec.IsNodeKind(work.method) {
-				if latest := env.nodeLatestVersion(previewCtx, work.method, work.nodePackageName); latest != "" {
+				if latest := env.NodeLatestVersion(previewCtx, work.method, work.nodePackageName); latest != "" {
 					if formatted := version.FormatWithToken(res.Before, latest); formatted != "" {
 						res.After = formatted
 					} else {
@@ -847,7 +846,7 @@ func dryRunResults(ctx context.Context, works []agentWork, env *envState, result
 	return results
 }
 
-func runTask(ctx context.Context, task updateTask, env *envState, opts options, locker *managerLocker, events chan<- updateEvent, results []result) {
+func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options, locker *managerLocker, events chan<- updateEvent, results []result) {
 	if len(task.agents) == 0 {
 		return
 	}
@@ -884,7 +883,7 @@ func runTask(ctx context.Context, task updateTask, env *envState, opts options, 
 			wg.Add(1)
 			go func(i int, before, pkg string) {
 				defer wg.Done()
-				latest := env.nodeLatestVersion(previewCtx, kind, pkg)
+				latest := env.NodeLatestVersion(previewCtx, kind, pkg)
 				if latest == "" {
 					return
 				}
@@ -975,7 +974,7 @@ const (
 	phaseFinish = agents.PhaseFinish
 )
 
-func runAllWithUI(ctx context.Context, selected []agents.Agent, env *envState, opts options) []result {
+func runAllWithUI(ctx context.Context, selected []agents.Agent, env *detect.Env, opts options) []result {
 	events := make(chan updateEvent, len(selected)*4)
 	done := make(chan struct{})
 
@@ -1018,42 +1017,7 @@ func runAllWithUI(ctx context.Context, selected []agents.Agent, env *envState, o
 		}
 	}()
 
-	go func() {
-		env.npmBinOnce.Do(env.loadNpmBin)
-	}()
-	go func() {
-		env.npmPkgOnce.Do(env.loadNpmPkgs)
-	}()
-	go func() {
-		env.pnpmBinOnce.Do(env.loadPnpmBin)
-	}()
-	go func() {
-		env.pnpmPkgOnce.Do(env.loadPnpmPkgs)
-	}()
-	go func() {
-		env.yarnBinOnce.Do(env.loadYarnBin)
-	}()
-	go func() {
-		env.yarnPkgOnce.Do(env.loadYarnPkgs)
-	}()
-	go func() {
-		env.bunBinOnce.Do(env.loadBunGlobalBin)
-	}()
-	go func() {
-		env.bunPkgOnce.Do(env.loadBunPkgs)
-	}()
-	go func() {
-		env.uvOnce.Do(env.loadUvTools)
-	}()
-	go func() {
-		env.brewOnce.Do(env.loadBrewFormulae)
-	}()
-	go func() {
-		env.pipOnce.Do(env.loadPipPkgs)
-	}()
-	go func() {
-		env.codeOnce.Do(env.loadCodeExtensions)
-	}()
+	env.Prewarm()
 
 	results := runAllWithEvents(ctx, selected, env, opts, events)
 	close(events)
@@ -1079,28 +1043,28 @@ func toUIEvent(ev updateEvent) ui.Event {
 	}
 }
 
-func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
+func resolveUpdate(agent agents.Agent, env *detect.Env) resolvedUpdate {
 	codeMissing := false
 	detail := ""
 	nativeIdentityMiss := ""
 	nodeManager := ""
 	if agent.Binary != "" {
-		nodeManager = env.nodeManagerForBinary(agent.Binary)
+		nodeManager = env.NodeManagerForBinary(agent.Binary)
 	}
 	packageManager := ""
 	packageName := agentspec.NodePackageName(agent.Strategies)
 	if nodeManager == "" && packageName != "" {
-		packageManager = env.nodeManagerForPackage(packageName)
+		packageManager = env.NodeManagerForPackage(packageName)
 	}
 
 	for _, strat := range agent.Strategies {
 		switch strat.Kind {
 		case agents.KindNative:
 			binary := nativeStrategyBinary(agent, strat)
-			if binary != "" && !env.hasBinary(binary) {
+			if binary != "" && !env.HasBinary(binary) {
 				continue
 			}
-			if !nativeStrategyHelpMatches(env, binary, strat.HelpContains) {
+			if !env.HelpMatches(binary, strat.HelpContains) {
 				nativeIdentityMiss = fmt.Sprintf("binary %s found but help text did not identify %s", binary, strat.HelpContains)
 				continue
 			}
@@ -1113,7 +1077,7 @@ func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
 				versionCmd: versionCmd,
 			}
 		case agents.KindBun, agents.KindNpm, agents.KindPnpm, agents.KindYarn:
-			if !env.hasNodeManager(strat.Kind) {
+			if !env.HasNodeManager(strat.Kind) {
 				continue
 			}
 			if agent.Binary == "" || strat.Package == "" {
@@ -1133,43 +1097,43 @@ func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
 				detail = fmt.Sprintf("%s global package %s installed; matched by package list; updating via %s", strat.Kind, strat.Package, strat.Kind)
 				return resolvedUpdate{cmd: agentspec.NodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package, version: strat.Version}
 			}
-			if !env.nodeBinHasBinary(strat.Kind, agent.Binary) {
+			if !env.NodeBinHasBinary(strat.Kind, agent.Binary) {
 				continue
 			}
 			detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
 			return resolvedUpdate{cmd: agentspec.NodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package}
 		case agents.KindBrew:
-			if !env.hasBrew {
+			if !env.HasBrew() {
 				continue
 			}
-			if env.brewHas(strat.Package) {
+			if env.BrewHas(strat.Package) {
 				detail = fmt.Sprintf("brew formula %s installed", strat.Package)
 				return resolvedUpdate{cmd: []string{"brew", "upgrade", strat.Package}, method: strat.Kind, detail: detail, pkg: strat.Package}
 			}
 		case agents.KindPip:
-			if !env.hasPython {
+			if !env.HasPython() {
 				continue
 			}
-			if env.pipHas(strat.Package) {
+			if env.PipHas(strat.Package) {
 				detail = fmt.Sprintf("pip package %s installed", strat.Package)
 				return resolvedUpdate{cmd: []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", strat.Package}, method: strat.Kind, detail: detail, pkg: strat.Package}
 			}
 		case agents.KindUv:
-			if !env.hasUv {
+			if !env.HasUv() {
 				continue
 			}
-			if env.uvHas(strat.Package) {
+			if env.UvHas(strat.Package) {
 				detail = fmt.Sprintf("uv tool %s installed", strat.Package)
 				return resolvedUpdate{cmd: []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@" + agentspec.VersionSpec(strat.Version)}, method: strat.Kind, detail: detail, pkg: strat.Package}
 			}
 		case agents.KindVSCode:
-			if env.codeCmd == "" {
+			if env.CodeCmd() == "" {
 				codeMissing = true
 				continue
 			}
-			if env.vscodeHas(strat.ExtensionID) {
-				detail = fmt.Sprintf("VS Code extension %s installed (via %s)", strat.ExtensionID, env.codeCmd)
-				return resolvedUpdate{cmd: []string{env.codeCmd, "--install-extension", strat.ExtensionID, "--force"}, method: strat.Kind, detail: detail}
+			if env.VscodeHas(strat.ExtensionID) {
+				detail = fmt.Sprintf("VS Code extension %s installed (via %s)", strat.ExtensionID, env.CodeCmd())
+				return resolvedUpdate{cmd: []string{env.CodeCmd(), "--install-extension", strat.ExtensionID, "--force"}, method: strat.Kind, detail: detail}
 			}
 		}
 	}
@@ -1177,7 +1141,7 @@ func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
 	if codeMissing {
 		return resolvedUpdate{reason: reasonMissingCode, detail: "VS Code CLI not found (code/codium/code-insiders)"}
 	}
-	if agent.Binary != "" && env.hasBinary(agent.Binary) {
+	if agent.Binary != "" && env.HasBinary(agent.Binary) {
 		return resolvedUpdate{reason: reasonManualInstall, detail: "binary found but no supported install method detected"}
 	}
 	if nativeIdentityMiss != "" {
@@ -1200,45 +1164,14 @@ func nativeStrategyVersionCmd(agent agents.Agent, strat agents.UpdateStrategy) [
 	return agent.VersionCmd
 }
 
-const nativeHelpCheckTimeout = 2 * time.Second
-
-func nativeStrategyHelpMatches(env *envState, binary, contains string) bool {
-	if strings.TrimSpace(contains) == "" {
-		return true
-	}
-	if binary == "" {
-		return false
-	}
-	path := env.binaryPath(binary)
-	cacheKey := binary + "\x00" + path + "\x00" + contains
-	env.mu.Lock()
-	if env.helpChecks != nil {
-		if ok, found := env.helpChecks[cacheKey]; found {
-			env.mu.Unlock()
-			return ok
-		}
-	} else {
-		env.helpChecks = map[string]bool{}
-	}
-	env.mu.Unlock()
-
-	out, exitCode, _, _ := runner.Run(env.baseCtx(), []string{binary, "--help"}, nativeHelpCheckTimeout)
-	ok := exitCode == 0 && strings.Contains(out, contains)
-
-	env.mu.Lock()
-	env.helpChecks[cacheKey] = ok
-	env.mu.Unlock()
-	return ok
-}
-
 // versionSpec returns the version selector for a package spec: a pinned version
 // when set, otherwise "latest" (forced to avoid getting stuck on old
 // minor/prerelease versions, common for 0.x CLIs).
 const versionCmdTimeout = 10 * time.Second
 
-func getVersion(ctx context.Context, agent agents.Agent, env *envState, method string, versionCmd []string) string {
+func getVersion(ctx context.Context, agent agents.Agent, env *detect.Env, method string, versionCmd []string) string {
 	if method == agents.KindVSCode && agent.ExtensionID != "" {
-		if version := env.vscodeVersion(agent.ExtensionID); version != "" {
+		if version := env.VscodeVersion(agent.ExtensionID); version != "" {
 			return version
 		}
 	}
@@ -1246,111 +1179,29 @@ func getVersion(ctx context.Context, agent agents.Agent, env *envState, method s
 		return runVersionCmd(ctx, versionCmd)
 	}
 	if len(agent.VersionCmd) > 0 {
-		if agent.Binary == "" || env.hasBinary(agent.Binary) {
+		if agent.Binary == "" || env.HasBinary(agent.Binary) {
 			return runVersionCmd(ctx, agent.VersionCmd)
 		}
 	}
 	if agent.ExtensionID != "" {
-		if version := env.vscodeVersion(agent.ExtensionID); version != "" {
+		if version := env.VscodeVersion(agent.ExtensionID); version != "" {
 			return version
 		}
 	}
 	return "unknown"
 }
 
-const latestVersionCmdTimeout = 12 * time.Second
-
 // nodeLatestVersion returns the registry "latest" for a node package, memoized
 // per (kind,pkg) so the dry-run preview and the live preview don't re-query the
 // same package. Only successful (non-empty) results are cached, so a transient
 // failure does not poison the preview for the rest of the run.
-func (e *envState) nodeLatestVersion(ctx context.Context, kind, pkg string) string {
-	pkg = strings.TrimSpace(pkg)
-	if pkg == "" {
-		return ""
-	}
-	key := kind + "\x00" + pkg
-	e.mu.Lock()
-	if e.latestCache != nil {
-		if v, ok := e.latestCache[key]; ok {
-			e.mu.Unlock()
-			return v
-		}
-	}
-	e.mu.Unlock()
-
-	v := queryNodeLatestVersion(ctx, kind, pkg)
-	if v != "" {
-		e.mu.Lock()
-		if e.latestCache == nil {
-			e.latestCache = map[string]string{}
-		}
-		e.latestCache[key] = v
-		e.mu.Unlock()
-	}
-	return v
-}
-
 // queryNodeLatestVersion runs the manager's registry query and extracts a single
 // semver token. Managers (and wrappers like safe-chain) can emit advisory banner
 // lines on stdout, so the parse prefers a clean standalone version line and fails
 // closed (empty -> no preview) rather than surfacing banner text as a "version".
-func queryNodeLatestVersion(ctx context.Context, kind, pkg string) string {
-	var args []string
-	switch kind {
-	case agents.KindNpm:
-		args = []string{"npm", "view", pkg, "dist-tags.latest"}
-	case agents.KindPnpm:
-		args = []string{"pnpm", "view", pkg, "dist-tags.latest", "--silent"}
-	case agents.KindYarn:
-		args = []string{"yarn", "info", pkg, "dist-tags.latest", "--silent"}
-	case agents.KindBun:
-		// `bun info` needs `-g` to work outside of a JS project.
-		args = []string{"bun", "info", "-g", pkg, "version", "--json"}
-	default:
-		return ""
-	}
-
-	out, exitCode, _, _ := runner.RunStdout(ctx, args, latestVersionCmdTimeout)
-	if exitCode != 0 {
-		return ""
-	}
-	// bun emits JSON: a scalar ("6.0.3") or, on some builds, the full manifest
-	// object. Parse the top-level version explicitly so a dependency's version in
-	// the manifest can't be mistaken for the package's own.
-	if kind == agents.KindBun {
-		if v := version.ParseBunJSON(out); v != "" {
-			return v
-		}
-	}
-	return version.ParseLatest(out)
-}
-
 // latestVersion returns the latest available version for an update method, or ""
 // when it is not cheaply/reliably knowable (native updaters, VS Code extensions,
 // and pip/uv tools, which lack a stable, banner-free CLI query). Used by --check.
-func (e *envState) latestVersion(ctx context.Context, method, pkg string) string {
-	switch method {
-	case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun:
-		return e.nodeLatestVersion(ctx, method, pkg)
-	case agents.KindBrew:
-		return e.brewLatest(ctx, pkg)
-	default:
-		return ""
-	}
-}
-
-func (e *envState) brewLatest(ctx context.Context, formula string) string {
-	if formula == "" {
-		return ""
-	}
-	out, exitCode, _, _ := runner.RunStdout(ctx, []string{"brew", "info", "--json=v2", formula}, latestVersionCmdTimeout)
-	if exitCode != 0 {
-		return ""
-	}
-	return version.ParseBrewLatest(out)
-}
-
 type checkState string
 
 const (
@@ -1398,7 +1249,7 @@ const (
 // runCheck resolves every selected agent and compares its installed version to
 // the latest available one, without changing anything. Lookups run concurrently
 // under a shared budget.
-func runCheck(ctx context.Context, selected []agents.Agent, env *envState) []checkResult {
+func runCheck(ctx context.Context, selected []agents.Agent, env *detect.Env) []checkResult {
 	results := make([]checkResult, len(selected))
 	checkCtx, cancel := context.WithTimeout(ctx, checkBudget)
 	defer cancel()
@@ -1422,7 +1273,7 @@ func runCheck(ctx context.Context, selected []agents.Agent, env *envState) []che
 				return
 			}
 			res.Current = getVersion(checkCtx, agent, env, resolved.method, resolved.versionCmd)
-			res.Latest = env.latestVersion(checkCtx, resolved.method, resolved.pkg)
+			res.Latest = env.LatestVersion(checkCtx, resolved.method, resolved.pkg)
 			res.State = compareVersions(res.Current, res.Latest)
 			results[i] = res
 		}(i, agent)
@@ -1676,8 +1527,6 @@ func isSafeNpmRenameTarget(path, dest string) bool {
 // manager metadata reads, so a tight bound keeps startup responsive on a degraded
 // environment (e.g. a manager hung behind a dead proxy) without affecting healthy
 // runs, where they return in well under a second.
-const detectCmdTimeout = 10 * time.Second
-
 func cmdString(args []string) string {
 	parts := make([]string, 0, len(args))
 	for _, arg := range args {
@@ -2050,627 +1899,4 @@ func hasFailures(results []result) bool {
 		}
 	}
 	return false
-}
-
-type envState struct {
-	ctx context.Context
-
-	hasBun    bool
-	hasBrew   bool
-	hasNpm    bool
-	hasPnpm   bool
-	hasYarn   bool
-	hasUv     bool
-	hasPython bool
-	codeCmd   string
-
-	mu           sync.Mutex
-	binPathCache map[string]string
-	npmBinOnce   sync.Once
-	npmBin       string
-	npmPkgOnce   sync.Once
-	npmPkgs      map[string]bool
-	pnpmBinOnce  sync.Once
-	pnpmBin      string
-	pnpmPkgOnce  sync.Once
-	pnpmPkgs     map[string]bool
-	yarnBinOnce  sync.Once
-	yarnBin      string
-	yarnPkgOnce  sync.Once
-	yarnPkgs     map[string]bool
-	bunBinOnce   sync.Once
-	bunGlobalBin string
-	bunPkgOnce   sync.Once
-	bunPkgs      map[string]bool
-	uvOnce       sync.Once
-	uvTools      map[string]bool
-	codeOnce     sync.Once
-	codeExts     map[string]string
-	helpChecks   map[string]bool
-	latestCache  map[string]string
-	brewOnce     sync.Once
-	brewFormulae map[string]bool
-	pipOnce      sync.Once
-	pipPkgs      map[string]bool
-}
-
-func newEnv(ctx context.Context) *envState {
-	return &envState{
-		ctx:          ctx,
-		hasBun:       hasBinary("bun"),
-		hasBrew:      hasBinary("brew"),
-		hasNpm:       hasBinary("npm"),
-		hasPnpm:      hasBinary("pnpm"),
-		hasYarn:      hasBinary("yarn"),
-		hasUv:        hasBinary("uv"),
-		hasPython:    hasBinary("python3"),
-		codeCmd:      detectCodeCmd(),
-		binPathCache: map[string]string{},
-		helpChecks:   map[string]bool{},
-	}
-}
-
-func detectCodeCmd() string {
-	candidates := []string{"code", "codium", "code-insiders"}
-	for _, candidate := range candidates {
-		if hasBinary(candidate) {
-			return candidate
-		}
-	}
-	return ""
-}
-
-func (e *envState) baseCtx() context.Context {
-	if e == nil || e.ctx == nil {
-		return context.Background()
-	}
-	return e.ctx
-}
-
-func (e *envState) hasBinary(name string) bool {
-	return e.binaryPath(name) != ""
-}
-
-func hasBinary(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
-}
-
-func (e *envState) binaryPath(name string) string {
-	if name == "" {
-		return ""
-	}
-	e.mu.Lock()
-	if path, ok := e.binPathCache[name]; ok {
-		e.mu.Unlock()
-		return path
-	}
-	e.mu.Unlock()
-	path, err := exec.LookPath(name)
-	if err != nil {
-		path = ""
-	} else {
-		path = filepath.Clean(path)
-	}
-	e.mu.Lock()
-	e.binPathCache[name] = path
-	e.mu.Unlock()
-	return path
-}
-
-func (e *envState) hasNodeManager(kind string) bool {
-	switch kind {
-	case agents.KindNpm:
-		return e.hasNpm
-	case agents.KindPnpm:
-		return e.hasPnpm
-	case agents.KindYarn:
-		return e.hasYarn
-	case agents.KindBun:
-		return e.hasBun
-	default:
-		return false
-	}
-}
-
-func (e *envState) nodeManagerForBinary(name string) string {
-	binPath := e.binaryPath(name)
-	if binPath == "" {
-		return ""
-	}
-	binDir := filepath.Dir(binPath)
-	resolvedBinDir := ""
-	if resolvedPath := resolveSymlinkPath(binPath); resolvedPath != "" {
-		resolvedBinDir = filepath.Dir(resolvedPath)
-	}
-	matches := []string{}
-	for _, kind := range []string{agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun} {
-		if !e.hasNodeManager(kind) {
-			continue
-		}
-		dir := e.nodeBinDir(kind)
-		if dir == "" {
-			continue
-		}
-		if samePath(dir, binDir) || (resolvedBinDir != "" && samePath(dir, resolvedBinDir)) {
-			matches = append(matches, kind)
-		}
-	}
-	if len(matches) == 1 {
-		return matches[0]
-	}
-	if len(matches) > 1 {
-		bestKind := ""
-		bestLen := -1
-		tie := false
-		for _, kind := range matches {
-			dir := e.nodeBinDir(kind)
-			if len(dir) > bestLen {
-				bestLen = len(dir)
-				bestKind = kind
-				tie = false
-				continue
-			}
-			if len(dir) == bestLen {
-				tie = true
-			}
-		}
-		if !tie {
-			return bestKind
-		}
-	}
-	return ""
-}
-
-func (e *envState) nodeBinHasBinary(kind, name string) bool {
-	return binDirHasBinary(e.nodeBinDir(kind), name)
-}
-
-func (e *envState) nodeBinDir(kind string) string {
-	switch kind {
-	case agents.KindNpm:
-		return e.npmBinDir()
-	case agents.KindPnpm:
-		return e.pnpmBinDir()
-	case agents.KindYarn:
-		return e.yarnBinDir()
-	case agents.KindBun:
-		return e.bunGlobalBinDir()
-	default:
-		return ""
-	}
-}
-
-func (e *envState) nodeManagerForPackage(pkg string) string {
-	if pkg == "" {
-		return ""
-	}
-	matches := []string{}
-	for _, kind := range []string{agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun} {
-		if !e.hasNodeManager(kind) {
-			continue
-		}
-		if e.nodeManagerHasPackage(kind, pkg) {
-			matches = append(matches, kind)
-		}
-	}
-	if len(matches) == 1 {
-		return matches[0]
-	}
-	return ""
-}
-
-func (e *envState) nodeManagerHasPackage(kind, pkg string) bool {
-	switch kind {
-	case agents.KindNpm:
-		return e.npmHas(pkg)
-	case agents.KindPnpm:
-		return e.pnpmHas(pkg)
-	case agents.KindYarn:
-		return e.yarnHas(pkg)
-	case agents.KindBun:
-		return e.bunHas(pkg)
-	default:
-		return false
-	}
-}
-
-func (e *envState) npmBinDir() string {
-	e.npmBinOnce.Do(e.loadNpmBin)
-	return e.npmBin
-}
-
-func (e *envState) loadNpmBin() {
-	e.npmBin = ""
-	if !e.hasNpm {
-		return
-	}
-	// Both probes share one budget so a hung npm can't burn two full timeouts.
-	probeCtx, cancel := context.WithTimeout(e.baseCtx(), detectCmdTimeout)
-	defer cancel()
-	out, exitCode, _, _ := runner.RunStdout(probeCtx, []string{"npm", "bin", "-g"}, 0)
-	if exitCode == 0 {
-		if dir := strings.TrimSpace(out); dir != "" {
-			e.npmBin = dir
-			return
-		}
-	}
-
-	// npm v11 removed `npm bin`, but `npm prefix -g` still works.
-	prefixOut, exitCode, _, _ := runner.RunStdout(probeCtx, []string{"npm", "prefix", "-g"}, 0)
-	if exitCode != 0 {
-		return
-	}
-	prefix := strings.TrimSpace(prefixOut)
-	if prefix == "" {
-		return
-	}
-	// On Unix-like systems, global binaries are installed under <prefix>/bin.
-	// On Windows, global binaries are typically installed directly under <prefix>.
-	if runtime.GOOS == "windows" {
-		bin := filepath.Join(prefix, "bin")
-		if info, err := os.Stat(bin); err == nil && info.IsDir() {
-			e.npmBin = bin
-			return
-		}
-		e.npmBin = prefix
-		return
-	}
-	e.npmBin = filepath.Join(prefix, "bin")
-}
-
-func (e *envState) npmHas(pkg string) bool {
-	e.npmPkgOnce.Do(e.loadNpmPkgs)
-	return e.npmPkgs[pkg]
-}
-
-func (e *envState) loadNpmPkgs() {
-	e.npmPkgs = map[string]bool{}
-	if !e.hasNpm {
-		return
-	}
-	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{"npm", "list", "-g", "--depth=0", "--json"}, detectCmdTimeout)
-	var payload struct {
-		Dependencies map[string]any `json:"dependencies"`
-	}
-	if err := json.Unmarshal([]byte(out), &payload); err != nil {
-		return
-	}
-	for name := range payload.Dependencies {
-		e.npmPkgs[name] = true
-	}
-}
-
-func (e *envState) pnpmBinDir() string {
-	e.pnpmBinOnce.Do(e.loadPnpmBin)
-	return e.pnpmBin
-}
-
-func (e *envState) loadPnpmBin() {
-	e.pnpmBin = ""
-	if !e.hasPnpm {
-		return
-	}
-	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"pnpm", "bin", "-g"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	e.pnpmBin = strings.TrimSpace(out)
-}
-
-func (e *envState) pnpmHas(pkg string) bool {
-	e.pnpmPkgOnce.Do(e.loadPnpmPkgs)
-	return e.pnpmPkgs[pkg]
-}
-
-func (e *envState) loadPnpmPkgs() {
-	e.pnpmPkgs = map[string]bool{}
-	if !e.hasPnpm {
-		return
-	}
-	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{"pnpm", "list", "-g", "--depth=0", "--json"}, detectCmdTimeout)
-	type pnpmPayload struct {
-		Dependencies map[string]any `json:"dependencies"`
-	}
-	var list []pnpmPayload
-	if err := json.Unmarshal([]byte(out), &list); err == nil {
-		for _, entry := range list {
-			for name := range entry.Dependencies {
-				e.pnpmPkgs[name] = true
-			}
-		}
-		return
-	}
-	var single pnpmPayload
-	if err := json.Unmarshal([]byte(out), &single); err != nil {
-		return
-	}
-	for name := range single.Dependencies {
-		e.pnpmPkgs[name] = true
-	}
-}
-
-func (e *envState) yarnBinDir() string {
-	e.yarnBinOnce.Do(e.loadYarnBin)
-	return e.yarnBin
-}
-
-func (e *envState) loadYarnBin() {
-	e.yarnBin = ""
-	if !e.hasYarn {
-		return
-	}
-	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"yarn", "global", "bin"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	e.yarnBin = strings.TrimSpace(out)
-}
-
-func (e *envState) yarnHas(pkg string) bool {
-	e.yarnPkgOnce.Do(e.loadYarnPkgs)
-	return e.yarnPkgs[pkg]
-}
-
-func (e *envState) loadYarnPkgs() {
-	e.yarnPkgs = map[string]bool{}
-	if !e.hasYarn {
-		return
-	}
-	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"yarn", "global", "list", "--depth=0"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	for name := range parsePackageListOutput(out) {
-		e.yarnPkgs[name] = true
-	}
-}
-
-func (e *envState) bunGlobalBinDir() string {
-	e.bunBinOnce.Do(e.loadBunGlobalBin)
-	return e.bunGlobalBin
-}
-
-func (e *envState) loadBunGlobalBin() {
-	e.bunGlobalBin = ""
-	if !e.hasBun {
-		return
-	}
-	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"bun", "pm", "bin", "-g"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	e.bunGlobalBin = strings.TrimSpace(out)
-}
-
-func (e *envState) bunHas(pkg string) bool {
-	e.bunPkgOnce.Do(e.loadBunPkgs)
-	return e.bunPkgs[pkg]
-}
-
-func (e *envState) loadBunPkgs() {
-	e.bunPkgs = map[string]bool{}
-	if !e.hasBun {
-		return
-	}
-	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"bun", "pm", "ls", "-g"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	for name := range parsePackageListOutput(out) {
-		e.bunPkgs[name] = true
-	}
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
-}
-
-func binDirHasBinary(binDir, name string) bool {
-	if binDir == "" || name == "" {
-		return false
-	}
-	candidates := []string{filepath.Join(binDir, name)}
-	if runtime.GOOS == "windows" {
-		candidates = append(candidates,
-			filepath.Join(binDir, name+".exe"),
-			filepath.Join(binDir, name+".cmd"),
-			filepath.Join(binDir, name+".bat"),
-		)
-	}
-	for _, candidate := range candidates {
-		if fileExists(candidate) {
-			return true
-		}
-	}
-	return false
-}
-
-func samePath(a, b string) bool {
-	if a == "" || b == "" {
-		return false
-	}
-	a = filepath.Clean(a)
-	b = filepath.Clean(b)
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(a, b)
-	}
-	if a == b {
-		return true
-	}
-	ra := resolveSymlinkPath(a)
-	rb := resolveSymlinkPath(b)
-	if ra != "" && rb != "" {
-		return ra == rb
-	}
-	if ra != "" && ra == b {
-		return true
-	}
-	if rb != "" && rb == a {
-		return true
-	}
-	return false
-}
-
-func resolveSymlinkPath(path string) string {
-	if path == "" {
-		return ""
-	}
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return ""
-	}
-	return filepath.Clean(resolved)
-}
-
-func parsePackageListOutput(out string) map[string]bool {
-	pkgs := map[string]bool{}
-	scanner := bufio.NewScanner(strings.NewReader(out))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-		for _, token := range strings.Fields(line) {
-			if name := parsePackageFromToken(token); name != "" {
-				pkgs[name] = true
-			}
-		}
-	}
-	return pkgs
-}
-
-func parsePackageFromToken(token string) string {
-	if token == "" {
-		return ""
-	}
-	token = strings.Trim(token, "\"'`,")
-	token = strings.TrimRight(token, "):,")
-	token = strings.TrimLeft(token, "(")
-	if !strings.Contains(token, "@") {
-		return ""
-	}
-	idx := strings.LastIndex(token, "@")
-	if idx <= 0 || idx == len(token)-1 {
-		return ""
-	}
-	return token[:idx]
-}
-
-func (e *envState) uvHas(pkg string) bool {
-	e.uvOnce.Do(e.loadUvTools)
-	return e.uvTools[pkg]
-}
-
-func (e *envState) loadUvTools() {
-	e.uvTools = map[string]bool{}
-	if !e.hasUv {
-		return
-	}
-	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{"uv", "tool", "list"}, detectCmdTimeout)
-	scanner := bufio.NewScanner(strings.NewReader(out))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		e.uvTools[fields[0]] = true
-	}
-}
-
-func (e *envState) brewHas(formula string) bool {
-	if !e.hasBrew {
-		return false
-	}
-	e.brewOnce.Do(e.loadBrewFormulae)
-	return e.brewFormulae[formula]
-}
-
-func (e *envState) loadBrewFormulae() {
-	e.brewFormulae = map[string]bool{}
-	if !e.hasBrew {
-		return
-	}
-	// One `brew list` instead of a `brew list <formula>` per agent (brew is slow
-	// to cold-start); each line is "<formula> <version> [more versions]".
-	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"brew", "list", "--formula", "--versions"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	scanner := bufio.NewScanner(strings.NewReader(out))
-	for scanner.Scan() {
-		if fields := strings.Fields(scanner.Text()); len(fields) > 0 {
-			e.brewFormulae[fields[0]] = true
-		}
-	}
-}
-
-func normalizePipName(name string) string {
-	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(name)), "_", "-")
-}
-
-func (e *envState) pipHas(pkg string) bool {
-	if !e.hasPython {
-		return false
-	}
-	e.pipOnce.Do(e.loadPipPkgs)
-	return e.pipPkgs[normalizePipName(pkg)]
-}
-
-func (e *envState) loadPipPkgs() {
-	e.pipPkgs = map[string]bool{}
-	if !e.hasPython {
-		return
-	}
-	// One `pip list` instead of a `pip show <pkg>` per agent. Names are normalized
-	// (lowercase, "_"->"-") to match pip's own canonicalization.
-	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"python3", "-m", "pip", "list", "--format", "freeze"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	scanner := bufio.NewScanner(strings.NewReader(out))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if i := strings.Index(line, "=="); i > 0 {
-			e.pipPkgs[normalizePipName(line[:i])] = true
-		}
-	}
-}
-
-func (e *envState) vscodeHas(extID string) bool {
-	e.codeOnce.Do(e.loadCodeExtensions)
-	_, ok := e.codeExts[extID]
-	return ok
-}
-
-func (e *envState) vscodeVersion(extID string) string {
-	e.codeOnce.Do(e.loadCodeExtensions)
-	return e.codeExts[extID]
-}
-
-func (e *envState) loadCodeExtensions() {
-	e.codeExts = map[string]string{}
-	if e.codeCmd == "" {
-		return
-	}
-	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{e.codeCmd, "--list-extensions", "--show-versions"}, detectCmdTimeout)
-	scanner := bufio.NewScanner(strings.NewReader(out))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		idx := strings.LastIndex(line, "@")
-		if idx <= 0 {
-			continue
-		}
-		id := line[:idx]
-		version := line[idx+1:]
-		e.codeExts[id] = version
-	}
 }
