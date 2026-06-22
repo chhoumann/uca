@@ -13,22 +13,6 @@ import (
 	"github.com/chhoumann/uca/internal/agents"
 )
 
-func TestFormatRowUpdatingShowsTargetVersion(t *testing.T) {
-	row := uiRow{
-		name:   "codex",
-		status: "updating",
-		before: "codex-cli 0.90.0-alpha.5",
-		after:  "codex-cli 0.98.0",
-		start:  time.Now(),
-	}
-	r := &uiRenderer{width: 200, useColor: false, useUnicode: true}
-
-	got := formatRow(row, len(row.name), options{}, r)
-	if !strings.Contains(got, "codex-cli 0.90.0-alpha.5 → codex-cli 0.98.0") {
-		t.Fatalf("formatRow() did not include target version; got %q", got)
-	}
-}
-
 func TestFilterAgentsAcceptsCursorAgentAlias(t *testing.T) {
 	defaults := agents.Default()
 
@@ -483,59 +467,6 @@ func TestEffectiveConcurrencyNonPositive(t *testing.T) {
 	}
 }
 
-func TestRecolorIconDoesNotCorruptName(t *testing.T) {
-	// droid in dry-run: ASCII icon is "dr", which also starts the name "droid".
-	row := uiRow{name: "droid", status: statusUpdated, reason: "dry-run", before: "1.0.0", after: "1.0.0"}
-	r := &uiRenderer{width: 200, useColor: true, useUnicode: false}
-
-	line := formatRow(row, len(row.name), options{}, r)
-
-	if !strings.Contains(line, "droid \x1b[35mdr\x1b[0m") {
-		t.Fatalf("formatRow() did not color the icon at its position; got %q", line)
-	}
-	if strings.Contains(line, "\x1b[35mdr\x1b[0moid") {
-		t.Fatalf("formatRow() corrupted the name by coloring 'dr' inside 'droid'; got %q", line)
-	}
-}
-
-func TestFormatRowUsesAsciiArrowWithoutUnicode(t *testing.T) {
-	row := uiRow{name: "codex", status: statusUpdated, before: "1.0.0", after: "1.1.0"}
-	r := &uiRenderer{width: 200, useColor: false, useUnicode: false}
-
-	line := formatRow(row, len(row.name), options{}, r)
-	if !strings.Contains(line, "1.0.0 -> 1.1.0") {
-		t.Fatalf("formatRow() ASCII should use '->'; got %q", line)
-	}
-	if strings.Contains(line, "→") {
-		t.Fatalf("formatRow() leaked a unicode arrow under !useUnicode; got %q", line)
-	}
-}
-
-func TestRenderDashboardSuppressesDetectingAfterCompletion(t *testing.T) {
-	r := &uiRenderer{width: 200, useColor: false, useUnicode: false}
-	start := time.Now()
-	rows := []uiRow{
-		{name: "claude", status: statusUpdated, visible: true, before: "1", after: "1"},
-		{name: "codex", status: "pending", visible: true},
-	}
-	// detected (1) < total (2) but one visible row already completed: the
-	// "detecting" suffix must not be shown (it is misleading at that point).
-	out := renderDashboard(rows, 6, start, options{}, r, 1, 2)
-	if strings.Contains(out, "detecting") {
-		t.Fatalf("renderDashboard showed 'detecting' after a row completed; got %q", out)
-	}
-
-	// While nothing has completed yet, detection progress is still advertised.
-	pending := []uiRow{
-		{name: "claude", status: "pending", visible: true},
-		{name: "codex", status: "pending", visible: true},
-	}
-	out = renderDashboard(pending, 6, start, options{}, r, 1, 2)
-	if !strings.Contains(out, "detecting 1/2") {
-		t.Fatalf("renderDashboard should advertise detection progress before completion; got %q", out)
-	}
-}
-
 func TestNodeLatestVersionCaches(t *testing.T) {
 	env := newTestEnv()
 	env.latestCache = map[string]string{agents.KindNpm + "\x00" + "pkg": "9.9.9"}
@@ -806,64 +737,6 @@ func TestRunCheckDetectsOutdated(t *testing.T) {
 	}
 	if results[0].Current != "1.0.0" || results[0].Latest != "2.0.0" {
 		t.Fatalf("current/latest = %q/%q", results[0].Current, results[0].Latest)
-	}
-}
-
-func TestApplyEvent(t *testing.T) {
-	// detect of a manual-install agent -> visible, shown as skipped.
-	row := uiRow{}
-	applyEvent(&row, updateEvent{Phase: phaseDetect, Show: true, Result: result{Status: statusSkipped, Reason: reasonManualInstall, Method: agents.KindNative}})
-	if !row.visible || row.status != statusSkipped || row.reason != reasonManualInstall {
-		t.Fatalf("detect(manual) row = %+v", row)
-	}
-
-	// detect of a normal updatable agent -> pending.
-	row = uiRow{}
-	applyEvent(&row, updateEvent{Phase: phaseDetect, Show: true, Result: result{Method: agents.KindNpm, Before: "1.0.0"}})
-	if !row.visible || row.status != "pending" || row.before != "1.0.0" {
-		t.Fatalf("detect(normal) row = %+v", row)
-	}
-
-	// start -> updating, target version captured.
-	start := time.Now()
-	applyEvent(&row, updateEvent{Phase: phaseStart, Time: start, Result: result{Before: "1.0.0", After: "1.1.0", Method: agents.KindNpm}})
-	if row.status != "updating" || row.after != "1.1.0" || row.start != start {
-		t.Fatalf("start row = %+v", row)
-	}
-
-	// finish -> final status + duration.
-	applyEvent(&row, updateEvent{Phase: phaseFinish, Result: result{Status: statusUpdated, Before: "1.0.0", After: "1.1.0", Duration: 3 * time.Second}})
-	if row.status != statusUpdated || row.duration != 3*time.Second {
-		t.Fatalf("finish row = %+v", row)
-	}
-}
-
-func TestRenderFrameBootVsDashboard(t *testing.T) {
-	r := &uiRenderer{width: 200, useColor: false, useUnicode: false}
-	start := time.Now()
-
-	// detected < total and no visible row yet -> boot line only.
-	rows := []uiRow{{name: "a", visible: false}, {name: "b", visible: false}}
-	boot := renderFrame(rows, 1, start, options{}, r, 0, 2)
-	if !strings.Contains(boot, "detecting 0/2") {
-		t.Fatalf("boot frame missing 'detecting 0/2': %q", boot)
-	}
-	if strings.Contains(boot, "\na ") {
-		t.Fatalf("boot frame should not render rows: %q", boot)
-	}
-
-	// detected < total with a visible row -> dashboard, still advertising detection.
-	rows[0].visible = true
-	rows[0].status = "pending"
-	dash := renderFrame(rows, 1, start, options{}, r, 1, 2)
-	if !strings.Contains(dash, "uca") || !strings.Contains(dash, "detecting 1/2") {
-		t.Fatalf("partial dashboard = %q", dash)
-	}
-
-	// all detected -> dashboard with no detecting suffix.
-	full := renderFrame(rows, 1, start, options{}, r, 2, 2)
-	if strings.Contains(full, "detecting") {
-		t.Fatalf("full dashboard should not show 'detecting': %q", full)
 	}
 }
 
