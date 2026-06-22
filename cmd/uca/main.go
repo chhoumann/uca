@@ -23,6 +23,7 @@ import (
 
 	"github.com/chhoumann/uca/internal/agents"
 	"github.com/chhoumann/uca/internal/agentspec"
+	runner "github.com/chhoumann/uca/internal/exec"
 	"github.com/chhoumann/uca/internal/ui"
 	"github.com/chhoumann/uca/internal/version"
 )
@@ -1221,7 +1222,7 @@ func nativeStrategyHelpMatches(env *envState, binary, contains string) bool {
 	}
 	env.mu.Unlock()
 
-	out, exitCode, _, _ := runCmd(env.baseCtx(), []string{binary, "--help"}, nativeHelpCheckTimeout)
+	out, exitCode, _, _ := runner.Run(env.baseCtx(), []string{binary, "--help"}, nativeHelpCheckTimeout)
 	ok := exitCode == 0 && strings.Contains(out, contains)
 
 	env.mu.Lock()
@@ -1310,7 +1311,7 @@ func queryNodeLatestVersion(ctx context.Context, kind, pkg string) string {
 		return ""
 	}
 
-	out, exitCode, _, _ := runCmdStdout(ctx, args, latestVersionCmdTimeout)
+	out, exitCode, _, _ := runner.RunStdout(ctx, args, latestVersionCmdTimeout)
 	if exitCode != 0 {
 		return ""
 	}
@@ -1343,7 +1344,7 @@ func (e *envState) brewLatest(ctx context.Context, formula string) string {
 	if formula == "" {
 		return ""
 	}
-	out, exitCode, _, _ := runCmdStdout(ctx, []string{"brew", "info", "--json=v2", formula}, latestVersionCmdTimeout)
+	out, exitCode, _, _ := runner.RunStdout(ctx, []string{"brew", "info", "--json=v2", formula}, latestVersionCmdTimeout)
 	if exitCode != 0 {
 		return ""
 	}
@@ -1443,85 +1444,22 @@ func runVersionCmd(ctx context.Context, args []string) string {
 	if len(args) == 0 {
 		return "unknown"
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	cmdCtx, cancel := context.WithTimeout(ctx, versionCmdTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
+	out, code, _, _ := runner.Run(ctx, args, versionCmdTimeout)
+	if code != 0 {
 		return "unknown"
 	}
-	return version.ParseOutput(string(out))
-}
-
-const (
-	exitCodeTimeout  = 124
-	exitCodeCanceled = 130
-)
-
-// cmdWaitDelay bounds how long Wait blocks after a command's context is
-// canceled (timeout/SIGINT) or after the process exits while a child still
-// holds an output pipe open. Without it, a single orphaned grandchild (e.g. a
-// `sleep` spawned by an update script) keeps the pipe open and makes --timeout
-// and Ctrl-C effectively non-responsive.
-const cmdWaitDelay = 5 * time.Second
-
-func runCmd(ctx context.Context, args []string, timeout time.Duration) (string, int, time.Duration, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	start := time.Now()
-	cmdCtx := ctx
-	cancel := func() {}
-	if timeout > 0 {
-		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
-	}
-	defer cancel()
-
-	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-	cmd.Stdin = nil
-	cmd.WaitDelay = cmdWaitDelay
-	configureProcessGroup(cmd)
-	err := cmd.Run()
-	duration := time.Since(start)
-	if err == nil {
-		return buf.String(), 0, duration, nil
-	}
-	// On timeout/cancellation exec kills the child with SIGKILL, so the returned
-	// error is an *exec.ExitError ("signal: killed", code -1), not a context
-	// error. Inspect the context state directly to classify these correctly.
-	if cmdCtx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
-		return buf.String(), exitCodeTimeout, duration, err
-	}
-	if ctx.Err() == context.Canceled || errors.Is(err, context.Canceled) {
-		return buf.String(), exitCodeCanceled, duration, err
-	}
-	// A WaitDelay expiry after the process already exited cleanly (a child kept
-	// an output pipe open) is not a real failure.
-	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0 {
-		return buf.String(), 0, duration, nil
-	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		return buf.String(), exitErr.ExitCode(), duration, err
-	}
-	return buf.String(), 1, duration, err
+	return version.ParseOutput(out)
 }
 
 func runUpdateCmd(ctx context.Context, args []string, timeout time.Duration) (string, string, int, time.Duration, error) {
-	out, exitCode, duration, err := runCmd(ctx, args, timeout)
+	out, exitCode, duration, err := runner.Run(ctx, args, timeout)
 	classifyOut := out
 	if exitCode == 0 {
 		return out, classifyOut, exitCode, duration, err
 	}
 	if shouldRetryNpm(args, out) {
 		cleanupMsg := cleanupNpmENotEmpty(out)
-		retryOut, retryCode, retryDuration, retryErr := runCmd(ctx, args, timeout)
+		retryOut, retryCode, retryDuration, retryErr := runner.Run(ctx, args, timeout)
 		combined := formatRetryOutput(out, cleanupMsg, retryOut)
 		classifyOut = retryOut
 		if strings.TrimSpace(classifyOut) == "" {
@@ -1535,7 +1473,7 @@ func runUpdateCmd(ctx context.Context, args []string, timeout time.Duration) (st
 func setFailureResult(res *result, exitCode int, updateCmd []string, output string, timeout time.Duration) {
 	res.Status = statusFailed
 	switch exitCode {
-	case exitCodeTimeout:
+	case runner.ExitCodeTimeout:
 		res.Reason = "timeout"
 		if timeout > 0 {
 			res.Explain = appendHint(res.Explain, fmt.Sprintf("command timed out after %s; rerun with --timeout 0 or increase it", timeout.Round(time.Second)))
@@ -1543,7 +1481,7 @@ func setFailureResult(res *result, exitCode int, updateCmd []string, output stri
 			res.Explain = appendHint(res.Explain, "command timed out; rerun with a larger --timeout")
 		}
 		return
-	case exitCodeCanceled:
+	case runner.ExitCodeCanceled:
 		res.Reason = "canceled"
 		res.Explain = appendHint(res.Explain, "interrupted; retry the update")
 		return
@@ -1739,44 +1677,6 @@ func isSafeNpmRenameTarget(path, dest string) bool {
 // environment (e.g. a manager hung behind a dead proxy) without affecting healthy
 // runs, where they return in well under a second.
 const detectCmdTimeout = 10 * time.Second
-
-func runCmdStdout(ctx context.Context, args []string, timeout time.Duration) (string, int, time.Duration, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	start := time.Now()
-	cmdCtx := ctx
-	cancel := func() {}
-	if timeout > 0 {
-		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
-	}
-	defer cancel()
-
-	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	cmd.WaitDelay = cmdWaitDelay
-	configureProcessGroup(cmd)
-	out, err := cmd.Output()
-	duration := time.Since(start)
-	if err == nil {
-		return string(out), 0, duration, nil
-	}
-	// See runCmd: a killed child surfaces as an ExitError, not a context error.
-	if cmdCtx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
-		return string(out), exitCodeTimeout, duration, err
-	}
-	if ctx.Err() == context.Canceled || errors.Is(err, context.Canceled) {
-		return string(out), exitCodeCanceled, duration, err
-	}
-	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0 {
-		return string(out), 0, duration, nil
-	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		return string(out), exitErr.ExitCode(), duration, err
-	}
-	return string(out), 1, duration, err
-}
 
 func cmdString(args []string) string {
 	parts := make([]string, 0, len(args))
@@ -2388,7 +2288,7 @@ func (e *envState) loadNpmBin() {
 	// Both probes share one budget so a hung npm can't burn two full timeouts.
 	probeCtx, cancel := context.WithTimeout(e.baseCtx(), detectCmdTimeout)
 	defer cancel()
-	out, exitCode, _, _ := runCmdStdout(probeCtx, []string{"npm", "bin", "-g"}, 0)
+	out, exitCode, _, _ := runner.RunStdout(probeCtx, []string{"npm", "bin", "-g"}, 0)
 	if exitCode == 0 {
 		if dir := strings.TrimSpace(out); dir != "" {
 			e.npmBin = dir
@@ -2397,7 +2297,7 @@ func (e *envState) loadNpmBin() {
 	}
 
 	// npm v11 removed `npm bin`, but `npm prefix -g` still works.
-	prefixOut, exitCode, _, _ := runCmdStdout(probeCtx, []string{"npm", "prefix", "-g"}, 0)
+	prefixOut, exitCode, _, _ := runner.RunStdout(probeCtx, []string{"npm", "prefix", "-g"}, 0)
 	if exitCode != 0 {
 		return
 	}
@@ -2429,7 +2329,7 @@ func (e *envState) loadNpmPkgs() {
 	if !e.hasNpm {
 		return
 	}
-	out, _, _, _ := runCmdStdout(e.baseCtx(), []string{"npm", "list", "-g", "--depth=0", "--json"}, detectCmdTimeout)
+	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{"npm", "list", "-g", "--depth=0", "--json"}, detectCmdTimeout)
 	var payload struct {
 		Dependencies map[string]any `json:"dependencies"`
 	}
@@ -2451,7 +2351,7 @@ func (e *envState) loadPnpmBin() {
 	if !e.hasPnpm {
 		return
 	}
-	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"pnpm", "bin", "-g"}, detectCmdTimeout)
+	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"pnpm", "bin", "-g"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -2468,7 +2368,7 @@ func (e *envState) loadPnpmPkgs() {
 	if !e.hasPnpm {
 		return
 	}
-	out, _, _, _ := runCmdStdout(e.baseCtx(), []string{"pnpm", "list", "-g", "--depth=0", "--json"}, detectCmdTimeout)
+	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{"pnpm", "list", "-g", "--depth=0", "--json"}, detectCmdTimeout)
 	type pnpmPayload struct {
 		Dependencies map[string]any `json:"dependencies"`
 	}
@@ -2500,7 +2400,7 @@ func (e *envState) loadYarnBin() {
 	if !e.hasYarn {
 		return
 	}
-	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"yarn", "global", "bin"}, detectCmdTimeout)
+	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"yarn", "global", "bin"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -2517,7 +2417,7 @@ func (e *envState) loadYarnPkgs() {
 	if !e.hasYarn {
 		return
 	}
-	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"yarn", "global", "list", "--depth=0"}, detectCmdTimeout)
+	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"yarn", "global", "list", "--depth=0"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -2536,7 +2436,7 @@ func (e *envState) loadBunGlobalBin() {
 	if !e.hasBun {
 		return
 	}
-	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"bun", "pm", "bin", "-g"}, detectCmdTimeout)
+	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"bun", "pm", "bin", "-g"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -2553,7 +2453,7 @@ func (e *envState) loadBunPkgs() {
 	if !e.hasBun {
 		return
 	}
-	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"bun", "pm", "ls", "-g"}, detectCmdTimeout)
+	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"bun", "pm", "ls", "-g"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -2668,7 +2568,7 @@ func (e *envState) loadUvTools() {
 	if !e.hasUv {
 		return
 	}
-	out, _, _, _ := runCmdStdout(e.baseCtx(), []string{"uv", "tool", "list"}, detectCmdTimeout)
+	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{"uv", "tool", "list"}, detectCmdTimeout)
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -2698,7 +2598,7 @@ func (e *envState) loadBrewFormulae() {
 	}
 	// One `brew list` instead of a `brew list <formula>` per agent (brew is slow
 	// to cold-start); each line is "<formula> <version> [more versions]".
-	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"brew", "list", "--formula", "--versions"}, detectCmdTimeout)
+	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"brew", "list", "--formula", "--versions"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -2729,7 +2629,7 @@ func (e *envState) loadPipPkgs() {
 	}
 	// One `pip list` instead of a `pip show <pkg>` per agent. Names are normalized
 	// (lowercase, "_"->"-") to match pip's own canonicalization.
-	out, exitCode, _, _ := runCmdStdout(e.baseCtx(), []string{"python3", "-m", "pip", "list", "--format", "freeze"}, detectCmdTimeout)
+	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"python3", "-m", "pip", "list", "--format", "freeze"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -2758,7 +2658,7 @@ func (e *envState) loadCodeExtensions() {
 	if e.codeCmd == "" {
 		return
 	}
-	out, _, _, _ := runCmdStdout(e.baseCtx(), []string{e.codeCmd, "--list-extensions", "--show-versions"}, detectCmdTimeout)
+	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{e.codeCmd, "--list-extensions", "--show-versions"}, detectCmdTimeout)
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
