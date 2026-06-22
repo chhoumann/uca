@@ -24,6 +24,35 @@ type Agent struct {
 	Strategies  []UpdateStrategy `json:"strategies,omitempty"`
 }
 
+// Update result status vocabulary, shared by the resolver, the renderer, and the
+// orchestrator so all sites compare against one source of truth.
+const (
+	StatusPending   = "pending"
+	StatusUpdating  = "updating"
+	StatusUpdated   = "updated"
+	StatusUnchanged = "unchanged"
+	StatusSkipped   = "skipped"
+	StatusFailed    = "failed"
+	StatusDryRun    = "dry-run"
+)
+
+// Skip/failure reason vocabulary surfaced to the user.
+const (
+	ReasonMissing       = "missing"
+	ReasonMissingCode   = "missing vscode"
+	ReasonManualInstall = "manual install"
+	ReasonQuota         = "quota"
+	ReasonNpmNotEmpty   = "npm ENOTEMPTY"
+	ReasonDryRun        = "dry-run"
+)
+
+// Update lifecycle phases emitted to the live UI.
+const (
+	PhaseDetect = "detect"
+	PhaseStart  = "start"
+	PhaseFinish = "finish"
+)
+
 const (
 	KindNative = "native"
 	KindBun    = "bun"

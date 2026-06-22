@@ -60,21 +60,23 @@ type result struct {
 	Explain   string
 }
 
+// Local aliases of the shared vocabulary in internal/agents (single source of
+// truth; these keep cmd/uca call sites terse without a parallel set of literals).
 const (
-	statusUpdated   = "updated"
-	statusUnchanged = "unchanged"
-	statusSkipped   = "skipped"
-	statusFailed    = "failed"
+	statusUpdated   = agents.StatusUpdated
+	statusUnchanged = agents.StatusUnchanged
+	statusSkipped   = agents.StatusSkipped
+	statusFailed    = agents.StatusFailed
 )
 
 var buildVersion = "dev"
 
 const (
-	reasonMissing       = "missing"
-	reasonMissingCode   = "missing vscode"
-	reasonManualInstall = "manual install"
-	reasonQuota         = "quota"
-	reasonNpmNotEmpty   = "npm ENOTEMPTY"
+	reasonMissing       = agents.ReasonMissing
+	reasonMissingCode   = agents.ReasonMissingCode
+	reasonManualInstall = agents.ReasonManualInstall
+	reasonQuota         = agents.ReasonQuota
+	reasonNpmNotEmpty   = agents.ReasonNpmNotEmpty
 )
 
 func main() {
@@ -1008,9 +1010,9 @@ type updateEvent struct {
 }
 
 const (
-	phaseDetect = "detect"
-	phaseStart  = "start"
-	phaseFinish = "finish"
+	phaseDetect = agents.PhaseDetect
+	phaseStart  = agents.PhaseStart
+	phaseFinish = agents.PhaseFinish
 )
 
 type uiRow struct {
