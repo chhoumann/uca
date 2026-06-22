@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/chhoumann/uca/internal/agents"
+	"github.com/chhoumann/uca/internal/agentspec"
 	"github.com/chhoumann/uca/internal/ui"
 	"github.com/chhoumann/uca/internal/version"
 )
@@ -591,24 +592,6 @@ func (l *managerLocker) lock(kind string) func() {
 	return func() { m.Unlock() }
 }
 
-func shouldLockKind(kind string) bool {
-	switch kind {
-	case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun, agents.KindBrew, agents.KindPip, agents.KindUv, agents.KindVSCode:
-		return true
-	default:
-		return false
-	}
-}
-
-func isNodeKind(kind string) bool {
-	switch kind {
-	case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun:
-		return true
-	default:
-		return false
-	}
-}
-
 func effectiveConcurrency(opts options, numTasks int) int {
 	if opts.Serial {
 		return 1
@@ -623,29 +606,6 @@ func effectiveConcurrency(opts options, numTasks int) int {
 		return 1
 	}
 	return numTasks
-}
-
-func nodeBatchUpdateCommand(kind string, pkgs []string) []string {
-	args := []string{}
-	switch kind {
-	case agents.KindNpm:
-		args = append(args, "npm", "install", "-g")
-	case agents.KindPnpm:
-		args = append(args, "pnpm", "add", "-g")
-	case agents.KindYarn:
-		args = append(args, "yarn", "global", "add")
-	case agents.KindBun:
-		args = append(args, "bun", "add", "-g")
-	default:
-		return nil
-	}
-	for _, pkg := range pkgs {
-		if strings.TrimSpace(pkg) == "" {
-			continue
-		}
-		args = append(args, pkg+"@latest")
-	}
-	return args
 }
 
 func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envState, opts options, events chan<- updateEvent) []result {
@@ -684,8 +644,8 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 				versionCmd:      resolved.versionCmd,
 				updateCmdSingle: resolved.cmd,
 			}
-			if isNodeKind(resolved.method) {
-				work.nodePackageName = nodePackageName(agent.Strategies)
+			if agentspec.IsNodeKind(resolved.method) {
+				work.nodePackageName = agentspec.NodePackageName(agent.Strategies)
 				work.nodePackageVersion = resolved.version
 			}
 			works[i] = work
@@ -701,7 +661,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 		if work.updateCmdSingle == nil {
 			continue
 		}
-		if isNodeKind(work.method) {
+		if agentspec.IsNodeKind(work.method) {
 			nodeGroups[work.method] = append(nodeGroups[work.method], i)
 			continue
 		}
@@ -731,7 +691,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *envStat
 			continue
 		}
 		sort.Strings(pkgs)
-		cmd := nodeBatchUpdateCommand(kind, pkgs)
+		cmd := agentspec.NodeBatchUpdateCommand(kind, pkgs)
 		group := make([]agentWork, 0, len(indexes))
 		for _, idx := range batchIndexes {
 			works[idx].updateCmd = cmd
@@ -863,7 +823,7 @@ func dryRunResults(ctx context.Context, works []agentWork, env *envState, result
 			}
 			res.Before = getVersion(previewCtx, work.agent, env, work.method, work.versionCmd)
 			res.After = res.Before
-			if isNodeKind(work.method) {
+			if agentspec.IsNodeKind(work.method) {
 				if latest := env.nodeLatestVersion(previewCtx, work.method, work.nodePackageName); latest != "" {
 					if formatted := version.FormatWithToken(res.Before, latest); formatted != "" {
 						res.After = formatted
@@ -893,7 +853,7 @@ func runTask(ctx context.Context, task updateTask, env *envState, opts options, 
 
 	kind := task.kind
 	unlock := func() {}
-	if shouldLockKind(kind) {
+	if agentspec.ShouldLockKind(kind) {
 		unlock = locker.lock(kind)
 	}
 	defer unlock()
@@ -910,7 +870,7 @@ func runTask(ctx context.Context, task updateTask, env *envState, opts options, 
 		res.Before = getVersion(ctx, work.agent, env, work.method, work.versionCmd)
 		prepared[i] = res
 	}
-	if events != nil && isNodeKind(kind) {
+	if events != nil && agentspec.IsNodeKind(kind) {
 		// Best-effort latest version preview. Keep it short so we don't delay updates on bad networks.
 		previewCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		var wg sync.WaitGroup
@@ -948,7 +908,7 @@ func runTask(ctx context.Context, task updateTask, env *envState, opts options, 
 
 	// If a batched node update fails, fall back to per-package updates so we can still make progress and
 	// attribute failures precisely.
-	if exitCode != 0 && len(task.agents) > 1 && isNodeKind(kind) {
+	if exitCode != 0 && len(task.agents) > 1 && agentspec.IsNodeKind(kind) {
 		for i, work := range task.agents {
 			res := prepared[i]
 			res.Explain = appendHint(res.Explain, "batch update failed; retrying individually")
@@ -1127,7 +1087,7 @@ func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
 		nodeManager = env.nodeManagerForBinary(agent.Binary)
 	}
 	packageManager := ""
-	packageName := nodePackageName(agent.Strategies)
+	packageName := agentspec.NodePackageName(agent.Strategies)
 	if nodeManager == "" && packageName != "" {
 		packageManager = env.nodeManagerForPackage(packageName)
 	}
@@ -1163,20 +1123,20 @@ func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
 					continue
 				}
 				detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
-				return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package, version: strat.Version}
+				return resolvedUpdate{cmd: agentspec.NodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package, version: strat.Version}
 			}
 			if packageManager != "" {
 				if packageManager != strat.Kind {
 					continue
 				}
 				detail = fmt.Sprintf("%s global package %s installed; matched by package list; updating via %s", strat.Kind, strat.Package, strat.Kind)
-				return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package, version: strat.Version}
+				return resolvedUpdate{cmd: agentspec.NodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package, version: strat.Version}
 			}
 			if !env.nodeBinHasBinary(strat.Kind, agent.Binary) {
 				continue
 			}
 			detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
-			return resolvedUpdate{cmd: nodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package}
+			return resolvedUpdate{cmd: agentspec.NodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package}
 		case agents.KindBrew:
 			if !env.hasBrew {
 				continue
@@ -1199,7 +1159,7 @@ func resolveUpdate(agent agents.Agent, env *envState) resolvedUpdate {
 			}
 			if env.uvHas(strat.Package) {
 				detail = fmt.Sprintf("uv tool %s installed", strat.Package)
-				return resolvedUpdate{cmd: []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@" + versionSpec(strat.Version)}, method: strat.Kind, detail: detail, pkg: strat.Package}
+				return resolvedUpdate{cmd: []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@" + agentspec.VersionSpec(strat.Version)}, method: strat.Kind, detail: detail, pkg: strat.Package}
 			}
 		case agents.KindVSCode:
 			if env.codeCmd == "" {
@@ -1273,45 +1233,6 @@ func nativeStrategyHelpMatches(env *envState, binary, contains string) bool {
 // versionSpec returns the version selector for a package spec: a pinned version
 // when set, otherwise "latest" (forced to avoid getting stuck on old
 // minor/prerelease versions, common for 0.x CLIs).
-func versionSpec(v string) string {
-	if s := strings.TrimSpace(v); s != "" {
-		return s
-	}
-	return "latest"
-}
-
-func nodeUpdateCommand(strat agents.UpdateStrategy) []string {
-	if len(strat.Command) > 0 {
-		return strat.Command
-	}
-	spec := strat.Package + "@" + versionSpec(strat.Version)
-	switch strat.Kind {
-	case agents.KindNpm:
-		// `npm update -g` does not accept `pkg@version` specs, so we use install.
-		return []string{"npm", "install", "-g", spec}
-	case agents.KindPnpm:
-		return []string{"pnpm", "add", "-g", spec}
-	case agents.KindYarn:
-		return []string{"yarn", "global", "add", spec}
-	case agents.KindBun:
-		return []string{"bun", "add", "-g", spec}
-	default:
-		return strat.Command
-	}
-}
-
-func nodePackageName(strategies []agents.UpdateStrategy) string {
-	for _, strat := range strategies {
-		switch strat.Kind {
-		case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun:
-			if strat.Package != "" {
-				return strat.Package
-			}
-		}
-	}
-	return ""
-}
-
 const versionCmdTimeout = 10 * time.Second
 
 func getVersion(ctx context.Context, agent agents.Agent, env *envState, method string, versionCmd []string) string {

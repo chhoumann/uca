@@ -1191,19 +1191,6 @@ func TestIsNpmGlobalMutate(t *testing.T) {
 	}
 }
 
-func TestNodeUpdateCommandPinnedVersion(t *testing.T) {
-	got := nodeUpdateCommand(agents.UpdateStrategy{Kind: agents.KindNpm, Package: "pkg", Version: "1.2.3"})
-	want := []string{"npm", "install", "-g", "pkg@1.2.3"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("pinned nodeUpdateCommand = %#v, want %#v", got, want)
-	}
-	// Empty version still resolves to @latest.
-	got = nodeUpdateCommand(agents.UpdateStrategy{Kind: agents.KindBun, Package: "pkg"})
-	if !reflect.DeepEqual(got, []string{"bun", "add", "-g", "pkg@latest"}) {
-		t.Fatalf("unpinned nodeUpdateCommand = %#v", got)
-	}
-}
-
 func TestRunAllWithEventsExcludesPinnedFromBatch(t *testing.T) {
 	dir := t.TempDir()
 	record := filepath.Join(dir, "npm-calls.txt")
@@ -1250,66 +1237,6 @@ func mustRead(t *testing.T, path string) []byte {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return data
-}
-
-func TestNodeUpdateCommand_UsesLatestTag(t *testing.T) {
-	tests := []struct {
-		name  string
-		strat agents.UpdateStrategy
-		want  []string
-	}{
-		{
-			name:  "npm",
-			strat: agents.UpdateStrategy{Kind: agents.KindNpm, Package: "pkg"},
-			want:  []string{"npm", "install", "-g", "pkg@latest"},
-		},
-		{
-			name:  "pnpm",
-			strat: agents.UpdateStrategy{Kind: agents.KindPnpm, Package: "pkg"},
-			want:  []string{"pnpm", "add", "-g", "pkg@latest"},
-		},
-		{
-			name:  "yarn",
-			strat: agents.UpdateStrategy{Kind: agents.KindYarn, Package: "pkg"},
-			want:  []string{"yarn", "global", "add", "pkg@latest"},
-		},
-		{
-			name:  "bun",
-			strat: agents.UpdateStrategy{Kind: agents.KindBun, Package: "pkg"},
-			want:  []string{"bun", "add", "-g", "pkg@latest"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := nodeUpdateCommand(tt.strat); !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("nodeUpdateCommand() = %#v, want %#v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestNodeBatchUpdateCommand(t *testing.T) {
-	tests := []struct {
-		name string
-		kind string
-		pkgs []string
-		want []string
-	}{
-		{name: "npm", kind: agents.KindNpm, pkgs: []string{"a", "b"}, want: []string{"npm", "install", "-g", "a@latest", "b@latest"}},
-		{name: "pnpm", kind: agents.KindPnpm, pkgs: []string{"a", "b"}, want: []string{"pnpm", "add", "-g", "a@latest", "b@latest"}},
-		{name: "yarn", kind: agents.KindYarn, pkgs: []string{"a", "b"}, want: []string{"yarn", "global", "add", "a@latest", "b@latest"}},
-		{name: "bun", kind: agents.KindBun, pkgs: []string{"a", "b"}, want: []string{"bun", "add", "-g", "a@latest", "b@latest"}},
-		{name: "npm_skips_empty", kind: agents.KindNpm, pkgs: []string{"a", "", "  ", "b"}, want: []string{"npm", "install", "-g", "a@latest", "b@latest"}},
-		{name: "unknown", kind: "nope", pkgs: []string{"a", "b"}, want: nil},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := nodeBatchUpdateCommand(tt.kind, tt.pkgs); !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("nodeBatchUpdateCommand() = %#v, want %#v", got, tt.want)
-			}
-		})
-	}
 }
 
 func TestEffectiveConcurrency(t *testing.T) {
