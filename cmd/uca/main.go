@@ -548,20 +548,6 @@ type agentWork struct {
 	updateCmdSingle []string
 }
 
-type resolvedUpdate struct {
-	cmd        []string
-	reason     string
-	method     string
-	detail     string
-	versionCmd []string
-	// pkg is the package/formula identifier the update targets, used by --check
-	// to look up the latest available version. Empty when latest is not knowable
-	// (e.g. native updaters and VS Code extensions).
-	pkg string
-	// version is the pinned version for the resolved strategy (empty = @latest).
-	version string
-}
-
 type updateTask struct {
 	kind   string
 	cmd    []string
@@ -633,20 +619,20 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 			defer resolveWG.Done()
 			resolveSem <- struct{}{}
 			defer func() { <-resolveSem }()
-			resolved := resolveUpdate(agent, env)
+			resolved := agentspec.Resolve(agent, env)
 			work := agentWork{
 				agent:           agent,
 				index:           i,
-				show:            resolved.cmd != nil || resolved.reason == reasonManualInstall,
-				method:          resolved.method,
-				explain:         resolved.detail,
-				reason:          resolved.reason,
-				versionCmd:      resolved.versionCmd,
-				updateCmdSingle: resolved.cmd,
+				show:            resolved.Cmd != nil || resolved.Reason == reasonManualInstall,
+				method:          resolved.Method,
+				explain:         resolved.Detail,
+				reason:          resolved.Reason,
+				versionCmd:      resolved.VersionCmd,
+				updateCmdSingle: resolved.Cmd,
 			}
-			if agentspec.IsNodeKind(resolved.method) {
+			if agentspec.IsNodeKind(resolved.Method) {
 				work.nodePackageName = agentspec.NodePackageName(agent.Strategies)
-				work.nodePackageVersion = resolved.version
+				work.nodePackageVersion = resolved.Version
 			}
 			works[i] = work
 		}(i, agent)
@@ -1043,127 +1029,6 @@ func toUIEvent(ev updateEvent) ui.Event {
 	}
 }
 
-func resolveUpdate(agent agents.Agent, env *detect.Env) resolvedUpdate {
-	codeMissing := false
-	detail := ""
-	nativeIdentityMiss := ""
-	nodeManager := ""
-	if agent.Binary != "" {
-		nodeManager = env.NodeManagerForBinary(agent.Binary)
-	}
-	packageManager := ""
-	packageName := agentspec.NodePackageName(agent.Strategies)
-	if nodeManager == "" && packageName != "" {
-		packageManager = env.NodeManagerForPackage(packageName)
-	}
-
-	for _, strat := range agent.Strategies {
-		switch strat.Kind {
-		case agents.KindNative:
-			binary := nativeStrategyBinary(agent, strat)
-			if binary != "" && !env.HasBinary(binary) {
-				continue
-			}
-			if !env.HelpMatches(binary, strat.HelpContains) {
-				nativeIdentityMiss = fmt.Sprintf("binary %s found but help text did not identify %s", binary, strat.HelpContains)
-				continue
-			}
-			versionCmd := nativeStrategyVersionCmd(agent, strat)
-			detail = fmt.Sprintf("binary %s found; using built-in update", binary)
-			return resolvedUpdate{
-				cmd:        strat.Command,
-				method:     strat.Kind,
-				detail:     detail,
-				versionCmd: versionCmd,
-			}
-		case agents.KindBun, agents.KindNpm, agents.KindPnpm, agents.KindYarn:
-			if !env.HasNodeManager(strat.Kind) {
-				continue
-			}
-			if agent.Binary == "" || strat.Package == "" {
-				continue
-			}
-			if nodeManager != "" {
-				if nodeManager != strat.Kind {
-					continue
-				}
-				detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
-				return resolvedUpdate{cmd: agentspec.NodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package, version: strat.Version}
-			}
-			if packageManager != "" {
-				if packageManager != strat.Kind {
-					continue
-				}
-				detail = fmt.Sprintf("%s global package %s installed; matched by package list; updating via %s", strat.Kind, strat.Package, strat.Kind)
-				return resolvedUpdate{cmd: agentspec.NodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package, version: strat.Version}
-			}
-			if !env.NodeBinHasBinary(strat.Kind, agent.Binary) {
-				continue
-			}
-			detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
-			return resolvedUpdate{cmd: agentspec.NodeUpdateCommand(strat), method: strat.Kind, detail: detail, pkg: strat.Package}
-		case agents.KindBrew:
-			if !env.HasBrew() {
-				continue
-			}
-			if env.BrewHas(strat.Package) {
-				detail = fmt.Sprintf("brew formula %s installed", strat.Package)
-				return resolvedUpdate{cmd: []string{"brew", "upgrade", strat.Package}, method: strat.Kind, detail: detail, pkg: strat.Package}
-			}
-		case agents.KindPip:
-			if !env.HasPython() {
-				continue
-			}
-			if env.PipHas(strat.Package) {
-				detail = fmt.Sprintf("pip package %s installed", strat.Package)
-				return resolvedUpdate{cmd: []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", strat.Package}, method: strat.Kind, detail: detail, pkg: strat.Package}
-			}
-		case agents.KindUv:
-			if !env.HasUv() {
-				continue
-			}
-			if env.UvHas(strat.Package) {
-				detail = fmt.Sprintf("uv tool %s installed", strat.Package)
-				return resolvedUpdate{cmd: []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@" + agentspec.VersionSpec(strat.Version)}, method: strat.Kind, detail: detail, pkg: strat.Package}
-			}
-		case agents.KindVSCode:
-			if env.CodeCmd() == "" {
-				codeMissing = true
-				continue
-			}
-			if env.VscodeHas(strat.ExtensionID) {
-				detail = fmt.Sprintf("VS Code extension %s installed (via %s)", strat.ExtensionID, env.CodeCmd())
-				return resolvedUpdate{cmd: []string{env.CodeCmd(), "--install-extension", strat.ExtensionID, "--force"}, method: strat.Kind, detail: detail}
-			}
-		}
-	}
-
-	if codeMissing {
-		return resolvedUpdate{reason: reasonMissingCode, detail: "VS Code CLI not found (code/codium/code-insiders)"}
-	}
-	if agent.Binary != "" && env.HasBinary(agent.Binary) {
-		return resolvedUpdate{reason: reasonManualInstall, detail: "binary found but no supported install method detected"}
-	}
-	if nativeIdentityMiss != "" {
-		return resolvedUpdate{reason: reasonMissing, detail: nativeIdentityMiss + "; no supported binary or install method detected"}
-	}
-	return resolvedUpdate{reason: reasonMissing, detail: "no supported binary or install method detected"}
-}
-
-func nativeStrategyBinary(agent agents.Agent, strat agents.UpdateStrategy) string {
-	if strat.Binary != "" {
-		return strat.Binary
-	}
-	return agent.Binary
-}
-
-func nativeStrategyVersionCmd(agent agents.Agent, strat agents.UpdateStrategy) []string {
-	if len(strat.VersionCmd) > 0 {
-		return strat.VersionCmd
-	}
-	return agent.VersionCmd
-}
-
 // versionSpec returns the version selector for a package spec: a pinned version
 // when set, otherwise "latest" (forced to avoid getting stuck on old
 // minor/prerelease versions, common for 0.x CLIs).
@@ -1261,19 +1126,19 @@ func runCheck(ctx context.Context, selected []agents.Agent, env *detect.Env) []c
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			resolved := resolveUpdate(agent, env)
-			res := checkResult{Agent: agent, Method: resolved.method}
-			if resolved.cmd == nil {
+			resolved := agentspec.Resolve(agent, env)
+			res := checkResult{Agent: agent, Method: resolved.Method}
+			if resolved.Cmd == nil {
 				res.State = checkMissing
-				res.Reason = resolved.reason
+				res.Reason = resolved.Reason
 				if res.Reason == "" {
 					res.Reason = reasonMissing
 				}
 				results[i] = res
 				return
 			}
-			res.Current = getVersion(checkCtx, agent, env, resolved.method, resolved.versionCmd)
-			res.Latest = env.LatestVersion(checkCtx, resolved.method, resolved.pkg)
+			res.Current = getVersion(checkCtx, agent, env, resolved.Method, resolved.VersionCmd)
+			res.Latest = env.LatestVersion(checkCtx, resolved.Method, resolved.Pkg)
 			res.State = compareVersions(res.Current, res.Latest)
 			results[i] = res
 		}(i, agent)
