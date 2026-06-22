@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/chhoumann/uca/internal/agents"
+	"github.com/chhoumann/uca/internal/detect"
 )
 
 func TestFilterAgentsAcceptsCursorAgentAlias(t *testing.T) {
@@ -251,12 +252,8 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-func newTestEnv() *envState {
-	return &envState{
-		ctx:          context.Background(),
-		binPathCache: map[string]string{},
-		helpChecks:   map[string]bool{},
-	}
+func newTestEnv() *detect.Env {
+	return detect.New(context.Background())
 }
 
 func TestApplyEnvDefaults(t *testing.T) {
@@ -467,16 +464,6 @@ func TestEffectiveConcurrencyNonPositive(t *testing.T) {
 	}
 }
 
-func TestNodeLatestVersionCaches(t *testing.T) {
-	env := newTestEnv()
-	env.latestCache = map[string]string{agents.KindNpm + "\x00" + "pkg": "9.9.9"}
-	// A cached value is returned without running any command (the fake PATH has
-	// no npm, so a real query would yield "").
-	if got := env.nodeLatestVersion(context.Background(), agents.KindNpm, "pkg"); got != "9.9.9" {
-		t.Fatalf("nodeLatestVersion cached = %q, want 9.9.9", got)
-	}
-}
-
 func TestDryRunPlanLinesGroupsBatch(t *testing.T) {
 	batch := "bun add -g @openai/codex@latest opencode-ai@latest"
 	results := []result{
@@ -594,28 +581,6 @@ func TestHasOutdated(t *testing.T) {
 	}
 }
 
-func TestLatestVersionDispatch(t *testing.T) {
-	env := newTestEnv()
-	// Non-knowable methods short-circuit to "".
-	for _, m := range []string{agents.KindNative, agents.KindPip, agents.KindUv, agents.KindVSCode} {
-		if got := env.latestVersion(context.Background(), m, "pkg"); got != "" {
-			t.Fatalf("latestVersion(%q) = %q, want empty", m, got)
-		}
-	}
-}
-
-func TestBrewLatestLivePath(t *testing.T) {
-	_, env := fakePathEnv(t, map[string]string{
-		"brew": "#!/bin/sh\necho '{\"formulae\":[{\"versions\":{\"stable\":\"1.2.3\"}}]}'\n",
-	})
-	if got := env.brewLatest(context.Background(), "copilot-cli"); got != "1.2.3" {
-		t.Fatalf("brewLatest = %q, want 1.2.3", got)
-	}
-	if got := env.latestVersion(context.Background(), agents.KindBrew, "copilot-cli"); got != "1.2.3" {
-		t.Fatalf("latestVersion(brew) = %q, want 1.2.3", got)
-	}
-}
-
 func TestRunCheckMissingAgent(t *testing.T) {
 	// No managers, binary absent -> missing.
 	_, env := fakePathEnv(t, map[string]string{})
@@ -724,7 +689,7 @@ func TestKnownAgentNamesSorted(t *testing.T) {
 
 func TestRunCheckDetectsOutdated(t *testing.T) {
 	env := nodeIntegrationEnv(t, map[string]string{
-		"npm": "#!/bin/sh\ncase \"$1\" in\n  view) echo 2.0.0 ;;\nesac\n",
+		"npm": fakeNpm("", []string{"pkg-one"}, false, "2.0.0"),
 		"one": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
 	})
 	list := []agents.Agent{{Name: "one", Binary: "one", VersionCmd: []string{"one", "--version"}, Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-one"}}}}
@@ -747,7 +712,10 @@ func writeExec(t *testing.T, dir, name, body string) {
 	}
 }
 
-func fakePathEnv(t *testing.T, scripts map[string]string) (string, *envState) {
+// fakePathEnv writes fake executables to a temp dir, points PATH at it, and
+// returns a detect.Env that probes that PATH (so capabilities are auto-detected
+// from the fakes — no field-poking needed).
+func fakePathEnv(t *testing.T, scripts map[string]string) (string, *detect.Env) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script PATH fixtures are POSIX-only")
@@ -757,14 +725,13 @@ func fakePathEnv(t *testing.T, scripts map[string]string) (string, *envState) {
 		writeExec(t, dir, name, body)
 	}
 	t.Setenv("PATH", dir)
-	return dir, &envState{ctx: context.Background(), binPathCache: map[string]string{}, helpChecks: map[string]bool{}}
+	return dir, detect.New(context.Background())
 }
 
 func TestResolveUpdateBrew(t *testing.T) {
 	_, env := fakePathEnv(t, map[string]string{
 		"brew": "#!/bin/sh\ncase \"$1\" in\n  list) echo \"copilot-cli 1.2.3\" ;;\nesac\n",
 	})
-	env.hasBrew = true
 	resolved := resolveUpdate(defaultAgent(t, "copilot"), env)
 	if !reflect.DeepEqual(resolved.cmd, []string{"brew", "upgrade", "copilot-cli"}) {
 		t.Fatalf("brew cmd = %#v", resolved.cmd)
@@ -779,7 +746,6 @@ func TestResolveUpdatePip(t *testing.T) {
 	_, env := fakePathEnv(t, map[string]string{
 		"python3": "#!/bin/sh\nif [ \"$3\" = \"list\" ]; then echo \"aider-chat==1.2.3\"; exit 0; fi\nexit 1\n",
 	})
-	env.hasPython = true
 	resolved := resolveUpdate(defaultAgent(t, "aider"), env)
 	want := []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", "aider-chat"}
 	if !reflect.DeepEqual(resolved.cmd, want) {
@@ -790,23 +756,11 @@ func TestResolveUpdatePip(t *testing.T) {
 	}
 }
 
-func TestPipHasNormalizesNames(t *testing.T) {
-	// pip canonicalizes names (case-insensitive, "_"->"-"); detection must match.
-	_, env := fakePathEnv(t, map[string]string{
-		"python3": "#!/bin/sh\nif [ \"$3\" = \"list\" ]; then echo \"Aider_Chat==1.0.0\"; exit 0; fi\nexit 1\n",
-	})
-	env.hasPython = true
-	if !env.pipHas("aider-chat") {
-		t.Fatal("pipHas(aider-chat) = false, want true (name normalization)")
-	}
-}
-
 func TestResolveUpdateUv(t *testing.T) {
 	// uv present -> uv strategy (preferred over pip).
 	_, env := fakePathEnv(t, map[string]string{
 		"uv": "#!/bin/sh\necho \"aider-chat v1.2.3\"\n",
 	})
-	env.hasUv = true
 	resolved := resolveUpdate(defaultAgent(t, "aider"), env)
 	want := []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", "aider-chat@latest"}
 	if !reflect.DeepEqual(resolved.cmd, want) {
@@ -821,7 +775,6 @@ func TestResolveUpdateVSCode(t *testing.T) {
 	_, env := fakePathEnv(t, map[string]string{
 		"code": "#!/bin/sh\necho \"RooVeterinaryInc.roo-cline@1.2.3\"\n",
 	})
-	env.codeCmd = "code"
 	resolved := resolveUpdate(defaultAgent(t, "roocode"), env)
 	want := []string{"code", "--install-extension", "RooVeterinaryInc.roo-cline", "--force"}
 	if !reflect.DeepEqual(resolved.cmd, want) {
@@ -834,7 +787,6 @@ func TestResolveUpdateVSCode(t *testing.T) {
 
 func TestResolveUpdateVSCodeMissingCode(t *testing.T) {
 	_, env := fakePathEnv(t, map[string]string{})
-	env.codeCmd = "" // no VS Code CLI
 	resolved := resolveUpdate(defaultAgent(t, "roocode"), env)
 	if resolved.cmd != nil || resolved.reason != reasonMissingCode {
 		t.Fatalf("missing-code resolved = %#v (reason %q), want reasonMissingCode", resolved.cmd, resolved.reason)
@@ -852,18 +804,36 @@ func TestResolveUpdateManualInstall(t *testing.T) {
 	}
 }
 
-func nodeIntegrationEnv(t *testing.T, scripts map[string]string) *envState {
+func nodeIntegrationEnv(t *testing.T, scripts map[string]string) *detect.Env {
 	t.Helper()
 	_, env := fakePathEnv(t, scripts)
-	env.hasNpm = true
-	// Pre-seed npm detection so resolveUpdate doesn't shell out to `npm bin -g`
-	// etc. (which would pollute the recorded npm calls). A dummy bin dir won't
-	// match any agent's bin dir, so detection falls to the package list.
-	env.npmBin = t.TempDir()
-	env.npmBinOnce.Do(func() {})
-	env.npmPkgs = map[string]bool{"pkg-one": true, "pkg-two": true}
-	env.npmPkgOnce.Do(func() {})
 	return env
+}
+
+// fakeNpm builds a fake `npm` that answers the detection probes (bin/prefix
+// empty, list -> the given global packages, view -> latest) so detect.New
+// populates the package list from it, plus records install argv to record (when
+// non-empty) and optionally fails the batch (>1 package) install.
+func fakeNpm(record string, pkgs []string, failBatch bool, latest string) string {
+	deps := make([]string, 0, len(pkgs))
+	for _, p := range pkgs {
+		deps = append(deps, "\""+p+"\":{}")
+	}
+	depsJSON := "{\"dependencies\":{" + strings.Join(deps, ",") + "}}"
+	install := ":"
+	if record != "" {
+		install = "echo \"$@\" >> '" + record + "'"
+	}
+	if failBatch {
+		install += "; if [ $# -gt 3 ]; then exit 1; fi"
+	}
+	return "#!/bin/sh\ncase \"$1\" in\n" +
+		"  bin) ;;\n" +
+		"  prefix) ;;\n" +
+		"  list) echo '" + depsJSON + "' ;;\n" +
+		"  view) echo '" + latest + "' ;;\n" +
+		"  install) " + install + " ;;\n" +
+		"esac\nexit 0\n"
 }
 
 func nodeTestAgents() []agents.Agent {
@@ -877,7 +847,7 @@ func TestRunAllWithEventsBatchesNodeUpdates(t *testing.T) {
 	dir := t.TempDir()
 	record := filepath.Join(dir, "npm-calls.txt")
 	env := nodeIntegrationEnv(t, map[string]string{
-		"npm": "#!/bin/sh\ncase \"$1\" in\n  install) echo \"$@\" >> '" + record + "' ;;\nesac\nexit 0\n",
+		"npm": fakeNpm(record, []string{"pkg-one", "pkg-two"}, false, ""),
 		"one": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
 		"two": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
 	})
@@ -906,7 +876,7 @@ func TestRunAllWithEventsCanceledKeepsPerAgentResults(t *testing.T) {
 	// A context canceled before scheduling must not collapse every unscheduled
 	// agent onto results[0]; each agent keeps its own slot (as skipped).
 	env := nodeIntegrationEnv(t, map[string]string{
-		"npm": "#!/bin/sh\nexit 0\n",
+		"npm": fakeNpm("", []string{"pkg-one", "pkg-two"}, false, ""),
 		"one": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
 		"two": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
 	})
@@ -931,7 +901,7 @@ func TestRunAllWithEventsBatchFailureFallsBackPerPackage(t *testing.T) {
 	record := filepath.Join(dir, "npm-calls.txt")
 	// The batch (>1 package) fails; each single-package retry succeeds.
 	env := nodeIntegrationEnv(t, map[string]string{
-		"npm": "#!/bin/sh\ncase \"$1\" in\n  install)\n    echo \"$@\" >> '" + record + "'\n    if [ $# -gt 3 ]; then exit 1; fi\n    exit 0 ;;\nesac\nexit 0\n",
+		"npm": fakeNpm(record, []string{"pkg-one", "pkg-two"}, true, ""),
 		"one": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
 		"two": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
 	})
@@ -1195,12 +1165,11 @@ func TestRunAllWithEventsExcludesPinnedFromBatch(t *testing.T) {
 	dir := t.TempDir()
 	record := filepath.Join(dir, "npm-calls.txt")
 	env := nodeIntegrationEnv(t, map[string]string{
-		"npm":   "#!/bin/sh\ncase \"$1\" in\n  install) echo \"$@\" >> '" + record + "' ;;\nesac\nexit 0\n",
+		"npm":   fakeNpm(record, []string{"pkg-one", "pkg-two", "pkg-three"}, false, ""),
 		"one":   "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
 		"two":   "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
 		"three": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
 	})
-	env.npmPkgs["pkg-three"] = true
 	list := []agents.Agent{
 		{Name: "one", Binary: "one", VersionCmd: []string{"one", "--version"}, Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-one", Version: "9.9.9"}}},
 		{Name: "two", Binary: "two", VersionCmd: []string{"two", "--version"}, Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-two"}}},
@@ -1259,88 +1228,6 @@ func TestEffectiveConcurrency(t *testing.T) {
 				t.Fatalf("effectiveConcurrency() = %d, want %d", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestNodeManagerForBinary(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skipping PATH-based binary detection test on windows")
-	}
-	dir := t.TempDir()
-	binName := "fakecli"
-	binPath := filepath.Join(dir, binName)
-	if err := os.WriteFile(binPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatalf("write fake binary: %v", err)
-	}
-	origPath := os.Getenv("PATH")
-	if err := os.Setenv("PATH", dir+string(os.PathListSeparator)+origPath); err != nil {
-		t.Fatalf("set PATH: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = os.Setenv("PATH", origPath)
-	})
-
-	env := &envState{
-		hasNpm:       true,
-		binPathCache: map[string]string{},
-		npmBin:       dir,
-	}
-	env.npmBinOnce.Do(func() {})
-
-	if got := env.nodeManagerForBinary(binName); got != agents.KindNpm {
-		t.Fatalf("nodeManagerForBinary() = %q, want %q", got, agents.KindNpm)
-	}
-}
-
-func TestNodeManagerForBinarySymlink(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skipping symlink detection test on windows")
-	}
-	binDir := t.TempDir()
-	targetDir := t.TempDir()
-	binName := "fakecli"
-	targetPath := filepath.Join(targetDir, binName)
-	if err := os.WriteFile(targetPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatalf("write target binary: %v", err)
-	}
-	linkPath := filepath.Join(binDir, binName)
-	if err := os.Symlink(targetPath, linkPath); err != nil {
-		t.Fatalf("symlink: %v", err)
-	}
-	origPath := os.Getenv("PATH")
-	if err := os.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath); err != nil {
-		t.Fatalf("set PATH: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = os.Setenv("PATH", origPath)
-	})
-
-	env := &envState{
-		hasNpm:       true,
-		binPathCache: map[string]string{},
-		npmBin:       targetDir,
-	}
-	env.npmBinOnce.Do(func() {})
-
-	if got := env.nodeManagerForBinary(binName); got != agents.KindNpm {
-		t.Fatalf("nodeManagerForBinary() = %q, want %q", got, agents.KindNpm)
-	}
-}
-
-func TestParsePackageFromToken(t *testing.T) {
-	tests := []struct {
-		token string
-		want  string
-	}{
-		{token: "\"@google/gemini-cli@1.2.3\"", want: "@google/gemini-cli"},
-		{token: "opencode-ai@0.1.0", want: "opencode-ai"},
-		{token: "nope", want: ""},
-		{token: "@scope/nover@", want: ""},
-	}
-	for _, tt := range tests {
-		if got := parsePackageFromToken(tt.token); got != tt.want {
-			t.Fatalf("parsePackageFromToken(%q) = %q, want %q", tt.token, got, tt.want)
-		}
 	}
 }
 
