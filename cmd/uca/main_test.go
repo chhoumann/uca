@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -638,11 +639,21 @@ func nodeIntegrationEnv(t *testing.T, scripts map[string]string) *detect.Env {
 // populates the package list from it, plus records install argv to record (when
 // non-empty) and optionally fails the batch (>1 package) install.
 func fakeNpm(record string, pkgs []string, failBatch bool, latest string) string {
+	return fakeNpmWithBinDir(record, "", pkgs, failBatch, latest)
+}
+
+// fakeNpmWithBinDir is fakeNpm plus a `npm bin -g` answer, so detection sees a
+// real global bin dir (used to exercise the bin-dir containment fallback).
+func fakeNpmWithBinDir(record, binDir string, pkgs []string, failBatch bool, latest string) string {
 	deps := make([]string, 0, len(pkgs))
 	for _, p := range pkgs {
 		deps = append(deps, "\""+p+"\":{}")
 	}
 	depsJSON := "{\"dependencies\":{" + strings.Join(deps, ",") + "}}"
+	binCase := ""
+	if binDir != "" {
+		binCase = "echo '" + binDir + "'"
+	}
 	install := ":"
 	if record != "" {
 		install = "echo \"$@\" >> '" + record + "'"
@@ -651,7 +662,7 @@ func fakeNpm(record string, pkgs []string, failBatch bool, latest string) string
 		install += "; if [ $# -gt 3 ]; then exit 1; fi"
 	}
 	return "#!/bin/sh\ncase \"$1\" in\n" +
-		"  bin) ;;\n" +
+		"  bin) " + binCase + " ;;\n" +
 		"  prefix) ;;\n" +
 		"  list) echo '" + depsJSON + "' ;;\n" +
 		"  view) echo '" + latest + "' ;;\n" +
@@ -692,6 +703,39 @@ func TestRunAllWithEventsBatchesNodeUpdates(t *testing.T) {
 		if res.Status != statusUnchanged {
 			t.Fatalf("%s status = %q, want unchanged", res.Agent.Name, res.Status)
 		}
+	}
+}
+
+func TestRunAllPinnedAgentViaBinDirFallbackStaysPinned(t *testing.T) {
+	// A pinned node agent whose binary PATH-resolves outside the manager's
+	// global bin dir (e.g. a shim earlier in PATH) is detected via the bin-dir
+	// containment fallback. It must keep its pin and run as its own command,
+	// not join the @latest batch.
+	dir := t.TempDir()
+	globalBin := filepath.Join(dir, "npm-global", "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatalf("mkdir global bin: %v", err)
+	}
+	writeExec(t, globalBin, "one", "#!/bin/sh\n")
+	record := filepath.Join(dir, "npm-calls.txt")
+	env := nodeIntegrationEnv(t, map[string]string{
+		"npm": fakeNpmWithBinDir(record, globalBin, []string{"pkg-two"}, false, ""),
+		"one": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
+		"two": "#!/bin/sh\ncase \"$1\" in --version) echo 1.0.0 ;; esac\n",
+	})
+
+	list := []agents.Agent{
+		{Name: "one", Binary: "one", VersionCmd: []string{"one", "--version"}, Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-one", Version: "1.2.3"}}},
+		{Name: "two", Binary: "two", VersionCmd: []string{"two", "--version"}, Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-two"}}},
+	}
+	runAllWithEvents(context.Background(), list, env, options{}, nil)
+
+	data, _ := os.ReadFile(record)
+	calls := strings.Split(strings.TrimSpace(string(data)), "\n")
+	sort.Strings(calls)
+	want := []string{"install -g pkg-one@1.2.3", "install -g pkg-two@latest"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("npm calls = %q, want %q", calls, want)
 	}
 }
 

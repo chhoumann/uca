@@ -198,3 +198,28 @@ func TestResolveNodeByPackageList(t *testing.T) {
 		t.Fatalf("pkg = %q", r.Pkg)
 	}
 }
+
+func TestResolveNodeBinDirFallbackKeepsPin(t *testing.T) {
+	// Binary PATH-resolves outside every manager bin dir (e.g. a shim), package
+	// list lookup misses, so resolution falls back to bin-dir containment. The
+	// pinned version must survive that path, or the agent is silently batched
+	// to @latest by the orchestrator.
+	agent := agents.Agent{
+		Name:       "one",
+		Binary:     "one",
+		VersionCmd: []string{"one", "--version"},
+		Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-one", Version: "1.2.3"}},
+	}
+	env := fakeEnv{
+		nodeMgrs: map[string]bool{agents.KindNpm: true},
+		bins:     map[string]bool{"one": true},
+		binInMgr: map[string]bool{"npm|one": true},
+	}
+	r := Resolve(agent, env)
+	if r.Version != "1.2.3" {
+		t.Fatalf("version = %q, want %q (pin must survive the bin-dir fallback)", r.Version, "1.2.3")
+	}
+	if !reflect.DeepEqual(r.Cmd, []string{"npm", "install", "-g", "pkg-one@1.2.3"}) || r.Method != agents.KindNpm || r.Pkg != "pkg-one" {
+		t.Fatalf("resolve = %#v", r)
+	}
+}

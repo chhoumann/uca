@@ -210,7 +210,7 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 				continue
 			}
 			detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
-			return Resolved{Cmd: NodeUpdateCommand(strat), Method: strat.Kind, Detail: detail, Pkg: strat.Package}
+			return Resolved{Cmd: NodeUpdateCommand(strat), Method: strat.Kind, Detail: detail, Pkg: strat.Package, Version: strat.Version}
 		case agents.KindBrew:
 			if !env.HasBrew() {
 				continue
