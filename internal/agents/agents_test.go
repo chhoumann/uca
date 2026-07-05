@@ -91,6 +91,56 @@ func TestDefaultIncludesPiFromEarendilWorks(t *testing.T) {
 	}
 }
 
+func TestDefaultIncludesOmpFromOhMyPi(t *testing.T) {
+	defaults := Default()
+	var got *Agent
+	for i := range defaults {
+		if defaults[i].Name == "omp" {
+			got = &defaults[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("Default() is missing omp")
+	}
+	if got.Binary != "omp" {
+		t.Fatalf("omp Binary = %q, want %q", got.Binary, "omp")
+	}
+	if len(got.VersionCmd) != 2 || got.VersionCmd[0] != "omp" || got.VersionCmd[1] != "--version" {
+		t.Fatalf("omp VersionCmd = %#v, want %#v", got.VersionCmd, []string{"omp", "--version"})
+	}
+
+	wantStrategies := []UpdateStrategy{
+		{Kind: KindBrew, Package: "omp"},
+		{Kind: KindBun, Package: "@oh-my-pi/pi-coding-agent"},
+		{Kind: KindNative, Command: []string{"omp", "update"}},
+	}
+	if len(got.Strategies) != len(wantStrategies) {
+		t.Fatalf("omp has %d strategies, want %d: %#v", len(got.Strategies), len(wantStrategies), got.Strategies)
+	}
+	for i, want := range wantStrategies {
+		gotStrategy := got.Strategies[i]
+		if gotStrategy.Kind != want.Kind || gotStrategy.Package != want.Package {
+			t.Fatalf("omp strategy %d = %#v, want %#v", i, gotStrategy, want)
+		}
+		if len(gotStrategy.Command) != len(want.Command) {
+			t.Fatalf("omp strategy %d command = %#v, want %#v", i, gotStrategy.Command, want.Command)
+		}
+		for j := range want.Command {
+			if gotStrategy.Command[j] != want.Command[j] {
+				t.Fatalf("omp strategy %d command = %#v, want %#v", i, gotStrategy.Command, want.Command)
+			}
+		}
+	}
+
+	for _, strat := range got.Strategies {
+		switch strat.Kind {
+		case KindNpm, KindPnpm, KindYarn:
+			t.Fatalf("omp must not include %s strategy", strat.Kind)
+		}
+	}
+}
+
 func TestDefaultIncludesCursorAgentPrimaryAndLegacyFallback(t *testing.T) {
 	defaults := Default()
 	var got *Agent

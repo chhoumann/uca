@@ -76,6 +76,7 @@ uca --explain
 - roocode (VS Code extension `RooVeterinaryInc.roo-cline`)
 - aider (uv tool `aider-chat` or pip `aider-chat`)
 - pi (npm/pnpm/yarn/bun `@earendil-works/pi-coding-agent`)
+- omp (Homebrew `omp`, bun `@oh-my-pi/pi-coding-agent`, or `omp update`)
 
 ## Live output
 

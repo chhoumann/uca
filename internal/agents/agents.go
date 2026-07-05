@@ -179,5 +179,15 @@ func Default() []Agent {
 			VersionCmd: []string{"pi", "--version"},
 			Strategies: nodePackageStrategies("@earendil-works/pi-coding-agent"),
 		},
+		{
+			Name:       "omp",
+			Binary:     "omp",
+			VersionCmd: []string{"omp", "--version"},
+			Strategies: []UpdateStrategy{
+				{Kind: KindBrew, Package: "omp"},
+				{Kind: KindBun, Package: "@oh-my-pi/pi-coding-agent"},
+				{Kind: KindNative, Command: []string{"omp", "update"}},
+			},
+		},
 	}
 }
