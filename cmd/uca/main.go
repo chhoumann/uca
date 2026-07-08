@@ -912,7 +912,7 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 
 			if indExitCode != 0 {
 				setFailureResult(&res, indExitCode, work.updateCmdSingle, indClassifyOut, opts.Timeout)
-			} else if res.Before != "" && res.After != "" && res.Before == res.After && res.Before != "unknown" {
+			} else if res.Before != "" && res.After != "" && version.Same(res.Before, res.After) && res.Before != "unknown" {
 				res.Status = statusUnchanged
 			} else {
 				res.Status = statusUpdated
@@ -934,7 +934,7 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 
 		if exitCode != 0 {
 			setFailureResult(&res, exitCode, task.cmd, classifyOut, opts.Timeout)
-		} else if res.Before != "" && res.After != "" && res.Before == res.After && res.Before != "unknown" {
+		} else if res.Before != "" && res.After != "" && version.Same(res.Before, res.After) && res.Before != "unknown" {
 			res.Status = statusUnchanged
 		} else {
 			res.Status = statusUpdated

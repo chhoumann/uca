@@ -43,6 +43,26 @@ func TestExtractToken(t *testing.T) {
 	}
 }
 
+func TestSame(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want bool
+	}{
+		{a: "grok 0.2.91 (39d0c6872354)", b: "grok 0.2.91 (39d0c6872354) [stable]", want: true},
+		{a: "codex-cli 0.90.0", b: "codex-cli 0.90.0", want: true},
+		{a: "codex-cli 0.90.0", b: "codex-cli 0.98.0", want: false},
+		{a: "2026.07.01-41b2de7", b: "2026.07.02-9c1f0aa", want: false},
+		{a: "unknown", b: "unknown", want: true},
+		{a: "unknown", b: "1.2.3", want: false},
+		{a: "", b: "1.2.3", want: false},
+	}
+	for _, tt := range tests {
+		if got := Same(tt.a, tt.b); got != tt.want {
+			t.Fatalf("Same(%q,%q)=%v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
 func TestFormatWithToken(t *testing.T) {
 	tests := []struct {
 		before string

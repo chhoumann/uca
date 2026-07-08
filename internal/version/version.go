@@ -46,6 +46,21 @@ func FormatWithToken(before, newVersion string) string {
 	return strings.Replace(before, token, newVersion, 1)
 }
 
+// Same reports whether two parsed `--version` outputs denote the same version.
+// Exact string equality counts; otherwise both must contain a version token and
+// the tokens must be identical. Tools decorate the version with state that
+// toggles between invocations (e.g. grok appends " [stable]" only while its
+// update-check cache is fresh), so raw output equality would misreport an
+// unchanged agent as updated.
+func Same(a, b string) bool {
+	if a == b {
+		return true
+	}
+	at, aok := ExtractToken(a)
+	bt, bok := ExtractToken(b)
+	return aok && bok && at == bt
+}
+
 // ParseOutput parses a `--version` command's combined output into a clean
 // version string, preferring a line that is just a version.
 func ParseOutput(out string) string {
