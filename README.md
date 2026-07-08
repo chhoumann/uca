@@ -77,6 +77,7 @@ uca --explain
 - aider (uv tool `aider-chat` or pip `aider-chat`)
 - pi (npm/pnpm/yarn/bun `@earendil-works/pi-coding-agent`)
 - omp (Homebrew `omp`, bun `@oh-my-pi/pi-coding-agent`, or `omp update`)
+- grok (npm/pnpm/yarn/bun `@xai-official/grok` or `grok update`)
 
 ## Live output
 

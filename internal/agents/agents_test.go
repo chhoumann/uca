@@ -141,6 +141,57 @@ func TestDefaultIncludesOmpFromOhMyPi(t *testing.T) {
 	}
 }
 
+func TestDefaultIncludesGrokFromXaiOfficial(t *testing.T) {
+	defaults := Default()
+	var got *Agent
+	for i := range defaults {
+		if defaults[i].Name == "grok" {
+			got = &defaults[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("Default() is missing grok")
+	}
+	if got.Binary != "grok" {
+		t.Fatalf("grok Binary = %q, want %q", got.Binary, "grok")
+	}
+	if len(got.VersionCmd) != 2 || got.VersionCmd[0] != "grok" || got.VersionCmd[1] != "--version" {
+		t.Fatalf("grok VersionCmd = %#v, want %#v", got.VersionCmd, []string{"grok", "--version"})
+	}
+
+	wantKinds := map[string]bool{
+		KindNpm:    false,
+		KindPnpm:   false,
+		KindYarn:   false,
+		KindBun:    false,
+		KindNative: false,
+	}
+	for _, strat := range got.Strategies {
+		if _, ok := wantKinds[strat.Kind]; !ok {
+			t.Fatalf("grok has unexpected %s strategy", strat.Kind)
+		}
+		wantKinds[strat.Kind] = true
+		if strat.Kind == KindNative {
+			if len(strat.Command) != 2 || strat.Command[0] != "grok" || strat.Command[1] != "update" {
+				t.Fatalf("native grok update command = %#v, want %#v", strat.Command, []string{"grok", "update"})
+			}
+			continue
+		}
+		if strat.Package != "@xai-official/grok" {
+			t.Fatalf("%s grok package = %q, want %q", strat.Kind, strat.Package, "@xai-official/grok")
+		}
+	}
+	for kind, found := range wantKinds {
+		if !found {
+			t.Fatalf("grok is missing %s strategy", kind)
+		}
+	}
+	if got.Strategies[len(got.Strategies)-1].Kind != KindNative {
+		t.Fatalf("grok native strategy must be last so node-manager installs win: %#v", got.Strategies)
+	}
+}
+
 func TestDefaultIncludesCursorAgentPrimaryAndLegacyFallback(t *testing.T) {
 	defaults := Default()
 	var got *Agent

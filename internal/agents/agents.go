@@ -189,5 +189,11 @@ func Default() []Agent {
 				{Kind: KindNative, Command: []string{"omp", "update"}},
 			},
 		},
+		{
+			Name:       "grok",
+			Binary:     "grok",
+			VersionCmd: []string{"grok", "--version"},
+			Strategies: append(nodePackageStrategies("@xai-official/grok"), UpdateStrategy{Kind: KindNative, Command: []string{"grok", "update"}}),
+		},
 	}
 }
