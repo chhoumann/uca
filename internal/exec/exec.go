@@ -50,9 +50,11 @@ func Run(ctx context.Context, args []string, timeout time.Duration) (string, int
 	err := cmd.Run()
 	duration := time.Since(start)
 	if err == nil {
+		trace(args, start, duration, 0)
 		return buf.String(), 0, duration, nil
 	}
 	code := classify(cmdCtx, ctx, cmd, err)
+	trace(args, start, duration, code)
 	if code == 0 {
 		return buf.String(), 0, duration, nil
 	}
@@ -80,9 +82,11 @@ func RunStdout(ctx context.Context, args []string, timeout time.Duration) (strin
 	out, err := cmd.Output()
 	duration := time.Since(start)
 	if err == nil {
+		trace(args, start, duration, 0)
 		return string(out), 0, duration, nil
 	}
 	code := classify(cmdCtx, ctx, cmd, err)
+	trace(args, start, duration, code)
 	if code == 0 {
 		return string(out), 0, duration, nil
 	}
