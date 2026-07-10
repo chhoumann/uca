@@ -22,6 +22,9 @@ func fakeEnv(t *testing.T, scripts map[string]string) *Env {
 		}
 	}
 	t.Setenv("PATH", dir)
+	// Keep latest-version lookups on the fake manager CLIs instead of the live
+	// registry HTTP fast path.
+	t.Setenv("UCA_NO_REGISTRY_HTTP", "1")
 	return New(context.Background())
 }
 

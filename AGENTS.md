@@ -9,6 +9,8 @@
 ## Build, Test, and Development Commands
 - `go build ./cmd/uca` — build the `uca` binary locally.
 - `go test ./...` — run unit tests (if/when added).
+- `UCA_TRACE=1 uca ...` — log every subprocess (start offset, duration, exit code) to stderr; use this when measuring performance.
+- `UCA_NO_REGISTRY_HTTP=1` — disable the direct-registry HTTP fast path for latest-version lookups (falls back to the package-manager CLIs). Test helpers set this to stay hermetic.
 - `gofmt -w cmd/uca/main.go internal/**/*.go` — format Go files.
 - `go mod tidy` — clean up dependencies after adding/removing imports.
 

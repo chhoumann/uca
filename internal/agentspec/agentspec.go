@@ -157,14 +157,24 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 	codeMissing := false
 	detail := ""
 	nativeIdentityMiss := ""
+	// The node-manager match is computed lazily on the first node strategy, so
+	// agents that resolve natively (or have no node strategies at all) never
+	// trigger the node bin-dir / package-list probes.
 	nodeManager := ""
-	if agent.Binary != "" {
-		nodeManager = env.NodeManagerForBinary(agent.Binary)
-	}
 	packageManager := ""
 	packageName := NodePackageName(agent.Strategies)
-	if nodeManager == "" && packageName != "" {
-		packageManager = env.NodeManagerForPackage(packageName)
+	managersResolved := false
+	resolveManagers := func() {
+		if managersResolved {
+			return
+		}
+		managersResolved = true
+		if agent.Binary != "" {
+			nodeManager = env.NodeManagerForBinary(agent.Binary)
+		}
+		if nodeManager == "" && packageName != "" {
+			packageManager = env.NodeManagerForPackage(packageName)
+		}
 	}
 
 	for _, strat := range agent.Strategies {
@@ -192,6 +202,7 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 			if agent.Binary == "" || strat.Package == "" {
 				continue
 			}
+			resolveManagers()
 			if nodeManager != "" {
 				if nodeManager != strat.Kind {
 					continue

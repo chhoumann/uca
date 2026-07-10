@@ -88,21 +88,42 @@ func New(ctx context.Context) *Env {
 	}
 }
 
-// Prewarm kicks off every detection loader concurrently so later lookups are
-// already populated (the sync.Once loaders dedupe with on-demand callers).
-func (e *Env) Prewarm() {
-	go func() { e.npmBinOnce.Do(e.loadNpmBin) }()
-	go func() { e.npmPkgOnce.Do(e.loadNpmPkgs) }()
-	go func() { e.pnpmBinOnce.Do(e.loadPnpmBin) }()
-	go func() { e.pnpmPkgOnce.Do(e.loadPnpmPkgs) }()
-	go func() { e.yarnBinOnce.Do(e.loadYarnBin) }()
-	go func() { e.yarnPkgOnce.Do(e.loadYarnPkgs) }()
-	go func() { e.bunBinOnce.Do(e.loadBunGlobalBin) }()
-	go func() { e.bunPkgOnce.Do(e.loadBunPkgs) }()
-	go func() { e.uvOnce.Do(e.loadUvTools) }()
-	go func() { e.brewOnce.Do(e.loadBrewFormulae) }()
-	go func() { e.pipOnce.Do(e.loadPipPkgs) }()
-	go func() { e.codeOnce.Do(e.loadCodeExtensions) }()
+// PrewarmNeeds selects which detection loaders Prewarm should kick off, so
+// callers only pay for manager probes their agents can actually consult.
+type PrewarmNeeds struct {
+	Node   bool // npm/pnpm/yarn/bun bin dirs and global package lists
+	Brew   bool
+	Pip    bool
+	Uv     bool
+	VSCode bool
+}
+
+// Prewarm kicks off the requested detection loaders concurrently so later
+// lookups are already populated (the sync.Once loaders dedupe with on-demand
+// callers).
+func (e *Env) Prewarm(needs PrewarmNeeds) {
+	if needs.Node {
+		go func() { e.npmBinOnce.Do(e.loadNpmBin) }()
+		go func() { e.npmPkgOnce.Do(e.loadNpmPkgs) }()
+		go func() { e.pnpmBinOnce.Do(e.loadPnpmBin) }()
+		go func() { e.pnpmPkgOnce.Do(e.loadPnpmPkgs) }()
+		go func() { e.yarnBinOnce.Do(e.loadYarnBin) }()
+		go func() { e.yarnPkgOnce.Do(e.loadYarnPkgs) }()
+		go func() { e.bunBinOnce.Do(e.loadBunGlobalBin) }()
+		go func() { e.bunPkgOnce.Do(e.loadBunPkgs) }()
+	}
+	if needs.Uv {
+		go func() { e.uvOnce.Do(e.loadUvTools) }()
+	}
+	if needs.Brew {
+		go func() { e.brewOnce.Do(e.loadBrewFormulae) }()
+	}
+	if needs.Pip {
+		go func() { e.pipOnce.Do(e.loadPipPkgs) }()
+	}
+	if needs.VSCode {
+		go func() { e.codeOnce.Do(e.loadCodeExtensions) }()
+	}
 }
 
 // Capability accessors (the four flags the resolver reads directly).
@@ -292,19 +313,10 @@ func (e *Env) loadNpmBin() {
 	if !e.hasNpm {
 		return
 	}
-	// Both probes share one budget so a hung npm can't burn two full timeouts.
-	probeCtx, cancel := context.WithTimeout(e.baseCtx(), detectCmdTimeout)
-	defer cancel()
-	out, exitCode, _, _ := runner.RunStdout(probeCtx, []string{"npm", "bin", "-g"}, 0)
-	if exitCode == 0 {
-		if dir := strings.TrimSpace(out); dir != "" {
-			e.npmBin = dir
-			return
-		}
-	}
-
-	// npm v11 removed `npm bin`, but `npm prefix -g` still works.
-	prefixOut, exitCode, _, _ := runner.RunStdout(probeCtx, []string{"npm", "prefix", "-g"}, 0)
+	// `npm prefix -g` works on every npm version; `npm bin -g` (removed in npm 9)
+	// was exactly <prefix>/bin on Unix and <prefix> on Windows, which is what we
+	// derive below.
+	prefixOut, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"npm", "prefix", "-g"}, detectCmdTimeout)
 	if exitCode != 0 {
 		return
 	}
@@ -605,6 +617,13 @@ func (e *Env) loadBrewFormulae() {
 	if !e.hasBrew {
 		return
 	}
+	// Fast path: an installed formula is a non-empty directory under the Cellar
+	// (each subdirectory is an installed version), so one directory listing
+	// replaces a `brew list` subprocess (~0.5s of Ruby startup).
+	if formulae := cellarFormulae(brewCellarDir()); formulae != nil {
+		e.brewFormulae = formulae
+		return
+	}
 	// One `brew list` instead of a `brew list <formula>` per agent (brew is slow
 	// to cold-start); each line is "<formula> <version> [more versions]".
 	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"brew", "list", "--formula", "--versions"}, detectCmdTimeout)
@@ -617,6 +636,46 @@ func (e *Env) loadBrewFormulae() {
 			e.brewFormulae[fields[0]] = true
 		}
 	}
+}
+
+// brewCellarDir resolves the Cellar location: $HOMEBREW_CELLAR, else
+// <prefix>/Cellar with the prefix derived from the brew binary's location
+// (unresolved, since e.g. /usr/local/bin/brew symlinks into the Homebrew
+// repository while the Cellar stays under /usr/local).
+func brewCellarDir() string {
+	if dir := strings.TrimSpace(os.Getenv("HOMEBREW_CELLAR")); dir != "" {
+		return dir
+	}
+	brewPath, err := exec.LookPath("brew")
+	if err != nil {
+		return ""
+	}
+	prefix := filepath.Dir(filepath.Dir(brewPath))
+	return filepath.Join(prefix, "Cellar")
+}
+
+// cellarFormulae lists installed formulae by reading the Cellar directory.
+// Returns nil when the Cellar can't be read (caller falls back to `brew list`).
+func cellarFormulae(cellar string) map[string]bool {
+	if cellar == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(cellar)
+	if err != nil {
+		return nil
+	}
+	formulae := map[string]bool{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		versions, err := os.ReadDir(filepath.Join(cellar, entry.Name()))
+		if err != nil || len(versions) == 0 {
+			continue
+		}
+		formulae[entry.Name()] = true
+	}
+	return formulae
 }
 
 func normalizePipName(name string) string {
@@ -735,7 +794,12 @@ func (e *Env) NodeLatestVersion(ctx context.Context, kind, pkg string) string {
 	}
 	e.mu.Unlock()
 
-	v := queryNodeLatestVersion(ctx, kind, pkg)
+	// Fast path: ask the registry directly (no manager-CLI startup). The CLI
+	// query remains as fallback for registries the HTTP path can't serve.
+	v := registryLatestVersion(ctx, pkg)
+	if v == "" {
+		v = queryNodeLatestVersion(ctx, kind, pkg)
+	}
 	if v != "" {
 		e.mu.Lock()
 		if e.latestCache == nil {

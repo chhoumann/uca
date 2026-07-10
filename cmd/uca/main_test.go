@@ -625,6 +625,9 @@ func fakePathEnv(t *testing.T, scripts map[string]string) (string, *detect.Env) 
 		writeExec(t, dir, name, body)
 	}
 	t.Setenv("PATH", dir)
+	// Keep latest-version lookups on the fake manager CLIs instead of the live
+	// registry HTTP fast path.
+	t.Setenv("UCA_NO_REGISTRY_HTTP", "1")
 	return dir, detect.New(context.Background())
 }
 
@@ -642,17 +645,18 @@ func fakeNpm(record string, pkgs []string, failBatch bool, latest string) string
 	return fakeNpmWithBinDir(record, "", pkgs, failBatch, latest)
 }
 
-// fakeNpmWithBinDir is fakeNpm plus a `npm bin -g` answer, so detection sees a
-// real global bin dir (used to exercise the bin-dir containment fallback).
+// fakeNpmWithBinDir is fakeNpm plus a `npm prefix -g` answer (binDir's parent,
+// mirroring npm's <prefix>/bin layout), so detection sees a real global bin dir
+// (used to exercise the bin-dir containment fallback).
 func fakeNpmWithBinDir(record, binDir string, pkgs []string, failBatch bool, latest string) string {
 	deps := make([]string, 0, len(pkgs))
 	for _, p := range pkgs {
 		deps = append(deps, "\""+p+"\":{}")
 	}
 	depsJSON := "{\"dependencies\":{" + strings.Join(deps, ",") + "}}"
-	binCase := ""
+	prefixCase := ""
 	if binDir != "" {
-		binCase = "echo '" + binDir + "'"
+		prefixCase = "echo '" + filepath.Dir(binDir) + "'"
 	}
 	install := ":"
 	if record != "" {
@@ -662,8 +666,7 @@ func fakeNpmWithBinDir(record, binDir string, pkgs []string, failBatch bool, lat
 		install += "; if [ $# -gt 3 ]; then exit 1; fi"
 	}
 	return "#!/bin/sh\ncase \"$1\" in\n" +
-		"  bin) " + binCase + " ;;\n" +
-		"  prefix) ;;\n" +
+		"  prefix) " + prefixCase + " ;;\n" +
 		"  list) echo '" + depsJSON + "' ;;\n" +
 		"  view) echo '" + latest + "' ;;\n" +
 		"  install) " + install + " ;;\n" +
@@ -1200,5 +1203,46 @@ func TestCleanupNpmENotEmpty(t *testing.T) {
 	}
 	if _, err := os.Stat(dest); err == nil {
 		t.Fatalf("cleanupNpmENotEmpty() did not remove %q", dest)
+	}
+}
+
+func TestPrewarmNeeds(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []agents.Agent
+		want detect.PrewarmNeeds
+	}{
+		{name: "empty", in: nil, want: detect.PrewarmNeeds{}},
+		{
+			name: "native only needs nothing",
+			in:   []agents.Agent{{Name: "claude", Binary: "claude", Strategies: []agents.UpdateStrategy{{Kind: agents.KindNative}}}},
+			want: detect.PrewarmNeeds{},
+		},
+		{
+			name: "node strategy needs node",
+			in:   []agents.Agent{{Name: "codex", Binary: "codex", Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "p"}}}},
+			want: detect.PrewarmNeeds{Node: true},
+		},
+		{
+			name: "extension id implies vscode (version fallback)",
+			in:   []agents.Agent{{Name: "cline", ExtensionID: "x.y", Strategies: []agents.UpdateStrategy{{Kind: agents.KindBun, Package: "p"}}}},
+			want: detect.PrewarmNeeds{Node: true, VSCode: true},
+		},
+		{
+			name: "brew pip uv vscode",
+			in: []agents.Agent{
+				{Name: "omp", Strategies: []agents.UpdateStrategy{{Kind: agents.KindBrew, Package: "omp"}}},
+				{Name: "aider", Strategies: []agents.UpdateStrategy{{Kind: agents.KindUv, Package: "a"}, {Kind: agents.KindPip, Package: "a"}}},
+				{Name: "roocode", Strategies: []agents.UpdateStrategy{{Kind: agents.KindVSCode, ExtensionID: "r.r"}}},
+			},
+			want: detect.PrewarmNeeds{Brew: true, Pip: true, Uv: true, VSCode: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := prewarmNeeds(tt.in); got != tt.want {
+				t.Fatalf("prewarmNeeds = %+v, want %+v", got, tt.want)
+			}
+		})
 	}
 }

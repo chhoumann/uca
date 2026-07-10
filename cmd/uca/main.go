@@ -133,6 +133,12 @@ func main() {
 	}
 
 	env := detect.New(ctx)
+	// Kick off the detection loaders the selected agents can need (they run
+	// concurrently and dedupe with on-demand callers). Without this, the resolver
+	// goroutines all walk the managers in the same order and the sync.Once loaders
+	// end up executing one after another - detection takes the serial sum of all
+	// manager probes instead of the slowest single one.
+	env.Prewarm(prewarmNeeds(selected))
 
 	if opts.Check {
 		checkResults := runCheck(ctx, selected, env)
@@ -505,6 +511,35 @@ func parseList(raw string) map[string]bool {
 	return items
 }
 
+// prewarmNeeds computes which detection loaders the selected agents can consult,
+// so Prewarm only spawns manager probes that resolution might actually read
+// (e.g. `--only claude` needs no package-manager probes at all).
+func prewarmNeeds(selected []agents.Agent) detect.PrewarmNeeds {
+	var needs detect.PrewarmNeeds
+	for _, agent := range selected {
+		// getVersion falls back to the VS Code extension version whenever an
+		// extension ID is present, independent of the chosen strategy.
+		if agent.ExtensionID != "" {
+			needs.VSCode = true
+		}
+		for _, strat := range agent.Strategies {
+			switch strat.Kind {
+			case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun:
+				needs.Node = true
+			case agents.KindBrew:
+				needs.Brew = true
+			case agents.KindPip:
+				needs.Pip = true
+			case agents.KindUv:
+				needs.Uv = true
+			case agents.KindVSCode:
+				needs.VSCode = true
+			}
+		}
+	}
+	return needs
+}
+
 func shouldShowUI(opts options) bool {
 	if opts.Quiet || opts.JSON {
 		return false
@@ -546,6 +581,14 @@ type agentWork struct {
 	updateCmd []string
 	// updateCmdSingle is the per-agent command (used for fallback when batch updates fail).
 	updateCmdSingle []string
+	// beforeVersion delivers the pre-update version lookup, launched already
+	// during resolution so a slow CLI startup overlaps detection (and other
+	// agents' resolution) instead of serializing after it. All resolves finish
+	// before any update starts, so the value is always read pre-mutation.
+	// previewLatest likewise delivers the dry-run registry lookup. Both channels
+	// are buffered and written exactly once.
+	beforeVersion <-chan string
+	previewLatest <-chan string
 }
 
 type updateTask struct {
@@ -608,6 +651,13 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 	for i, agent := range selected {
 		works[i] = agentWork{agent: agent, index: i}
 	}
+	var previewCtx context.Context
+	if opts.DryRun {
+		var previewCancel context.CancelFunc
+		previewCtx, previewCancel = context.WithTimeout(ctx, dryRunPreviewBudget)
+		defer previewCancel()
+	}
+
 	var resolveWG sync.WaitGroup
 	resolveSem := make(chan struct{}, resolveConcurrency)
 	for i, agent := range selected {
@@ -633,6 +683,30 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 			if agentspec.IsNodeKind(resolved.Method) {
 				work.nodePackageName = agentspec.NodePackageName(agent.Strategies)
 				work.nodePackageVersion = resolved.Version
+			}
+			if work.updateCmdSingle != nil {
+				// Start the pre-update version lookup now (one channel write);
+				// runTask / dryRunResults collect it after the resolve barrier.
+				versionCtx := ctx
+				if opts.DryRun {
+					versionCtx = previewCtx
+				}
+				before := make(chan string, 1)
+				work.beforeVersion = before
+				go func(work agentWork) {
+					before <- getVersion(versionCtx, work.agent, env, work.method, work.versionCmd)
+				}(work)
+				if opts.DryRun {
+					latest := make(chan string, 1)
+					work.previewLatest = latest
+					go func(work agentWork) {
+						if agentspec.IsNodeKind(work.method) {
+							latest <- env.NodeLatestVersion(previewCtx, work.method, work.nodePackageName)
+							return
+						}
+						latest <- ""
+					}(work)
+				}
 			}
 			works[i] = work
 		}(i, agent)
@@ -690,7 +764,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 	now := time.Now()
 
 	if opts.DryRun {
-		return dryRunResults(ctx, works, env, results, events, now)
+		return dryRunResults(works, results, events, now)
 	}
 
 	for _, work := range works {
@@ -750,17 +824,16 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 }
 
 const (
-	dryRunPreviewBudget      = 12 * time.Second
-	dryRunPreviewConcurrency = 8
-	resolveConcurrency       = 16
+	dryRunPreviewBudget = 12 * time.Second
+	resolveConcurrency  = 16
 )
 
-// dryRunResults computes the dry-run preview. It emits all detect events first
-// (cheap), then fetches current+latest versions concurrently — each is a
-// subprocess / network round-trip — then emits finish events. This keeps
-// `uca -n` fast: wall-clock is ~max(single lookup) instead of the sum across
-// agents (previously the lookups ran fully serially with no budget cap).
-func dryRunResults(ctx context.Context, works []agentWork, env *detect.Env, results []result, events chan<- updateEvent, now time.Time) []result {
+// dryRunResults assembles the dry-run preview. The version lookups were already
+// launched during resolution (see the previewBefore/previewLatest channels), so
+// this emits the detect events, then collects each agent's lookups and emits its
+// finish event. Wall-clock is ~max(resolve barrier, slowest single lookup)
+// instead of the sum across agents.
+func dryRunResults(works []agentWork, results []result, events chan<- updateEvent, now time.Time) []result {
 	updatable := make([]*agentWork, 0, len(works))
 	for i := range works {
 		work := &works[i]
@@ -790,43 +863,32 @@ func dryRunResults(ctx context.Context, works []agentWork, env *detect.Env, resu
 		updatable = append(updatable, work)
 	}
 
-	previewCtx, cancel := context.WithTimeout(ctx, dryRunPreviewBudget)
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, dryRunPreviewConcurrency)
 	for _, work := range updatable {
-		wg.Add(1)
-		go func(work *agentWork) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			res := result{
-				Agent:     work.agent,
-				Method:    work.method,
-				Explain:   work.explain,
-				UpdateCmd: cmdString(work.updateCmd),
-				Status:    statusUpdated,
-				Reason:    "dry-run",
-			}
-			res.Before = getVersion(previewCtx, work.agent, env, work.method, work.versionCmd)
-			res.After = res.Before
-			if agentspec.IsNodeKind(work.method) {
-				if latest := env.NodeLatestVersion(previewCtx, work.method, work.nodePackageName); latest != "" {
-					if formatted := version.FormatWithToken(res.Before, latest); formatted != "" {
-						res.After = formatted
-					} else {
-						res.After = latest
-					}
+		res := result{
+			Agent:     work.agent,
+			Method:    work.method,
+			Explain:   work.explain,
+			UpdateCmd: cmdString(work.updateCmd),
+			Status:    statusUpdated,
+			Reason:    "dry-run",
+		}
+		res.Before = "unknown"
+		if work.beforeVersion != nil {
+			res.Before = <-work.beforeVersion
+		}
+		res.After = res.Before
+		if work.previewLatest != nil {
+			if latest := <-work.previewLatest; latest != "" {
+				if formatted := version.FormatWithToken(res.Before, latest); formatted != "" {
+					res.After = formatted
+				} else {
+					res.After = latest
 				}
 			}
-			results[work.index] = res
-		}(work)
-	}
-	wg.Wait()
-	cancel()
-
-	if events != nil {
-		for _, work := range updatable {
-			events <- updateEvent{Index: work.index, Phase: phaseFinish, Result: results[work.index], Time: time.Now(), Show: work.show}
+		}
+		results[work.index] = res
+		if events != nil {
+			events <- updateEvent{Index: work.index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: work.show}
 		}
 	}
 	return results
@@ -844,17 +906,21 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 	}
 	defer unlock()
 
-	// Prepare results and emit start events.
+	// Prepare results and emit start events. The pre-update version lookups were
+	// launched during resolution (see beforeVersion); collect them here.
 	prepared := make([]result, len(task.agents))
 	for i, work := range task.agents {
-		res := result{
+		prepared[i] = result{
 			Agent:     work.agent,
 			Method:    work.method,
 			Explain:   work.explain,
 			UpdateCmd: cmdString(work.updateCmd),
 		}
-		res.Before = getVersion(ctx, work.agent, env, work.method, work.versionCmd)
-		prepared[i] = res
+		if work.beforeVersion != nil {
+			prepared[i].Before = <-work.beforeVersion
+		} else {
+			prepared[i].Before = getVersion(ctx, work.agent, env, work.method, work.versionCmd)
+		}
 	}
 	if events != nil && agentspec.IsNodeKind(kind) {
 		// Best-effort latest version preview. Keep it short so we don't delay updates on bad networks.
@@ -926,11 +992,21 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 	}
 
 	// Batch success or non-batch failure path.
+	afters := make([]string, len(task.agents))
+	var afterWG sync.WaitGroup
+	for i, work := range task.agents {
+		afterWG.Add(1)
+		go func(i int, work agentWork) {
+			defer afterWG.Done()
+			afters[i] = getVersion(ctx, work.agent, env, work.method, work.versionCmd)
+		}(i, work)
+	}
+	afterWG.Wait()
 	for i, work := range task.agents {
 		res := prepared[i]
 		res.Duration = duration
 		res.Log = out
-		res.After = getVersion(ctx, work.agent, env, work.method, work.versionCmd)
+		res.After = afters[i]
 
 		if exitCode != 0 {
 			setFailureResult(&res, exitCode, task.cmd, classifyOut, opts.Timeout)
@@ -1002,8 +1078,6 @@ func runAllWithUI(ctx context.Context, selected []agents.Agent, env *detect.Env,
 			}
 		}
 	}()
-
-	env.Prewarm()
 
 	results := runAllWithEvents(ctx, selected, env, opts, events)
 	close(events)
@@ -1137,8 +1211,12 @@ func runCheck(ctx context.Context, selected []agents.Agent, env *detect.Env) []c
 				results[i] = res
 				return
 			}
+			// Current (a CLI startup) and latest (registry/manager query) are
+			// independent lookups; fetch them concurrently.
+			latestCh := make(chan string, 1)
+			go func() { latestCh <- env.LatestVersion(checkCtx, resolved.Method, resolved.Pkg) }()
 			res.Current = getVersion(checkCtx, agent, env, resolved.Method, resolved.VersionCmd)
-			res.Latest = env.LatestVersion(checkCtx, resolved.Method, resolved.Pkg)
+			res.Latest = <-latestCh
 			res.State = compareVersions(res.Current, res.Latest)
 			results[i] = res
 		}(i, agent)
