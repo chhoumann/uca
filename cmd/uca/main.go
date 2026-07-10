@@ -39,13 +39,16 @@ type options struct {
 	Verbose     bool
 	Quiet       bool
 	DryRun      bool
-	Check       bool
-	Explain     bool
-	JSON        bool
-	Only        string
-	Skip        string
-	Help        bool
-	Version     bool
+	// Force runs every update command even for agents that are provably already
+	// at the latest version (normally those are skipped as unchanged).
+	Force   bool
+	Check   bool
+	Explain bool
+	JSON    bool
+	Only    string
+	Skip    string
+	Help    bool
+	Version bool
 }
 
 type result struct {
@@ -140,11 +143,12 @@ func main() {
 	// end up executing one after another - detection takes the serial sum of all
 	// manager probes instead of the slowest single one.
 	env.Prewarm(prewarmNeeds(selected))
-	// Modes that display "latest" also start those registry lookups now, so the
-	// network round-trip overlaps detection instead of following it.
-	if opts.DryRun || opts.Check || shouldShowUI(opts) {
-		env.PrefetchLatest(ctx, nodePackages(selected))
-	}
+	// Start the "latest version" lookups now so the network round-trip overlaps
+	// detection instead of following it. Every mode consumes them: dry-run/check
+	// and the live UI display them, and the update path uses them to skip
+	// commands for agents provably already at latest.
+	env.PrefetchLatest(ctx, nodePackages(selected))
+	env.PrefetchMarketplaceLatest(ctx, extensionIDs(selected))
 
 	verCache = vercache.Open()
 
@@ -213,6 +217,8 @@ func parseFlags(args []string) (options, error) {
 	fs.BoolVar(&opts.Quiet, "quiet", false, "summary only")
 	fs.BoolVar(&opts.DryRun, "n", false, "print commands without executing")
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "print commands without executing")
+	fs.BoolVar(&opts.Force, "f", false, "run updates even when already at the latest version")
+	fs.BoolVar(&opts.Force, "force", false, "run updates even when already at the latest version")
 	fs.BoolVar(&opts.Check, "check", false, "report which agents are outdated, do not update")
 	fs.BoolVar(&opts.Explain, "explain", false, "explain detection and update method")
 	fs.BoolVar(&opts.JSON, "json", false, "emit machine-readable JSON (implies no live UI)")
@@ -413,6 +419,7 @@ Options:
   -v, --verbose     show update command output for each agent
   -q, --quiet       suppress per-agent version lines (summary only)
   -n, --dry-run     print commands that would run, do not execute
+  -f, --force       run updates even when already at the latest version
       --check       report which agents are outdated, do not update (exit 10 if any are)
       --explain     show detection details and chosen update method
       --json        emit machine-readable JSON (implies no live UI)
@@ -565,6 +572,28 @@ func nodePackages(selected []agents.Agent) []string {
 	return pkgs
 }
 
+// extensionIDs returns the distinct VS Code extension IDs the selected agents
+// reference, in selection order.
+func extensionIDs(selected []agents.Agent) []string {
+	ids := []string{}
+	seen := map[string]bool{}
+	add := func(id string) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	for _, agent := range selected {
+		add(agent.ExtensionID)
+		for _, strat := range agent.Strategies {
+			if strat.Kind == agents.KindVSCode {
+				add(strat.ExtensionID)
+			}
+		}
+	}
+	return ids
+}
+
 func shouldShowUI(opts options) bool {
 	if opts.Quiet || opts.JSON {
 		return false
@@ -591,13 +620,16 @@ func runAll(ctx context.Context, selected []agents.Agent, env *detect.Env, opts 
 }
 
 type agentWork struct {
-	agent           agents.Agent
-	index           int
-	show            bool
-	method          string
-	explain         string
-	reason          string
-	versionCmd      []string
+	agent      agents.Agent
+	index      int
+	show       bool
+	method     string
+	explain    string
+	reason     string
+	versionCmd []string
+	// pkg is the resolved package/formula/extension identifier the update
+	// targets (used for latest-version lookups and skip-if-current).
+	pkg             string
 	nodePackageName string
 	// nodePackageVersion is the pinned version (empty = @latest). A pinned node
 	// agent is excluded from batching, since the batch assumes a uniform @latest.
@@ -608,12 +640,16 @@ type agentWork struct {
 	updateCmdSingle []string
 	// beforeVersion delivers the pre-update version lookup, launched already
 	// during resolution so a slow CLI startup overlaps detection (and other
-	// agents' resolution) instead of serializing after it. All resolves finish
-	// before any update starts, so the value is always read pre-mutation.
-	// previewLatest likewise delivers the dry-run registry lookup. Both channels
-	// are buffered and written exactly once.
+	// agents' resolution) instead of serializing after it. The lookup is always
+	// spawned before the agent's own update command runs, so it reads the
+	// pre-mutation binary. previewLatest likewise delivers the dry-run registry
+	// lookup. Both channels are buffered and written exactly once.
 	beforeVersion <-chan string
 	previewLatest <-chan string
+	// dispatched marks an agent whose task was sent to the workers during
+	// resolution (before the resolve barrier); the post-barrier loops must not
+	// emit its events or build a task for it again.
+	dispatched bool
 }
 
 type updateTask struct {
@@ -683,6 +719,35 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 		defer previewCancel()
 	}
 
+	// Workers start before resolution so a non-node agent's update can begin the
+	// moment its own resolve completes, instead of waiting out the global
+	// barrier (the slowest manager probe). Node agents still wait for the
+	// barrier: batching needs every node resolution. Serial mode keeps the old
+	// everything-after-the-barrier flow so its execution order stays
+	// deterministic. Dry-run runs no updates at all.
+	earlyDispatch := !opts.DryRun && !opts.Serial
+	locker := newManagerLocker()
+	taskCh := make(chan updateTask, len(selected))
+	var workerWG sync.WaitGroup
+	if !opts.DryRun {
+		workerCount := effectiveConcurrency(opts, len(selected))
+		if workerCount > len(selected) && len(selected) > 0 {
+			workerCount = len(selected)
+		}
+		if workerCount < 1 {
+			workerCount = 1
+		}
+		workerWG.Add(workerCount)
+		for i := 0; i < workerCount; i++ {
+			go func() {
+				defer workerWG.Done()
+				for task := range taskCh {
+					runTask(ctx, task, env, opts, locker, events, results)
+				}
+			}()
+		}
+	}
+
 	var resolveWG sync.WaitGroup
 	resolveSem := make(chan struct{}, resolveConcurrency)
 	for i, agent := range selected {
@@ -703,6 +768,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 				explain:         resolved.Detail,
 				reason:          resolved.Reason,
 				versionCmd:      resolved.VersionCmd,
+				pkg:             resolved.Pkg,
 				updateCmdSingle: resolved.Cmd,
 			}
 			if agentspec.IsNodeKind(resolved.Method) {
@@ -732,18 +798,35 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 						latest <- ""
 					}(work)
 				}
+				if earlyDispatch && !agentspec.IsNodeKind(work.method) {
+					work.updateCmd = work.updateCmdSingle
+					work.dispatched = true
+					if events != nil {
+						res := result{
+							Agent:     work.agent,
+							Method:    work.method,
+							Explain:   work.explain,
+							UpdateCmd: cmdString(work.updateCmd),
+						}
+						events <- updateEvent{Index: work.index, Phase: phaseDetect, Result: res, Time: time.Now(), Show: work.show}
+					}
+					works[i] = work
+					taskCh <- updateTask{kind: work.method, cmd: work.updateCmd, agents: []agentWork{work}}
+					return
+				}
 			}
 			works[i] = work
 		}(i, agent)
 	}
 	resolveWG.Wait()
 
-	// Build tasks (batch node updates by manager kind).
+	// Build the remaining tasks (batch node updates by manager kind); agents
+	// already dispatched during resolution are excluded.
 	tasks := []updateTask{}
 	nodeGroups := map[string][]int{}
 	for i := range works {
 		work := &works[i]
-		if work.updateCmdSingle == nil {
+		if work.updateCmdSingle == nil || work.dispatched {
 			continue
 		}
 		if agentspec.IsNodeKind(work.method) {
@@ -793,6 +876,9 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 	}
 
 	for _, work := range works {
+		if work.dispatched {
+			continue // detect event already emitted during resolution
+		}
 		res := result{
 			Agent:     work.agent,
 			Method:    work.method,
@@ -820,30 +906,11 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 		}
 	}
 
-	locker := newManagerLocker()
-	taskCh := make(chan updateTask)
-	var wg sync.WaitGroup
-	workerCount := effectiveConcurrency(opts, len(tasks))
-	if workerCount > len(tasks) {
-		workerCount = len(tasks)
-	}
-	if workerCount < 1 {
-		workerCount = 1
-	}
-	wg.Add(workerCount)
-	for i := 0; i < workerCount; i++ {
-		go func() {
-			defer wg.Done()
-			for task := range taskCh {
-				runTask(ctx, task, env, opts, locker, events, results)
-			}
-		}()
-	}
 	for _, task := range tasks {
 		taskCh <- task
 	}
 	close(taskCh)
-	wg.Wait()
+	workerWG.Wait()
 
 	return results
 }
@@ -974,6 +1041,25 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 		wg.Wait()
 		cancel()
 	}
+	// Skip the update command entirely when every agent in the task is provably
+	// already at the latest version (exact metadata only; see taskUpToDate). A
+	// no-op update still costs 0.5-2s of manager startup, so this is the big
+	// win on the common nothing-to-do run. --force restores the old behavior.
+	if !opts.Force && ctx.Err() == nil && taskUpToDate(ctx, task, env) {
+		now := time.Now()
+		for i, work := range task.agents {
+			res := prepared[i]
+			res.After = res.Before
+			res.Status = statusUnchanged
+			res.Explain = appendHint(res.Explain, "already at latest; use --force to run the update anyway")
+			results[work.index] = res
+			if events != nil {
+				events <- updateEvent{Index: work.index, Phase: phaseFinish, Result: res, Time: now, Show: work.show}
+			}
+		}
+		return
+	}
+
 	startTime := time.Now()
 	if events != nil {
 		for i, work := range task.agents {
@@ -1045,6 +1131,58 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 			events <- updateEvent{Index: work.index, Phase: phaseFinish, Result: res, Time: time.Now(), Show: work.show}
 		}
 	}
+}
+
+// taskUpToDate reports whether every agent in the task is provably already at
+// its target version, using only exact metadata: the manager's own installed
+// records (global package.json, brew Cellar, extensions manifest) against an
+// authoritative latest (npm registry, tap formula literal, marketplace). Any
+// gap in either side fails open (run the update command). pnpm/yarn global
+// package dirs are not confidently derivable, and native/pip/uv have no cheap
+// authoritative latest, so those always run.
+func taskUpToDate(ctx context.Context, task updateTask, env *detect.Env) bool {
+	for _, work := range task.agents {
+		switch {
+		case agentspec.IsNodeKind(work.method):
+			installed := env.NodeInstalledVersion(work.method, work.nodePackageName)
+			if installed == "" {
+				return false
+			}
+			if pin := strings.TrimSpace(work.nodePackageVersion); pin != "" {
+				// A pin can be a downgrade target, so only exact equality skips.
+				if version.Compare(installed, pin) != 0 {
+					return false
+				}
+				continue
+			}
+			var latest string
+			if work.method == agents.KindBun {
+				// bun's no-op install is faster than a registry round-trip, so
+				// only use an answer that has already arrived.
+				latest = env.PeekLatest(work.nodePackageName)
+			} else {
+				latest = env.NodeLatestVersion(ctx, work.method, work.nodePackageName)
+			}
+			if compareVersions(installed, latest) != checkUpToDate {
+				return false
+			}
+		case work.method == agents.KindBrew:
+			installed := env.BrewInstalledVersion(work.pkg)
+			latest := env.BrewTapLatest(work.pkg)
+			if installed == "" || compareVersions(installed, latest) != checkUpToDate {
+				return false
+			}
+		case work.method == agents.KindVSCode:
+			installed := env.VscodeVersion(work.pkg)
+			latest := env.VSCodeMarketplaceLatest(ctx, work.pkg)
+			if installed == "" || compareVersions(installed, latest) != checkUpToDate {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return len(task.agents) > 0
 }
 
 type updateEvent struct {

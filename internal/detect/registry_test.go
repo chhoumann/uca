@@ -141,3 +141,44 @@ func TestCellarFormulae(t *testing.T) {
 		t.Fatalf("cellarFormulae(missing) = %v, want nil (fall back to brew list)", got)
 	}
 }
+
+func TestQueryMarketplaceLatest(t *testing.T) {
+	body := `{"results":[{"extensions":[{"versions":[
+	 {"version":"5.0.0","properties":[{"key":"Microsoft.VisualStudio.Code.PreRelease","value":"true"}]},
+	 {"version":"4.0.7","properties":[]},
+	 {"version":"4.0.6","properties":[]}
+	]}]}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	old := marketplaceURL
+	marketplaceURL = srv.URL
+	defer func() { marketplaceURL = old }()
+
+	if got := queryMarketplaceLatest(context.Background(), "pub.ext"); got != "4.0.7" {
+		t.Fatalf("queryMarketplaceLatest = %q, want 4.0.7 (first stable, skipping pre-release)", got)
+	}
+}
+
+func TestQueryMarketplaceLatestEmptyResults(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"results":[{"extensions":[]}]}`))
+	}))
+	defer srv.Close()
+	old := marketplaceURL
+	marketplaceURL = srv.URL
+	defer func() { marketplaceURL = old }()
+
+	if got := queryMarketplaceLatest(context.Background(), "pub.missing"); got != "" {
+		t.Fatalf("queryMarketplaceLatest(missing) = %q, want empty", got)
+	}
+}
+
+func TestVSCodeMarketplaceLatestKillSwitch(t *testing.T) {
+	t.Setenv("UCA_NO_REGISTRY_HTTP", "1")
+	env := New(context.Background())
+	if got := env.VSCodeMarketplaceLatest(context.Background(), "pub.ext"); got != "" {
+		t.Fatalf("kill switch must disable marketplace lookups, got %q", got)
+	}
+}

@@ -840,6 +840,16 @@ type latestFlight struct {
 	v    string
 }
 
+// PeekLatest returns a node package's latest version only if a lookup has
+// already completed, never blocking or spawning. Used where waiting would cost
+// more than the update command it might skip (bun's no-op install is faster
+// than a registry round-trip).
+func (e *Env) PeekLatest(pkg string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.latestCache[strings.TrimSpace(pkg)]
+}
+
 // NodeLatestVersion returns the registry "latest" for a node package, memoized
 // per package (the answer is manager-independent). Only successful (non-empty)
 // results are cached.
@@ -906,13 +916,16 @@ func queryNodeLatestVersion(ctx context.Context, kind, pkg string) string {
 }
 
 // LatestVersion returns the latest available version for an update method, or ""
-// when it is not cheaply/reliably knowable (native/VS Code/pip/uv). Used by --check.
+// when it is not cheaply/reliably knowable (native/pip/uv). Used by --check.
+// For vscode, pkg is the extension ID.
 func (e *Env) LatestVersion(ctx context.Context, method, pkg string) string {
 	switch method {
 	case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun:
 		return e.NodeLatestVersion(ctx, method, pkg)
 	case agents.KindBrew:
 		return e.brewLatest(ctx, pkg)
+	case agents.KindVSCode:
+		return e.VSCodeMarketplaceLatest(ctx, pkg)
 	default:
 		return ""
 	}

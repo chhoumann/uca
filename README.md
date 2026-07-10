@@ -28,12 +28,22 @@ Options:
 - `-v, --verbose` show update command output for each agent
 - `-q, --quiet` suppress per-agent version lines (summary only)
 - `-n, --dry-run` print commands that would run, do not execute
+- `-f, --force` run update commands even for agents already at the latest version
+- `--check` report which agents are outdated, do not update (exit 10 if any are)
 - `--explain` show detection details and chosen update method
+- `--json` emit machine-readable JSON
 - `--only <list>` comma-separated agent list to include (e.g. `claude,codex`)
 - `--skip <list>` comma-separated agent list to exclude
 - `-h, --help` show usage
 
 `agent` is accepted as an alias for `cursor` in `--only` and `--skip`.
+
+When uca can prove an agent is already at the latest version from the package
+manager's own metadata (global `package.json` vs the npm registry, brew Cellar
+vs the tap formula, VS Code's extensions manifest vs the Marketplace), it skips
+that agent's update command and reports it unchanged. Use `--force` to run the
+update commands anyway. Native updaters (like `claude update`) always run,
+since only they know their latest version.
 
 ## Examples
 

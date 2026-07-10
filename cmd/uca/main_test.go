@@ -1252,3 +1252,82 @@ func TestPrewarmNeeds(t *testing.T) {
 		})
 	}
 }
+
+// npmSkipFixture builds a fake npm environment where pkg-one is installed
+// globally at installedVersion (exact package.json metadata) and the registry
+// reports latestVersion. Returns the install-call record file.
+func npmSkipFixture(t *testing.T, installedVersion, latestVersion, pin string) (string, *detect.Env, []agents.Agent) {
+	t.Helper()
+	dir := t.TempDir()
+	prefix := filepath.Join(dir, "npm-global")
+	pkgDir := filepath.Join(prefix, "lib", "node_modules", "pkg-one")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"name":"pkg-one","version":"` + installedVersion + `"}`
+	if err := os.WriteFile(filepath.Join(pkgDir, "package.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(dir, "npm-calls.txt")
+	env := nodeIntegrationEnv(t, map[string]string{
+		"npm": fakeNpmWithBinDir(record, filepath.Join(prefix, "bin"), nil, false, latestVersion),
+		"one": "#!/bin/sh\ncase \"$1\" in --version) echo " + installedVersion + " ;; esac\n",
+	})
+	list := []agents.Agent{{
+		Name: "one", Binary: "one", VersionCmd: []string{"one", "--version"},
+		Strategies: []agents.UpdateStrategy{{Kind: agents.KindNpm, Package: "pkg-one", Version: pin}},
+	}}
+	return record, env, list
+}
+
+func recordedCalls(t *testing.T, record string) string {
+	t.Helper()
+	data, _ := os.ReadFile(record)
+	return strings.TrimSpace(string(data))
+}
+
+func TestRunAllSkipsNodeUpdateWhenAtLatest(t *testing.T) {
+	record, env, list := npmSkipFixture(t, "2.0.0", "2.0.0", "")
+	results := runAllWithEvents(context.Background(), list, env, options{}, nil)
+	if calls := recordedCalls(t, record); calls != "" {
+		t.Fatalf("update must be skipped when installed == latest; npm calls = %q", calls)
+	}
+	if results[0].Status != statusUnchanged {
+		t.Fatalf("status = %q, want unchanged", results[0].Status)
+	}
+	if !strings.Contains(results[0].Explain, "already at latest") {
+		t.Fatalf("explain = %q, want already-at-latest hint", results[0].Explain)
+	}
+}
+
+func TestRunAllRunsNodeUpdateWhenOutdated(t *testing.T) {
+	record, env, list := npmSkipFixture(t, "2.0.0", "3.0.0", "")
+	runAllWithEvents(context.Background(), list, env, options{}, nil)
+	if calls := recordedCalls(t, record); calls != "install -g pkg-one@latest" {
+		t.Fatalf("outdated package must update; npm calls = %q", calls)
+	}
+}
+
+func TestRunAllForceRunsUpdateWhenAtLatest(t *testing.T) {
+	record, env, list := npmSkipFixture(t, "2.0.0", "2.0.0", "")
+	runAllWithEvents(context.Background(), list, env, options{Force: true}, nil)
+	if calls := recordedCalls(t, record); calls != "install -g pkg-one@latest" {
+		t.Fatalf("--force must run the update; npm calls = %q", calls)
+	}
+}
+
+func TestRunAllSkipsPinnedNodeUpdateOnlyAtExactPin(t *testing.T) {
+	// Installed == pin: nothing to do.
+	record, env, list := npmSkipFixture(t, "1.2.3", "9.9.9", "1.2.3")
+	runAllWithEvents(context.Background(), list, env, options{}, nil)
+	if calls := recordedCalls(t, record); calls != "" {
+		t.Fatalf("pinned at target must skip; npm calls = %q", calls)
+	}
+
+	// Installed newer than pin: the pin is a downgrade target and must run.
+	record, env, list = npmSkipFixture(t, "2.0.0", "9.9.9", "1.2.3")
+	runAllWithEvents(context.Background(), list, env, options{}, nil)
+	if calls := recordedCalls(t, record); calls != "install -g pkg-one@1.2.3" {
+		t.Fatalf("pin mismatch must run the pinned install; npm calls = %q", calls)
+	}
+}

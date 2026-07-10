@@ -253,7 +253,8 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 			}
 			if env.VscodeHas(strat.ExtensionID) {
 				detail = fmt.Sprintf("VS Code extension %s installed (via %s)", strat.ExtensionID, env.CodeCmd())
-				return Resolved{Cmd: []string{env.CodeCmd(), "--install-extension", strat.ExtensionID, "--force"}, Method: strat.Kind, Detail: detail}
+				// Pkg carries the extension ID: the marketplace lookup key.
+				return Resolved{Cmd: []string{env.CodeCmd(), "--install-extension", strat.ExtensionID, "--force"}, Method: strat.Kind, Detail: detail, Pkg: strat.ExtensionID}
 			}
 		}
 	}
