@@ -23,17 +23,27 @@ func fakeEnv(t *testing.T, scripts map[string]string) *Env {
 	}
 	t.Setenv("PATH", dir)
 	// Keep latest-version lookups on the fake manager CLIs instead of the live
-	// registry HTTP fast path.
+	// registry HTTP fast path, and isolate the filesystem fast paths (npmrc
+	// prefix, VS Code extensions manifest, brew Cellar/taps) from host state.
 	t.Setenv("UCA_NO_REGISTRY_HTTP", "1")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("npm_config_prefix", "")
+	t.Setenv("NPM_CONFIG_PREFIX", "")
+	t.Setenv("HOMEBREW_CELLAR", "")
+	t.Setenv("HOMEBREW_REPOSITORY", "")
 	return New(context.Background())
 }
 
 func TestNodeLatestVersionCaches(t *testing.T) {
 	env := New(context.Background())
-	env.latestCache = map[string]string{agents.KindNpm + "\x00" + "pkg": "9.9.9"}
-	// A cached value is returned without running any command.
+	env.latestCache = map[string]string{"pkg": "9.9.9"}
+	// A cached value is returned without running any command, regardless of the
+	// manager kind (the registry answer is manager-independent).
 	if got := env.NodeLatestVersion(context.Background(), agents.KindNpm, "pkg"); got != "9.9.9" {
 		t.Fatalf("NodeLatestVersion cached = %q, want 9.9.9", got)
+	}
+	if got := env.NodeLatestVersion(context.Background(), agents.KindBun, "pkg"); got != "9.9.9" {
+		t.Fatalf("NodeLatestVersion cached (other kind) = %q, want 9.9.9", got)
 	}
 }
 

@@ -626,8 +626,14 @@ func fakePathEnv(t *testing.T, scripts map[string]string) (string, *detect.Env) 
 	}
 	t.Setenv("PATH", dir)
 	// Keep latest-version lookups on the fake manager CLIs instead of the live
-	// registry HTTP fast path.
+	// registry HTTP fast path, and isolate the filesystem fast paths (npmrc
+	// prefix, VS Code extensions manifest, brew Cellar/taps) from host state.
 	t.Setenv("UCA_NO_REGISTRY_HTTP", "1")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("npm_config_prefix", "")
+	t.Setenv("NPM_CONFIG_PREFIX", "")
+	t.Setenv("HOMEBREW_CELLAR", "")
+	t.Setenv("HOMEBREW_REPOSITORY", "")
 	return dir, detect.New(context.Background())
 }
 

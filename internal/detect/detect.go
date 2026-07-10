@@ -41,34 +41,37 @@ type Env struct {
 	hasPython bool
 	codeCmd   string
 
-	mu           sync.Mutex
-	binPathCache map[string]string
-	npmBinOnce   sync.Once
-	npmBin       string
-	npmPkgOnce   sync.Once
-	npmPkgs      map[string]bool
-	pnpmBinOnce  sync.Once
-	pnpmBin      string
-	pnpmPkgOnce  sync.Once
-	pnpmPkgs     map[string]bool
-	yarnBinOnce  sync.Once
-	yarnBin      string
-	yarnPkgOnce  sync.Once
-	yarnPkgs     map[string]bool
-	bunBinOnce   sync.Once
-	bunGlobalBin string
-	bunPkgOnce   sync.Once
-	bunPkgs      map[string]bool
-	uvOnce       sync.Once
-	uvTools      map[string]bool
-	codeOnce     sync.Once
-	codeExts     map[string]string
-	helpChecks   map[string]bool
-	latestCache  map[string]string
-	brewOnce     sync.Once
-	brewFormulae map[string]bool
-	pipOnce      sync.Once
-	pipPkgs      map[string]bool
+	mu            sync.Mutex
+	binPathCache  map[string]string
+	npmPrefixOnce sync.Once
+	npmPrefixVal  string
+	npmBinOnce    sync.Once
+	npmBin        string
+	npmPkgOnce    sync.Once
+	npmPkgs       map[string]bool
+	pnpmBinOnce   sync.Once
+	pnpmBin       string
+	pnpmPkgOnce   sync.Once
+	pnpmPkgs      map[string]bool
+	yarnBinOnce   sync.Once
+	yarnBin       string
+	yarnPkgOnce   sync.Once
+	yarnPkgs      map[string]bool
+	bunBinOnce    sync.Once
+	bunGlobalBin  string
+	bunPkgOnce    sync.Once
+	bunPkgs       map[string]bool
+	uvOnce        sync.Once
+	uvTools       map[string]bool
+	codeOnce      sync.Once
+	codeExts      map[string]string
+	helpChecks    map[string]bool
+	latestCache   map[string]string
+	latestFlight  map[string]*latestFlight
+	brewOnce      sync.Once
+	brewFormulae  map[string]bool
+	pipOnce       sync.Once
+	pipPkgs       map[string]bool
 }
 
 // New probes which managers/tools are installed and returns a ready Env.
@@ -303,6 +306,24 @@ func (e *Env) nodeManagerHasPackage(kind, pkg string) bool {
 	}
 }
 
+// npmPrefix resolves npm's global prefix: from the environment / ~/.npmrc /
+// the node binary's location when confidently derivable (see npmfs.go), else
+// from `npm prefix -g`.
+func (e *Env) npmPrefix() string {
+	e.npmPrefixOnce.Do(func() {
+		e.npmPrefixVal = npmPrefixFast()
+		if e.npmPrefixVal != "" {
+			return
+		}
+		out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"npm", "prefix", "-g"}, detectCmdTimeout)
+		if exitCode != 0 {
+			return
+		}
+		e.npmPrefixVal = strings.TrimSpace(out)
+	})
+	return e.npmPrefixVal
+}
+
 func (e *Env) npmBinDir() string {
 	e.npmBinOnce.Do(e.loadNpmBin)
 	return e.npmBin
@@ -313,14 +334,7 @@ func (e *Env) loadNpmBin() {
 	if !e.hasNpm {
 		return
 	}
-	// `npm prefix -g` works on every npm version; `npm bin -g` (removed in npm 9)
-	// was exactly <prefix>/bin on Unix and <prefix> on Windows, which is what we
-	// derive below.
-	prefixOut, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"npm", "prefix", "-g"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	prefix := strings.TrimSpace(prefixOut)
+	prefix := e.npmPrefix()
 	if prefix == "" {
 		return
 	}
@@ -347,6 +361,14 @@ func (e *Env) loadNpmPkgs() {
 	e.npmPkgs = map[string]bool{}
 	if !e.hasNpm {
 		return
+	}
+	// Fast path: a directory listing of the global node_modules answers "is this
+	// package installed" without a ~200ms `npm list` startup.
+	if prefix := e.npmPrefix(); prefix != "" {
+		if pkgs := listGlobalNodePackages(globalNodeModulesDir(prefix)); pkgs != nil {
+			e.npmPkgs = pkgs
+			return
+		}
 	}
 	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{"npm", "list", "-g", "--depth=0", "--json"}, detectCmdTimeout)
 	var payload struct {
@@ -729,6 +751,12 @@ func (e *Env) loadCodeExtensions() {
 	if e.codeCmd == "" {
 		return
 	}
+	// Fast path: read the extensions manifest VS Code itself maintains instead
+	// of spawning its CLI (see vscodeext.go).
+	if exts := readCodeExtensions(codeExtensionsDir(e.codeCmd)); exts != nil {
+		e.codeExts = exts
+		return
+	}
 	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{e.codeCmd, "--list-extensions", "--show-versions"}, detectCmdTimeout)
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
@@ -777,26 +805,62 @@ func (e *Env) HelpMatches(binary, contains string) bool {
 	return ok
 }
 
+// PrefetchLatest starts registry latest-version lookups for the given packages
+// in the background, so the answers are (mostly) ready by the time resolution
+// finishes and asks for them. Results land in the same memoized store
+// NodeLatestVersion reads.
+func (e *Env) PrefetchLatest(ctx context.Context, pkgs []string) {
+	for _, pkg := range pkgs {
+		if pkg = strings.TrimSpace(pkg); pkg != "" {
+			go e.registryLatestOnce(ctx, pkg)
+		}
+	}
+}
+
+// registryLatestOnce queries the registry over HTTP for a package's latest
+// version, deduplicated per package (a prefetch and an on-demand caller share
+// one request; the loser of the race just waits for the same result).
+func (e *Env) registryLatestOnce(ctx context.Context, pkg string) string {
+	e.mu.Lock()
+	if e.latestFlight == nil {
+		e.latestFlight = map[string]*latestFlight{}
+	}
+	f, ok := e.latestFlight[pkg]
+	if !ok {
+		f = &latestFlight{}
+		e.latestFlight[pkg] = f
+	}
+	e.mu.Unlock()
+	f.once.Do(func() { f.v = registryLatestVersion(ctx, pkg) })
+	return f.v
+}
+
+type latestFlight struct {
+	once sync.Once
+	v    string
+}
+
 // NodeLatestVersion returns the registry "latest" for a node package, memoized
-// per (kind,pkg). Only successful (non-empty) results are cached.
+// per package (the answer is manager-independent). Only successful (non-empty)
+// results are cached.
 func (e *Env) NodeLatestVersion(ctx context.Context, kind, pkg string) string {
 	pkg = strings.TrimSpace(pkg)
 	if pkg == "" {
 		return ""
 	}
-	key := kind + "\x00" + pkg
 	e.mu.Lock()
 	if e.latestCache != nil {
-		if v, ok := e.latestCache[key]; ok {
+		if v, ok := e.latestCache[pkg]; ok {
 			e.mu.Unlock()
 			return v
 		}
 	}
 	e.mu.Unlock()
 
-	// Fast path: ask the registry directly (no manager-CLI startup). The CLI
-	// query remains as fallback for registries the HTTP path can't serve.
-	v := registryLatestVersion(ctx, pkg)
+	// Fast path: ask the registry directly (no manager-CLI startup); usually
+	// already in flight via PrefetchLatest. The CLI query remains as fallback
+	// for registries the HTTP path can't serve.
+	v := e.registryLatestOnce(ctx, pkg)
 	if v == "" {
 		v = queryNodeLatestVersion(ctx, kind, pkg)
 	}
@@ -805,7 +869,7 @@ func (e *Env) NodeLatestVersion(ctx context.Context, kind, pkg string) string {
 		if e.latestCache == nil {
 			e.latestCache = map[string]string{}
 		}
-		e.latestCache[key] = v
+		e.latestCache[pkg] = v
 		e.mu.Unlock()
 	}
 	return v
@@ -858,9 +922,88 @@ func (e *Env) brewLatest(ctx context.Context, formula string) string {
 	if formula == "" {
 		return ""
 	}
+	// Fast path: tap formulae are local .rb files, and release-pipeline-generated
+	// ones (GoReleaser etc.) carry an explicit `version "x"` literal. `brew info`
+	// reads the same clone, so this is the same data without ~0.7s of Ruby
+	// startup. Anything ambiguous or literal-less falls through to brew info.
+	if v := tapFormulaVersion(brewTapsDirs(), formula); v != "" {
+		return v
+	}
 	out, exitCode, _, _ := runner.RunStdout(ctx, []string{"brew", "info", "--json=v2", formula}, latestVersionCmdTimeout)
 	if exitCode != 0 {
 		return ""
 	}
 	return version.ParseBrewLatest(out)
+}
+
+// brewTapsDirs returns candidate Library/Taps directories: the configured
+// repository, the prefix itself (Apple Silicon layout), and <prefix>/Homebrew
+// (Intel macOS layout).
+func brewTapsDirs() []string {
+	roots := []string{}
+	if repo := strings.TrimSpace(os.Getenv("HOMEBREW_REPOSITORY")); repo != "" {
+		roots = append(roots, repo)
+	}
+	if brewPath, err := exec.LookPath("brew"); err == nil {
+		prefix := filepath.Dir(filepath.Dir(brewPath))
+		roots = append(roots, prefix, filepath.Join(prefix, "Homebrew"))
+	}
+	dirs := make([]string, 0, len(roots))
+	seen := map[string]bool{}
+	for _, root := range roots {
+		dir := filepath.Join(root, "Library", "Taps")
+		if !seen[dir] {
+			seen[dir] = true
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
+}
+
+// tapFormulaVersion finds formula .rb files across locally-cloned taps and
+// extracts an explicit version literal. Empty when the formula is absent,
+// present in more than one tap (ambiguous), or has no literal (version derived
+// from its url, e.g. most homebrew/core formulae).
+func tapFormulaVersion(tapsDirs []string, formula string) string {
+	matches := []string{}
+	for _, dir := range tapsDirs {
+		for _, pattern := range []string{
+			filepath.Join(dir, "*", "*", "Formula", formula+".rb"),
+			filepath.Join(dir, "*", "*", formula+".rb"),
+		} {
+			found, err := filepath.Glob(pattern)
+			if err != nil {
+				continue
+			}
+			matches = append(matches, found...)
+		}
+	}
+	if len(matches) != 1 {
+		return ""
+	}
+	data, err := os.ReadFile(matches[0])
+	if err != nil {
+		return ""
+	}
+	return formulaVersionLiteral(string(data))
+}
+
+// formulaVersionLiteral extracts the first `version "x"` literal from formula
+// source, or "".
+func formulaVersionLiteral(src string) string {
+	for _, line := range strings.Split(src, "\n") {
+		line = strings.TrimSpace(line)
+		rest, ok := strings.CutPrefix(line, "version ")
+		if !ok {
+			continue
+		}
+		rest = strings.TrimSpace(rest)
+		if len(rest) < 2 || rest[0] != '"' {
+			continue
+		}
+		if end := strings.IndexByte(rest[1:], '"'); end > 0 {
+			return rest[1 : 1+end]
+		}
+	}
+	return ""
 }

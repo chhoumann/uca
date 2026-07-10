@@ -11,6 +11,7 @@
 - `go test ./...` — run unit tests (if/when added).
 - `UCA_TRACE=1 uca ...` — log every subprocess (start offset, duration, exit code) to stderr; use this when measuring performance.
 - `UCA_NO_REGISTRY_HTTP=1` — disable the direct-registry HTTP fast path for latest-version lookups (falls back to the package-manager CLIs). Test helpers set this to stay hermetic.
+- `UCA_NO_VERSION_CACHE=1` — disable the persistent version-command cache (`<user-cache-dir>/uca/versions.json`, keyed by binary path+size+mtime so any update invalidates it).
 - `gofmt -w cmd/uca/main.go internal/**/*.go` — format Go files.
 - `go mod tidy` — clean up dependencies after adding/removing imports.
 

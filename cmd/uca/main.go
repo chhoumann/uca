@@ -24,6 +24,7 @@ import (
 	"github.com/chhoumann/uca/internal/detect"
 	runner "github.com/chhoumann/uca/internal/exec"
 	"github.com/chhoumann/uca/internal/ui"
+	"github.com/chhoumann/uca/internal/vercache"
 	"github.com/chhoumann/uca/internal/version"
 )
 
@@ -139,9 +140,17 @@ func main() {
 	// end up executing one after another - detection takes the serial sum of all
 	// manager probes instead of the slowest single one.
 	env.Prewarm(prewarmNeeds(selected))
+	// Modes that display "latest" also start those registry lookups now, so the
+	// network round-trip overlaps detection instead of following it.
+	if opts.DryRun || opts.Check || shouldShowUI(opts) {
+		env.PrefetchLatest(ctx, nodePackages(selected))
+	}
+
+	verCache = vercache.Open()
 
 	if opts.Check {
 		checkResults := runCheck(ctx, selected, env)
+		verCache.Save() // best-effort; a failed save just re-runs version reads next time
 		if opts.JSON {
 			printCheckJSON(checkResults, unknown)
 		} else {
@@ -158,6 +167,7 @@ func main() {
 
 	uiEnabled := shouldShowUI(opts)
 	results := runAll(ctx, selected, env, opts, uiEnabled)
+	verCache.Save() // best-effort; a failed save just re-runs version reads next time
 
 	if opts.JSON {
 		printJSON(results, unknown, opts)
@@ -538,6 +548,21 @@ func prewarmNeeds(selected []agents.Agent) detect.PrewarmNeeds {
 		}
 	}
 	return needs
+}
+
+// nodePackages returns the distinct node package names the selected agents
+// reference, in selection order.
+func nodePackages(selected []agents.Agent) []string {
+	pkgs := []string{}
+	seen := map[string]bool{}
+	for _, agent := range selected {
+		pkg := agentspec.NodePackageName(agent.Strategies)
+		if pkg != "" && !seen[pkg] {
+			seen[pkg] = true
+			pkgs = append(pkgs, pkg)
+		}
+	}
+	return pkgs
 }
 
 func shouldShowUI(opts options) bool {
@@ -1234,15 +1259,25 @@ func hasOutdated(results []checkResult) bool {
 	return false
 }
 
+// verCache memoizes version-command output across runs, keyed by the binary's
+// identity so any update invalidates it. Nil (e.g. in tests, or when disabled)
+// is a no-op.
+var verCache *vercache.Cache
+
 func runVersionCmd(ctx context.Context, args []string) string {
 	if len(args) == 0 {
 		return "unknown"
+	}
+	if v, ok := verCache.Get(args); ok {
+		return v
 	}
 	out, code, _, _ := runner.Run(ctx, args, versionCmdTimeout)
 	if code != 0 {
 		return "unknown"
 	}
-	return version.ParseOutput(out)
+	v := version.ParseOutput(out)
+	verCache.Put(args, v)
+	return v
 }
 
 func runUpdateCmd(ctx context.Context, args []string, timeout time.Duration) (string, string, int, time.Duration, error) {
