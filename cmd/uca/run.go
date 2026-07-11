@@ -273,7 +273,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 		batchIndexes := make([]int, 0, len(indexes))
 		for _, idx := range indexes {
 			pkg := strings.TrimSpace(works[idx].nodePackageName)
-			// A version-pinned agent can't join the @latest batch — run it on its
+			// A version-pinned agent can't join the @latest batch - run it on its
 			// own with its pinned single command.
 			if pkg == "" || works[idx].nodePackageVersion != "" {
 				works[idx].updateCmd = works[idx].updateCmdSingle

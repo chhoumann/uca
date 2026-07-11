@@ -113,9 +113,8 @@ func main() {
 	// Kick off the detection loaders the selected agents can need (they run
 	// concurrently and dedupe with on-demand callers). Without this, the resolver
 	// goroutines all walk the managers in the same order and the once-guarded
-	// lazy loaders
-	// end up executing one after another - detection takes the serial sum of all
-	// manager probes instead of the slowest single one.
+	// lazy loaders end up executing one after another - detection takes the
+	// serial sum of all manager probes instead of the slowest single one.
 	env.Prewarm(prewarmNeeds(selected))
 	// Start the "latest version" lookups now so the network round-trip overlaps
 	// detection instead of following it. Every mode consumes them: dry-run/check
