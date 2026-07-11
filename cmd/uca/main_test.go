@@ -367,10 +367,10 @@ func TestEffectiveConcurrencyNonPositive(t *testing.T) {
 func TestDryRunPlanLinesGroupsBatch(t *testing.T) {
 	batch := "bun add -g @openai/codex@latest opencode-ai@latest"
 	results := []result{
-		{Agent: agents.Agent{Name: "claude"}, Status: statusUpdated, Reason: "dry-run", UpdateCmd: "claude update"},
-		{Agent: agents.Agent{Name: "codex"}, Status: statusUpdated, Reason: "dry-run", UpdateCmd: batch},
-		{Agent: agents.Agent{Name: "gemini"}, Status: statusSkipped, Reason: reasonMissing},
-		{Agent: agents.Agent{Name: "opencode"}, Status: statusUpdated, Reason: "dry-run", UpdateCmd: batch},
+		{Agent: agents.Agent{Name: "claude"}, Status: agents.StatusUpdated, Reason: "dry-run", UpdateCmd: "claude update"},
+		{Agent: agents.Agent{Name: "codex"}, Status: agents.StatusUpdated, Reason: "dry-run", UpdateCmd: batch},
+		{Agent: agents.Agent{Name: "gemini"}, Status: agents.StatusSkipped, Reason: agents.ReasonMissing},
+		{Agent: agents.Agent{Name: "opencode"}, Status: agents.StatusUpdated, Reason: "dry-run", UpdateCmd: batch},
 	}
 	lines := dryRunPlanLines(results)
 	want := []string{
@@ -385,11 +385,11 @@ func TestDryRunPlanLinesGroupsBatch(t *testing.T) {
 
 func TestBuildReport(t *testing.T) {
 	results := []result{
-		{Agent: agents.Agent{Name: "claude"}, Method: "native", Status: statusUpdated, Before: "1", After: "2", Duration: 8 * time.Second, UpdateCmd: "claude update"},
-		{Agent: agents.Agent{Name: "codex"}, Method: "bun", Status: statusUnchanged, Before: "1", After: "1"},
-		{Agent: agents.Agent{Name: "gemini"}, Status: statusSkipped, Reason: "missing"},
-		{Agent: agents.Agent{Name: "amp"}, Method: "native", Status: statusUpdated, Reason: "dry-run", Before: "1", After: "1", UpdateCmd: "amp update", Explain: "binary amp found"},
-		{Agent: agents.Agent{Name: "droid"}, Method: "native", Status: statusFailed, Reason: "timeout"},
+		{Agent: agents.Agent{Name: "claude"}, Method: "native", Status: agents.StatusUpdated, Before: "1", After: "2", Duration: 8 * time.Second, UpdateCmd: "claude update"},
+		{Agent: agents.Agent{Name: "codex"}, Method: "bun", Status: agents.StatusUnchanged, Before: "1", After: "1"},
+		{Agent: agents.Agent{Name: "gemini"}, Status: agents.StatusSkipped, Reason: "missing"},
+		{Agent: agents.Agent{Name: "amp"}, Method: "native", Status: agents.StatusUpdated, Reason: "dry-run", Before: "1", After: "1", UpdateCmd: "amp update", Explain: "binary amp found"},
+		{Agent: agents.Agent{Name: "droid"}, Method: "native", Status: agents.StatusFailed, Reason: "timeout"},
 	}
 	rep := buildReport(results, []string{"bogus"}, options{})
 
@@ -427,11 +427,11 @@ func TestJSONStatus(t *testing.T) {
 		res  result
 		want string
 	}{
-		{name: "dry-run", res: result{Status: statusUpdated, Reason: "dry-run"}, want: "dry-run"},
-		{name: "updated", res: result{Status: statusUpdated}, want: "updated"},
-		{name: "unchanged", res: result{Status: statusUnchanged}, want: "unchanged"},
-		{name: "skipped", res: result{Status: statusSkipped, Reason: "missing"}, want: "skipped"},
-		{name: "failed", res: result{Status: statusFailed}, want: "failed"},
+		{name: "dry-run", res: result{Status: agents.StatusUpdated, Reason: "dry-run"}, want: "dry-run"},
+		{name: "updated", res: result{Status: agents.StatusUpdated}, want: "updated"},
+		{name: "unchanged", res: result{Status: agents.StatusUnchanged}, want: "unchanged"},
+		{name: "skipped", res: result{Status: agents.StatusSkipped, Reason: "missing"}, want: "skipped"},
+		{name: "failed", res: result{Status: agents.StatusFailed}, want: "failed"},
 		{name: "empty", res: result{}, want: "unknown"},
 	}
 	for _, tt := range tests {
@@ -709,7 +709,7 @@ func TestRunAllWithEventsBatchesNodeUpdates(t *testing.T) {
 		t.Fatalf("batch call = %q", calls)
 	}
 	for _, res := range results {
-		if res.Status != statusUnchanged {
+		if res.Status != agents.StatusUnchanged {
 			t.Fatalf("%s status = %q, want unchanged", res.Agent.Name, res.Status)
 		}
 	}
@@ -766,7 +766,7 @@ func TestRunAllWithEventsCanceledKeepsPerAgentResults(t *testing.T) {
 		t.Fatalf("results collapsed: [0]=%q [1]=%q", results[0].Agent.Name, results[1].Agent.Name)
 	}
 	for _, res := range results {
-		if res.Status != statusSkipped {
+		if res.Status != agents.StatusSkipped {
 			t.Fatalf("%s status = %q, want skipped", res.Agent.Name, res.Status)
 		}
 	}
@@ -794,7 +794,7 @@ func TestRunAllWithEventsBatchFailureFallsBackPerPackage(t *testing.T) {
 	}
 	// Both fell back to a successful single update -> not failed.
 	for _, res := range results {
-		if res.Status == statusFailed {
+		if res.Status == agents.StatusFailed {
 			t.Fatalf("%s unexpectedly failed after fallback", res.Agent.Name)
 		}
 	}
@@ -929,14 +929,14 @@ func TestClassifyUpdateFailure(t *testing.T) {
 			name:       "quota",
 			args:       []string{"gemini", "--version"},
 			output:     "TerminalQuotaError: You have exhausted your capacity on this model.",
-			wantReason: reasonQuota,
+			wantReason: agents.ReasonQuota,
 			wantHint:   "quota exceeded",
 		},
 		{
 			name:       "npm_enotempty",
 			args:       []string{"npm", "install", "-g", "pkg"},
 			output:     "npm error ENOTEMPTY: directory not empty",
-			wantReason: reasonNpmNotEmpty,
+			wantReason: agents.ReasonNpmNotEmpty,
 			wantHint:   "npm rename failed",
 		},
 		{
@@ -1292,7 +1292,7 @@ func TestRunAllSkipsNodeUpdateWhenAtLatest(t *testing.T) {
 	if calls := recordedCalls(t, record); calls != "" {
 		t.Fatalf("update must be skipped when installed == latest; npm calls = %q", calls)
 	}
-	if results[0].Status != statusUnchanged {
+	if results[0].Status != agents.StatusUnchanged {
 		t.Fatalf("status = %q, want unchanged", results[0].Status)
 	}
 	if !strings.Contains(results[0].Explain, "already at latest") {
