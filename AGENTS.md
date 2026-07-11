@@ -33,5 +33,5 @@
 
 ## Release & Distribution Notes
 - Releases are tagged (e.g., `v0.2.0`) and built via GoReleaser.
-- Homebrew tap repo: `chhoumann/homebrew-tap`; formula updates are handled by CI.
+- Homebrew tap repo: `chhoumann/homebrew-tap`; cask updates (`Casks/uca.rb`) are handled by CI.
 - When changing CLI behavior, update `README.md` examples and any release notes.

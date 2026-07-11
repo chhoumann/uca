@@ -26,14 +26,21 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
-brews:
+# Homebrew distribution is a cask (the formula-based `brews` section is
+# deprecated since GoReleaser v2.10). The binaries are unsigned, so the
+# post-install hook strips the Gatekeeper quarantine bit on macOS; without it
+# the installed binary dies with "uca is damaged and cannot be opened".
+homebrew_casks:
   - name: uca
     homepage: "https://github.com/chhoumann/uca"
     description: "Update multiple coding-agent CLIs with one command"
-    license: "MIT"
     repository:
       owner: chhoumann
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    install: |
-      bin.install "uca"
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/uca"]
+          end
