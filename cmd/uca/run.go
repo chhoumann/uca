@@ -13,7 +13,7 @@ import (
 	"github.com/chhoumann/uca/internal/agents"
 	"github.com/chhoumann/uca/internal/agentspec"
 	"github.com/chhoumann/uca/internal/detect"
-	runner "github.com/chhoumann/uca/internal/exec"
+	"github.com/chhoumann/uca/internal/runner"
 	"github.com/chhoumann/uca/internal/ui"
 	"github.com/chhoumann/uca/internal/vercache"
 	"github.com/chhoumann/uca/internal/version"
@@ -208,7 +208,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 				pkg:             resolved.Pkg,
 				updateCmdSingle: resolved.Cmd,
 			}
-			if agentspec.IsNodeKind(resolved.Method) {
+			if agents.IsNodeKind(resolved.Method) {
 				work.nodePackageName = agentspec.NodePackageName(agent.Strategies)
 				work.nodePackageVersion = resolved.Version
 			}
@@ -228,24 +228,18 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 					latest := make(chan string, 1)
 					work.previewLatest = latest
 					go func(work agentWork) {
-						if agentspec.IsNodeKind(work.method) {
+						if agents.IsNodeKind(work.method) {
 							latest <- env.NodeLatestVersion(previewCtx, work.method, work.nodePackageName)
 							return
 						}
 						latest <- ""
 					}(work)
 				}
-				if earlyDispatch && !agentspec.IsNodeKind(work.method) {
+				if earlyDispatch && !agents.IsNodeKind(work.method) {
 					work.updateCmd = work.updateCmdSingle
 					work.dispatched = true
 					if events != nil {
-						res := result{
-							Agent:     work.agent,
-							Method:    work.method,
-							Explain:   work.explain,
-							UpdateCmd: cmdString(work.updateCmd),
-						}
-						events <- updateEvent{Index: work.index, Phase: agents.PhaseDetect, Result: res, Time: time.Now(), Show: work.show}
+						events <- updateEvent{Index: work.index, Phase: agents.PhaseDetect, Result: work.baseResult(), Time: time.Now(), Show: work.show}
 					}
 					works[i] = work
 					taskCh <- updateTask{kind: work.method, cmd: work.updateCmd, agents: []agentWork{work}}
@@ -266,7 +260,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 		if work.updateCmdSingle == nil || work.dispatched {
 			continue
 		}
-		if agentspec.IsNodeKind(work.method) {
+		if agents.IsNodeKind(work.method) {
 			nodeGroups[work.method] = append(nodeGroups[work.method], i)
 			continue
 		}
@@ -312,35 +306,11 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 		return dryRunResults(works, results, events, now)
 	}
 
-	for _, work := range works {
-		if work.dispatched {
+	for i := range works {
+		if works[i].dispatched {
 			continue // detect event already emitted during resolution
 		}
-		res := result{
-			Agent:     work.agent,
-			Method:    work.method,
-			Explain:   work.explain,
-			UpdateCmd: cmdString(work.updateCmd),
-		}
-
-		if work.updateCmdSingle == nil {
-			res.Status = agents.StatusSkipped
-			if work.reason == "" {
-				res.Reason = agents.ReasonMissing
-			} else {
-				res.Reason = work.reason
-			}
-			results[work.index] = res
-			if events != nil {
-				events <- updateEvent{Index: work.index, Phase: agents.PhaseDetect, Result: res, Time: now, Show: work.show}
-				events <- updateEvent{Index: work.index, Phase: agents.PhaseFinish, Result: res, Time: now, Show: work.show}
-			}
-			continue
-		}
-
-		if events != nil {
-			events <- updateEvent{Index: work.index, Phase: agents.PhaseDetect, Result: res, Time: now, Show: work.show}
-		}
+		emitResolved(&works[i], results, events, now)
 	}
 
 	for _, task := range tasks {
@@ -360,42 +330,15 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 func dryRunResults(works []agentWork, results []result, events chan<- updateEvent, now time.Time) []result {
 	updatable := make([]*agentWork, 0, len(works))
 	for i := range works {
-		work := &works[i]
-		res := result{
-			Agent:     work.agent,
-			Method:    work.method,
-			Explain:   work.explain,
-			UpdateCmd: cmdString(work.updateCmd),
+		if emitResolved(&works[i], results, events, now) {
+			updatable = append(updatable, &works[i])
 		}
-		if work.updateCmdSingle == nil {
-			res.Status = agents.StatusSkipped
-			if work.reason == "" {
-				res.Reason = agents.ReasonMissing
-			} else {
-				res.Reason = work.reason
-			}
-			results[work.index] = res
-			if events != nil {
-				events <- updateEvent{Index: work.index, Phase: agents.PhaseDetect, Result: res, Time: now, Show: work.show}
-				events <- updateEvent{Index: work.index, Phase: agents.PhaseFinish, Result: res, Time: now, Show: work.show}
-			}
-			continue
-		}
-		if events != nil {
-			events <- updateEvent{Index: work.index, Phase: agents.PhaseDetect, Result: res, Time: now, Show: work.show}
-		}
-		updatable = append(updatable, work)
 	}
 
 	for _, work := range updatable {
-		res := result{
-			Agent:     work.agent,
-			Method:    work.method,
-			Explain:   work.explain,
-			UpdateCmd: cmdString(work.updateCmd),
-			Status:    agents.StatusUpdated,
-			Reason:    "dry-run",
-		}
+		res := work.baseResult()
+		res.Status = agents.StatusUpdated
+		res.Reason = agents.ReasonDryRun
 		res.Before = "unknown"
 		if work.beforeVersion != nil {
 			res.Before = <-work.beforeVersion
@@ -418,6 +361,40 @@ func dryRunResults(works []agentWork, results []result, events chan<- updateEven
 	return results
 }
 
+// baseResult seeds a result with the fields known at resolve time.
+func (w *agentWork) baseResult() result {
+	return result{
+		Agent:     w.agent,
+		Method:    w.method,
+		Explain:   w.explain,
+		UpdateCmd: cmdString(w.updateCmd),
+	}
+}
+
+// emitResolved records a resolved agent's detect event, or its full skipped
+// result (detect+finish) when it has no update command. Reports whether the
+// agent has an update to run.
+func emitResolved(work *agentWork, results []result, events chan<- updateEvent, now time.Time) bool {
+	res := work.baseResult()
+	if work.updateCmdSingle == nil {
+		res.Status = agents.StatusSkipped
+		res.Reason = work.reason
+		if res.Reason == "" {
+			res.Reason = agents.ReasonMissing
+		}
+		results[work.index] = res
+		if events != nil {
+			events <- updateEvent{Index: work.index, Phase: agents.PhaseDetect, Result: res, Time: now, Show: work.show}
+			events <- updateEvent{Index: work.index, Phase: agents.PhaseFinish, Result: res, Time: now, Show: work.show}
+		}
+		return false
+	}
+	if events != nil {
+		events <- updateEvent{Index: work.index, Phase: agents.PhaseDetect, Result: res, Time: now, Show: work.show}
+	}
+	return true
+}
+
 func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options, locker *managerLocker, events chan<- updateEvent, results []result) {
 	if len(task.agents) == 0 {
 		return
@@ -434,19 +411,14 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 	// launched during resolution (see beforeVersion); collect them here.
 	prepared := make([]result, len(task.agents))
 	for i, work := range task.agents {
-		prepared[i] = result{
-			Agent:     work.agent,
-			Method:    work.method,
-			Explain:   work.explain,
-			UpdateCmd: cmdString(work.updateCmd),
-		}
+		prepared[i] = work.baseResult()
 		if work.beforeVersion != nil {
 			prepared[i].Before = <-work.beforeVersion
 		} else {
 			prepared[i].Before = getVersion(ctx, work.agent, env, work.method, work.versionCmd)
 		}
 	}
-	if events != nil && agentspec.IsNodeKind(kind) {
+	if events != nil && agents.IsNodeKind(kind) {
 		// Best-effort latest version preview. Keep it short so we don't delay updates on bad networks.
 		previewCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		var wg sync.WaitGroup
@@ -503,7 +475,7 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 
 	// If a batched node update fails, fall back to per-package updates so we can still make progress and
 	// attribute failures precisely.
-	if exitCode != 0 && len(task.agents) > 1 && agentspec.IsNodeKind(kind) {
+	if exitCode != 0 && len(task.agents) > 1 && agents.IsNodeKind(kind) {
 		for i, work := range task.agents {
 			res := prepared[i]
 			res.Explain = appendHint(res.Explain, "batch update failed; retrying individually")
@@ -577,7 +549,7 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 func taskUpToDate(ctx context.Context, task updateTask, env *detect.Env) bool {
 	for _, work := range task.agents {
 		switch {
-		case agentspec.IsNodeKind(work.method):
+		case agents.IsNodeKind(work.method):
 			installed := env.NodeInstalledVersion(work.method, work.nodePackageName)
 			if installed == "" {
 				return false

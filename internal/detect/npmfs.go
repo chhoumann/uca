@@ -2,7 +2,7 @@ package detect
 
 import (
 	"os"
-	exec "os/exec"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"

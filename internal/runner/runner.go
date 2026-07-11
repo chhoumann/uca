@@ -1,9 +1,9 @@
-// Package exec runs external commands with consistent timeout, cancellation, and
+// Package runner runs external commands with consistent timeout, cancellation, and
 // process-group handling. Run captures combined stdout+stderr; RunStdout captures
 // stdout only (detection parsers depend on a banner-free stdout). On
 // timeout/cancellation the whole process group is killed (see proc_unix.go) and
 // the result is classified as ExitCodeTimeout/ExitCodeCanceled.
-package exec
+package runner
 
 import (
 	"bytes"

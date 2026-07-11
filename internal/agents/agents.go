@@ -33,7 +33,6 @@ const (
 	StatusUnchanged = "unchanged"
 	StatusSkipped   = "skipped"
 	StatusFailed    = "failed"
-	StatusDryRun    = "dry-run"
 )
 
 // Skip/failure reason vocabulary surfaced to the user.
@@ -71,6 +70,16 @@ const (
 func ValidKind(kind string) bool {
 	switch kind {
 	case KindNative, KindBun, KindBrew, KindNpm, KindPnpm, KindYarn, KindPip, KindUv, KindVSCode:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsNodeKind reports whether kind is a node package manager (npm/pnpm/yarn/bun).
+func IsNodeKind(kind string) bool {
+	switch kind {
+	case KindNpm, KindPnpm, KindYarn, KindBun:
 		return true
 	default:
 		return false

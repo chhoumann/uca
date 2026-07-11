@@ -62,10 +62,7 @@ func TestNodeBatchUpdateCommand(t *testing.T) {
 	}
 }
 
-func TestIsNodeKindAndShouldLock(t *testing.T) {
-	if !IsNodeKind(agents.KindNpm) || IsNodeKind(agents.KindNative) {
-		t.Fatal("IsNodeKind wrong")
-	}
+func TestShouldLockKind(t *testing.T) {
 	if !ShouldLockKind(agents.KindBrew) || ShouldLockKind(agents.KindNative) {
 		t.Fatal("ShouldLockKind wrong")
 	}

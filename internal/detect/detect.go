@@ -9,7 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	exec "os/exec"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/chhoumann/uca/internal/agents"
-	runner "github.com/chhoumann/uca/internal/exec"
+	"github.com/chhoumann/uca/internal/runner"
 	"github.com/chhoumann/uca/internal/version"
 )
 

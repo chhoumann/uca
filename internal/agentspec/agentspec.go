@@ -22,16 +22,6 @@ func ShouldLockKind(kind string) bool {
 	}
 }
 
-// IsNodeKind reports whether the kind is a node package manager (npm/pnpm/yarn/bun).
-func IsNodeKind(kind string) bool {
-	switch kind {
-	case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun:
-		return true
-	default:
-		return false
-	}
-}
-
 // VersionSpec returns the version selector for a package spec: a pinned version
 // when set, otherwise "latest" (forced to avoid getting stuck on old
 // minor/prerelease versions, common for 0.x CLIs).
@@ -92,11 +82,8 @@ func NodeBatchUpdateCommand(kind string, pkgs []string) []string {
 // NodePackageName returns the package name from an agent's first node strategy.
 func NodePackageName(strategies []agents.UpdateStrategy) string {
 	for _, strat := range strategies {
-		switch strat.Kind {
-		case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun:
-			if strat.Package != "" {
-				return strat.Package
-			}
+		if agents.IsNodeKind(strat.Kind) && strat.Package != "" {
+			return strat.Package
 		}
 	}
 	return ""

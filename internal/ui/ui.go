@@ -17,6 +17,11 @@ import (
 	"golang.org/x/term"
 )
 
+// statusDryRun is a presentation-only status derived from
+// (StatusUpdated, ReasonDryRun) for icon and color selection; the orchestrator
+// never emits it.
+const statusDryRun = "dry-run"
+
 // Row is one agent's line in the dashboard.
 type Row struct {
 	Name     string
@@ -383,7 +388,7 @@ func fitLine(line string, width int, unicode bool) string {
 func statusIcon(row Row, unicode bool) string {
 	status := row.Status
 	if status == agents.StatusUpdated && row.Reason == agents.ReasonDryRun {
-		status = agents.StatusDryRun
+		status = statusDryRun
 	}
 	if status == agents.StatusSkipped && row.Reason == agents.ReasonManualInstall {
 		if unicode {
@@ -419,7 +424,7 @@ func statusIcon(row Row, unicode bool) string {
 			return "–"
 		}
 		return "-"
-	case agents.StatusDryRun:
+	case statusDryRun:
 		if unicode {
 			return "≈"
 		}
@@ -473,7 +478,7 @@ func colorize(text, status string, enabled bool) string {
 		code = "31"
 	case agents.StatusSkipped:
 		code = "33"
-	case agents.StatusDryRun:
+	case statusDryRun:
 		code = "35"
 	}
 	if code == "" {

@@ -17,7 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	exec "os/exec"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"

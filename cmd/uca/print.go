@@ -143,7 +143,7 @@ type jsonReport struct {
 // for machine consumers (dry-run surfaces as its own status rather than
 // "updated" with reason "dry-run").
 func jsonStatus(res result) string {
-	if res.Status == agents.StatusUpdated && res.Reason == "dry-run" {
+	if res.Status == agents.StatusUpdated && res.Reason == agents.ReasonDryRun {
 		return "dry-run"
 	}
 	if res.Status == "" {

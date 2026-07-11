@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/chhoumann/uca/internal/agents"
-	runner "github.com/chhoumann/uca/internal/exec"
+	"github.com/chhoumann/uca/internal/runner"
 )
 
 func setFailureResult(res *result, exitCode int, updateCmd []string, output string, timeout time.Duration) {
