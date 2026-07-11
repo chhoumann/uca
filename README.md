@@ -39,11 +39,12 @@ Options:
 `agent` is accepted as an alias for `cursor` in `--only` and `--skip`.
 
 When uca can prove an agent is already at the latest version from the package
-manager's own metadata (global `package.json` vs the npm registry, brew Cellar
-vs the tap formula, VS Code's extensions manifest vs the Marketplace), it skips
-that agent's update command and reports it unchanged. Use `--force` to run the
-update commands anyway. Native updaters (like `claude update`) always run,
-since only they know their latest version.
+manager's own metadata (global `package.json` vs the npm registry, VS Code's
+extensions manifest vs the Marketplace), it skips that agent's update command
+and reports it unchanged. Use `--force` to run the update commands anyway.
+Brew agents and native updaters (like `claude update`) always run: a local tap
+clone is only as fresh as the last `brew update`, and only a native updater
+knows its own latest version.
 
 ## Examples
 

@@ -184,9 +184,16 @@ func Default() []Agent {
 			Binary:     "omp",
 			VersionCmd: []string{"omp", "--version"},
 			Strategies: []UpdateStrategy{
+				// Native first: `omp update` checks the npm registry for latest,
+				// detects the installer that owns the active executable, and for a
+				// brew-owned binary runs `brew update` before `brew upgrade` - so
+				// it sees a just-published release immediately, while a plain
+				// `brew upgrade` only refreshes taps per Homebrew's periodic
+				// auto-update policy. Brew/bun remain as fallbacks for a missing
+				// binary.
+				{Kind: KindNative, Command: []string{"omp", "update"}},
 				{Kind: KindBrew, Package: "omp"},
 				{Kind: KindBun, Package: "@oh-my-pi/pi-coding-agent"},
-				{Kind: KindNative, Command: []string{"omp", "update"}},
 			},
 		},
 		{

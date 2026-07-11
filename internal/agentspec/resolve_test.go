@@ -139,6 +139,31 @@ func TestResolveBrew(t *testing.T) {
 	}
 }
 
+// omp's own updater is installer-aware (for a brew-owned binary it runs
+// `brew update` before `brew upgrade`), so it must win over the brew/bun
+// strategies whenever the binary exists: a plain `brew upgrade` only refreshes
+// taps per Homebrew's periodic auto-update policy, while `omp update` sees a
+// just-published release immediately.
+func TestResolveOmpPrefersNativeOverBrew(t *testing.T) {
+	env := fakeEnv{
+		bins:    map[string]bool{"omp": true},
+		brew:    true,
+		brewSet: map[string]bool{"omp": true},
+	}
+	r := Resolve(agentByName(t, "omp"), env)
+	if !reflect.DeepEqual(r.Cmd, []string{"omp", "update"}) || r.Method != agents.KindNative {
+		t.Fatalf("omp resolve = %#v method %q, want native omp update", r.Cmd, r.Method)
+	}
+}
+
+func TestResolveOmpFallsBackToBrewWithoutBinary(t *testing.T) {
+	env := fakeEnv{brew: true, brewSet: map[string]bool{"omp": true}}
+	r := Resolve(agentByName(t, "omp"), env)
+	if !reflect.DeepEqual(r.Cmd, []string{"brew", "upgrade", "omp"}) || r.Method != agents.KindBrew {
+		t.Fatalf("omp resolve = %#v method %q, want brew fallback", r.Cmd, r.Method)
+	}
+}
+
 func TestResolvePip(t *testing.T) {
 	env := fakeEnv{python: true, pipSet: map[string]bool{"aider-chat": true}}
 	r := Resolve(agentByName(t, "aider"), env)

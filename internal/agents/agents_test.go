@@ -111,9 +111,9 @@ func TestDefaultIncludesOmpFromOhMyPi(t *testing.T) {
 	}
 
 	wantStrategies := []UpdateStrategy{
+		{Kind: KindNative, Command: []string{"omp", "update"}},
 		{Kind: KindBrew, Package: "omp"},
 		{Kind: KindBun, Package: "@oh-my-pi/pi-coding-agent"},
-		{Kind: KindNative, Command: []string{"omp", "update"}},
 	}
 	if len(got.Strategies) != len(wantStrategies) {
 		t.Fatalf("omp has %d strategies, want %d: %#v", len(got.Strategies), len(wantStrategies), got.Strategies)

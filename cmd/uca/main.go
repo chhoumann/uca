@@ -1135,11 +1135,13 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 
 // taskUpToDate reports whether every agent in the task is provably already at
 // its target version, using only exact metadata: the manager's own installed
-// records (global package.json, brew Cellar, extensions manifest) against an
-// authoritative latest (npm registry, tap formula literal, marketplace). Any
-// gap in either side fails open (run the update command). pnpm/yarn global
-// package dirs are not confidently derivable, and native/pip/uv have no cheap
-// authoritative latest, so those always run.
+// records (global package.json, extensions manifest) against an authoritative
+// latest (npm registry, marketplace). Any gap in either side fails open (run
+// the update command). pnpm/yarn global package dirs are not confidently
+// derivable; native/pip/uv have no cheap authoritative latest; and brew's
+// locally-cloned tap formula has no freshness guarantee (only `brew update`,
+// which `brew upgrade` runs implicitly, refreshes it - so skipping the upgrade
+// on tap data would keep the tap stale forever). Those always run.
 func taskUpToDate(ctx context.Context, task updateTask, env *detect.Env) bool {
 	for _, work := range task.agents {
 		switch {
@@ -1164,12 +1166,6 @@ func taskUpToDate(ctx context.Context, task updateTask, env *detect.Env) bool {
 				latest = env.NodeLatestVersion(ctx, work.method, work.nodePackageName)
 			}
 			if compareVersions(installed, latest) != checkUpToDate {
-				return false
-			}
-		case work.method == agents.KindBrew:
-			installed := env.BrewInstalledVersion(work.pkg)
-			latest := env.BrewTapLatest(work.pkg)
-			if installed == "" || compareVersions(installed, latest) != checkUpToDate {
 				return false
 			}
 		case work.method == agents.KindVSCode:
