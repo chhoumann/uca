@@ -112,7 +112,8 @@ func main() {
 	env := detect.New(ctx)
 	// Kick off the detection loaders the selected agents can need (they run
 	// concurrently and dedupe with on-demand callers). Without this, the resolver
-	// goroutines all walk the managers in the same order and the sync.Once loaders
+	// goroutines all walk the managers in the same order and the once-guarded
+	// lazy loaders
 	// end up executing one after another - detection takes the serial sum of all
 	// manager probes instead of the slowest single one.
 	env.Prewarm(prewarmNeeds(selected))
@@ -201,6 +202,15 @@ func parseFlags(args []string) (options, error) {
 	fs.BoolVar(&opts.Help, "help", false, "show help")
 	fs.BoolVar(&opts.Version, "version", false, "show version")
 	if err := fs.Parse(args); err != nil {
+		return opts, err
+	}
+	if fs.NArg() > 0 {
+		// flag.Parse stops at the first positional, so anything after it
+		// (including flags) would be silently dropped and the run would proceed
+		// with defaults. Fail loudly instead.
+		err := fmt.Errorf("unexpected argument %q (select agents with --only/--skip)", fs.Arg(0))
+		fmt.Fprintf(os.Stderr, "uca: %v\n", err)
+		usageTo(os.Stderr)
 		return opts, err
 	}
 	applyEnvDefaults(&opts, fs)

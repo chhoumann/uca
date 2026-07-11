@@ -17,10 +17,13 @@ import (
 	"golang.org/x/term"
 )
 
-// statusDryRun is a presentation-only status derived from
-// (StatusUpdated, ReasonDryRun) for icon and color selection; the orchestrator
-// never emits it.
-const statusDryRun = "dry-run"
+// statusDryRun and statusManual are presentation-only statuses derived from
+// (StatusUpdated, ReasonDryRun) and (StatusSkipped, ReasonManualInstall) for
+// label, icon, and color selection; the orchestrator never emits them.
+const (
+	statusDryRun = "dry-run"
+	statusManual = "manual"
+)
 
 // Row is one agent's line in the dashboard.
 type Row struct {
@@ -33,7 +36,6 @@ type Row struct {
 	Start    time.Time
 	Duration time.Duration
 	Visible  bool
-	Detected bool
 }
 
 // Event is a flat update-lifecycle event the dashboard consumes. The caller
@@ -55,7 +57,7 @@ type Event struct {
 // occupied so it can redraw in place.
 type Renderer struct {
 	Out        *os.File
-	LastLines  int
+	lastLines  int
 	UseColor   bool
 	UseUnicode bool
 	Width      int
@@ -73,12 +75,12 @@ func NewRenderer(out *os.File) *Renderer {
 
 // Draw redraws the frame in place over the previous one.
 func (r *Renderer) Draw(content string) {
-	if r.LastLines > 0 {
-		fmt.Fprintf(r.Out, "\x1b[%dA", r.LastLines)
+	if r.lastLines > 0 {
+		fmt.Fprintf(r.Out, "\x1b[%dA", r.lastLines)
 	}
 	fmt.Fprint(r.Out, "\x1b[0G\x1b[0J")
 	fmt.Fprint(r.Out, content)
-	r.LastLines = countLines(content)
+	r.lastLines = countLines(content)
 }
 
 func countLines(s string) int {
@@ -92,16 +94,17 @@ func countLines(s string) int {
 	return lines
 }
 
-// HideCursor / ShowCursor toggle the terminal cursor around a live render.
-func HideCursor(out *os.File) {
-	if out != nil {
-		fmt.Fprint(out, "\x1b[?25l")
+// HideCursor hides the terminal cursor for the duration of a live render.
+func (r *Renderer) HideCursor() {
+	if r.Out != nil {
+		fmt.Fprint(r.Out, "\x1b[?25l")
 	}
 }
 
-func ShowCursor(out *os.File) {
-	if out != nil {
-		fmt.Fprint(out, "\x1b[?25h")
+// ShowCursor restores the terminal cursor after a live render.
+func (r *Renderer) ShowCursor() {
+	if r.Out != nil {
+		fmt.Fprint(r.Out, "\x1b[?25h")
 	}
 }
 
@@ -117,7 +120,17 @@ func shouldUseColor() bool {
 }
 
 func shouldUseUnicode() bool {
-	locale := strings.ToUpper(os.Getenv("LC_ALL") + os.Getenv("LC_CTYPE") + os.Getenv("LANG"))
+	// POSIX precedence: LC_ALL overrides LC_CTYPE, which overrides LANG. The
+	// first non-empty variable decides; concatenating them would let a UTF-8
+	// LANG leak past LC_ALL=C.
+	locale := os.Getenv("LC_ALL")
+	if locale == "" {
+		locale = os.Getenv("LC_CTYPE")
+	}
+	if locale == "" {
+		locale = os.Getenv("LANG")
+	}
+	locale = strings.ToUpper(locale)
 	// Match both the macOS canonical form (en_US.UTF-8) and the glibc/Linux
 	// canonical lowercase form (en_US.utf8) so Linux UTF-8 terminals still get
 	// the unicode glyphs.
@@ -183,7 +196,6 @@ func (r *Renderer) RenderFrame(rows []Row, nameWidth int, start time.Time, expla
 }
 
 func (r *Renderer) renderDashboard(rows []Row, nameWidth int, start time.Time, explain bool, detected, total int) string {
-	visibleTotal := 0
 	completed := 0
 	updated := 0
 	unchanged := 0
@@ -194,7 +206,6 @@ func (r *Renderer) renderDashboard(rows []Row, nameWidth int, start time.Time, e
 			continue
 		}
 		visibleRows = append(visibleRows, row)
-		visibleTotal++
 		if row.Status == agents.StatusUpdated || row.Status == agents.StatusUnchanged || row.Status == agents.StatusSkipped || row.Status == agents.StatusFailed {
 			completed++
 		}
@@ -207,24 +218,24 @@ func (r *Renderer) renderDashboard(rows []Row, nameWidth int, start time.Time, e
 			failed++
 		}
 	}
-	header := fmt.Sprintf("uca  %s  %d/%d  ok:%d same:%d fail:%d  %s", spinnerGlyph(time.Since(start), r.UseUnicode), completed, visibleTotal, updated, unchanged, failed, fmtElapsed(time.Since(start)))
+	header := fmt.Sprintf("uca  %s  %d/%d  ok:%d same:%d fail:%d  %s", spinnerGlyph(time.Since(start), r.UseUnicode), completed, len(visibleRows), updated, unchanged, failed, fmtElapsed(time.Since(start)))
 	// Only advertise detection progress while it is genuinely ongoing. Once any
 	// row has finished, a lingering "detecting" suffix is misleading (this shows
 	// up in dry-run, where detect and finish events are emitted back-to-back).
 	if detected < total && completed == 0 {
 		header = fmt.Sprintf("%s  detecting %d/%d", header, detected, total)
 	}
-	lines := make([]string, 0, visibleTotal+2)
-	lines = append(lines, fitLine(header, r.Width, r.UseUnicode), "")
+	lines := make([]string, 0, len(visibleRows)+2)
+	lines = append(lines, r.fitLine(header), "")
 	for _, row := range visibleRows {
-		lines = append(lines, formatRow(row, nameWidth, explain, r))
+		lines = append(lines, r.formatRow(row, nameWidth, explain))
 	}
 	return strings.Join(lines, "\n") + "\n"
 }
 
 func (r *Renderer) renderBoot(start time.Time, detected, total int) string {
 	header := fmt.Sprintf("uca  %s  detecting %d/%d  %s", spinnerGlyph(time.Since(start), r.UseUnicode), detected, total, fmtElapsed(time.Since(start)))
-	return fitLine(header, r.Width, r.UseUnicode) + "\n"
+	return r.fitLine(header) + "\n"
 }
 
 func spinnerGlyph(elapsed time.Duration, unicode bool) string {
@@ -236,50 +247,57 @@ func spinnerGlyph(elapsed time.Duration, unicode bool) string {
 	return frames[index]
 }
 
-func formatRow(row Row, nameWidth int, explain bool, r *Renderer) string {
-	statusLabel := statusLabelFor(row)
-	iconPlain := statusIcon(row, r.UseUnicode)
-	iconColored := colorize(iconPlain, statusLabel, r.UseColor)
-
-	// Gate the version separators on the locale like every other glyph, so a
-	// non-UTF-8 terminal does not get a stray unicode arrow/ellipsis.
-	arrow := "->"
-	ellipsis := "..."
+// arrow and ellipsis pick the separator glyphs for the renderer's charset, so
+// a non-UTF-8 terminal never gets a stray unicode glyph.
+func (r *Renderer) arrow() string {
 	if r.UseUnicode {
-		arrow = "→"
-		ellipsis = "…"
+		return "→"
 	}
+	return "->"
+}
+
+func (r *Renderer) ellipsis() string {
+	if r.UseUnicode {
+		return "…"
+	}
+	return "..."
+}
+
+// versionTransition renders the "before -> after" version column.
+func (r *Renderer) versionTransition(before, after string) string {
+	return fmt.Sprintf("%s %s %s", safeVersion(before), r.arrow(), safeVersion(after))
+}
+
+func (r *Renderer) formatRow(row Row, nameWidth int, explain bool) string {
+	status := displayStatus(row)
+	label := statusLabel(status)
+	iconPlain := statusIcon(status, row.Start, r.UseUnicode)
+	iconColored := colorize(iconPlain, status, r.UseColor)
 
 	version := "--"
 	elapsed := "--"
 	info := ""
-	switch row.Status {
-	case agents.StatusPending:
-		statusLabel = statusLabelFor(row)
+	switch status {
 	case agents.StatusUpdating:
-		statusLabel = statusLabelFor(row)
 		if strings.TrimSpace(row.After) != "" {
-			version = fmt.Sprintf("%s %s %s", safeVersion(row.Before), arrow, safeVersion(row.After))
+			version = r.versionTransition(row.Before, row.After)
 		} else {
-			version = fmt.Sprintf("%s %s %s", safeVersion(row.Before), arrow, ellipsis)
+			version = fmt.Sprintf("%s %s %s", safeVersion(row.Before), r.arrow(), r.ellipsis())
 		}
 		if !row.Start.IsZero() {
 			elapsed = fmtElapsed(time.Since(row.Start))
 		}
-	case agents.StatusUpdated:
-		version = fmt.Sprintf("%s %s %s", safeVersion(row.Before), arrow, safeVersion(row.After))
-		elapsed = fmtElapsed(row.Duration)
-	case agents.StatusUnchanged:
-		version = fmt.Sprintf("%s %s %s", safeVersion(row.Before), arrow, safeVersion(row.After))
+	case agents.StatusUpdated, agents.StatusUnchanged, statusDryRun:
+		version = r.versionTransition(row.Before, row.After)
 		elapsed = fmtElapsed(row.Duration)
 	case agents.StatusFailed:
-		version = fmt.Sprintf("%s %s %s", safeVersion(row.Before), arrow, safeVersion(row.After))
+		version = r.versionTransition(row.Before, row.After)
 		elapsed = fmtElapsed(row.Duration)
 		if row.Reason != "" {
 			info = row.Reason
 		}
 	case agents.StatusSkipped:
-		if row.Reason != "" && row.Reason != agents.ReasonManualInstall {
+		if row.Reason != "" {
 			info = row.Reason
 		}
 	}
@@ -288,7 +306,7 @@ func formatRow(row Row, nameWidth int, explain bool, r *Renderer) string {
 		info = MethodLabel(row.Method)
 	}
 
-	if statusLabel == "dry-run" {
+	if status == statusDryRun {
 		info = "preview"
 	}
 
@@ -296,8 +314,8 @@ func formatRow(row Row, nameWidth int, explain bool, r *Renderer) string {
 		info = " (" + info + ")"
 	}
 
-	line := fmt.Sprintf("%-*s %s %-9s %s %6s%s", nameWidth, row.Name, iconPlain, statusLabel, version, elapsed, info)
-	line = fitLine(line, r.Width, r.UseUnicode)
+	line := fmt.Sprintf("%-*s %s %-9s %s %6s%s", nameWidth, row.Name, iconPlain, label, version, elapsed, info)
+	line = r.fitLine(line)
 	if iconPlain != iconColored {
 		line = recolorIcon(line, nameWidth, iconPlain, iconColored)
 	}
@@ -318,17 +336,25 @@ func recolorIcon(line string, nameWidth int, iconPlain, iconColored string) stri
 	return strings.Replace(line, iconPlain, iconColored, 1)
 }
 
-func statusLabelFor(row Row) string {
+// displayStatus derives the one semantic status a row is presented as:
+// updated+dry-run renders as dry-run, skipped+manual-install as manual. Label,
+// icon, and color all key on this value so they cannot drift apart.
+func displayStatus(row Row) string {
 	if row.Status == agents.StatusUpdated && row.Reason == agents.ReasonDryRun {
-		return "dry-run"
-	}
-	if row.Status == agents.StatusUnchanged {
-		return "same"
+		return statusDryRun
 	}
 	if row.Status == agents.StatusSkipped && row.Reason == agents.ReasonManualInstall {
-		return "manual"
+		return statusManual
 	}
 	return row.Status
+}
+
+// statusLabel maps a display status to the text shown in the status column.
+func statusLabel(status string) string {
+	if status == agents.StatusUnchanged {
+		return "same"
+	}
+	return status
 }
 
 func fmtElapsed(d time.Duration) string {
@@ -349,53 +375,44 @@ func fmtElapsed(d time.Duration) string {
 	return fmt.Sprintf("%dh%02dm", hours, mins)
 }
 
-func fitLine(line string, width int, unicode bool) string {
+// fitLine truncates the line to the renderer's width (ending in an ellipsis)
+// or pads it with spaces to exactly that width.
+func (r *Renderer) fitLine(line string) string {
+	width := r.Width
 	if width <= 0 {
 		return line
 	}
 	line = strings.TrimRight(line, "\n")
-	if runewidth.StringWidth(line) == width {
-		return line
-	}
-	if runewidth.StringWidth(line) > width {
-		ellipsis := "..."
-		if unicode {
-			ellipsis = "…"
-		}
-		target := width - runewidth.StringWidth(ellipsis)
+	w := runewidth.StringWidth(line)
+	if w > width {
+		ellipsis := r.ellipsis()
+		ellipsisWidth := runewidth.StringWidth(ellipsis)
+		target := width - ellipsisWidth
 		if target < 0 {
 			target = 0
 		}
 		var b strings.Builder
 		current := 0
-		for _, r := range line {
-			rw := runewidth.RuneWidth(r)
-			if current+rw > target {
+		for _, c := range line {
+			cw := runewidth.RuneWidth(c)
+			if current+cw > target {
 				break
 			}
-			b.WriteRune(r)
-			current += rw
+			b.WriteRune(c)
+			current += cw
 		}
 		line = b.String() + ellipsis
+		w = current + ellipsisWidth
 	}
-	pad := width - runewidth.StringWidth(line)
-	if pad > 0 {
+	if pad := width - w; pad > 0 {
 		line += strings.Repeat(" ", pad)
 	}
 	return line
 }
 
-func statusIcon(row Row, unicode bool) string {
-	status := row.Status
-	if status == agents.StatusUpdated && row.Reason == agents.ReasonDryRun {
-		status = statusDryRun
-	}
-	if status == agents.StatusSkipped && row.Reason == agents.ReasonManualInstall {
-		if unicode {
-			return "○"
-		}
-		return "o"
-	}
+// statusIcon picks the icon glyph for a display status; start feeds the
+// updating spinner's animation phase.
+func statusIcon(status string, start time.Time, unicode bool) string {
 	switch status {
 	case agents.StatusPending:
 		if unicode {
@@ -403,7 +420,7 @@ func statusIcon(row Row, unicode bool) string {
 		}
 		return "."
 	case agents.StatusUpdating:
-		return spinnerGlyph(time.Since(row.Start), unicode)
+		return spinnerGlyph(time.Since(start), unicode)
 	case agents.StatusUpdated:
 		if unicode {
 			return "✓"
@@ -424,6 +441,11 @@ func statusIcon(row Row, unicode bool) string {
 			return "–"
 		}
 		return "-"
+	case statusManual:
+		if unicode {
+			return "○"
+		}
+		return "o"
 	case statusDryRun:
 		if unicode {
 			return "≈"
@@ -477,6 +499,8 @@ func colorize(text, status string, enabled bool) string {
 	case agents.StatusFailed:
 		code = "31"
 	case agents.StatusSkipped:
+		code = "33"
+	case statusManual:
 		code = "33"
 	case statusDryRun:
 		code = "35"

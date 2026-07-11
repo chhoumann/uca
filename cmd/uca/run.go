@@ -608,8 +608,9 @@ func runAllWithUI(ctx context.Context, selected []agents.Agent, env *detect.Env,
 
 	renderer := ui.NewRenderer(os.Stdout)
 	start := time.Now()
-	ui.HideCursor(renderer.Out)
+	renderer.HideCursor()
 	totalAgents := len(selected)
+	detected := make([]bool, len(selected))
 	detectedCount := 0
 	renderer.Draw(renderer.RenderFrame(rows, nameWidth, start, opts.Explain, detectedCount, totalAgents))
 
@@ -624,8 +625,8 @@ func runAllWithUI(ctx context.Context, selected []agents.Agent, env *detect.Env,
 					renderer.Draw(renderer.RenderFrame(rows, nameWidth, start, opts.Explain, detectedCount, totalAgents))
 					return
 				}
-				if ev.Phase == agents.PhaseDetect && !rows[ev.Index].Detected {
-					rows[ev.Index].Detected = true
+				if ev.Phase == agents.PhaseDetect && !detected[ev.Index] {
+					detected[ev.Index] = true
 					detectedCount++
 				}
 				ui.ApplyEvent(&rows[ev.Index], toUIEvent(ev))
@@ -639,7 +640,7 @@ func runAllWithUI(ctx context.Context, selected []agents.Agent, env *detect.Env,
 	results := runAllWithEvents(ctx, selected, env, opts, events)
 	close(events)
 	<-done
-	ui.ShowCursor(renderer.Out)
+	renderer.ShowCursor()
 	return results
 }
 

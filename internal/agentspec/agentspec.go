@@ -1,7 +1,8 @@
-// Package agentspec builds the concrete update commands for an agent's chosen
-// strategy. These are pure functions over the agent registry types; the resolver
-// that decides which strategy applies (given the environment) lives in cmd/uca
-// for now and calls into these builders.
+// Package agentspec resolves how to update an agent. Resolve walks an agent's
+// strategies in order, probing the environment through the Env interface
+// (satisfied structurally by *detect.Env), and returns the first applicable
+// update command. The command builders alongside it are pure functions over
+// the agent registry types.
 package agentspec
 
 import (
@@ -22,54 +23,50 @@ func ShouldLockKind(kind string) bool {
 	}
 }
 
-// VersionSpec returns the version selector for a package spec: a pinned version
+// versionSpec returns the version selector for a package spec: a pinned version
 // when set, otherwise "latest" (forced to avoid getting stuck on old
 // minor/prerelease versions, common for 0.x CLIs).
-func VersionSpec(v string) string {
+func versionSpec(v string) string {
 	if s := strings.TrimSpace(v); s != "" {
 		return s
 	}
 	return "latest"
 }
 
-// NodeUpdateCommand builds the single-package update command for a node strategy
+// nodeInstallArgv maps each node package manager to its global-install argv
+// prefix, shared by nodeUpdateCommand and NodeBatchUpdateCommand. npm uses
+// install because `npm update -g` does not accept `pkg@version` specs.
+var nodeInstallArgv = map[string][]string{
+	agents.KindNpm:  {"npm", "install", "-g"},
+	agents.KindPnpm: {"pnpm", "add", "-g"},
+	agents.KindYarn: {"yarn", "global", "add"},
+	agents.KindBun:  {"bun", "add", "-g"},
+}
+
+// nodeUpdateCommand builds the single-package update command for a node strategy
 // (honoring a pinned Version, else @latest).
-func NodeUpdateCommand(strat agents.UpdateStrategy) []string {
+func nodeUpdateCommand(strat agents.UpdateStrategy) []string {
 	if len(strat.Command) > 0 {
 		return strat.Command
 	}
-	spec := strat.Package + "@" + VersionSpec(strat.Version)
-	switch strat.Kind {
-	case agents.KindNpm:
-		// `npm update -g` does not accept `pkg@version` specs, so we use install.
-		return []string{"npm", "install", "-g", spec}
-	case agents.KindPnpm:
-		return []string{"pnpm", "add", "-g", spec}
-	case agents.KindYarn:
-		return []string{"yarn", "global", "add", spec}
-	case agents.KindBun:
-		return []string{"bun", "add", "-g", spec}
-	default:
-		return strat.Command
+	prefix, ok := nodeInstallArgv[strat.Kind]
+	if !ok {
+		return nil
 	}
+	cmd := make([]string, 0, len(prefix)+1)
+	cmd = append(cmd, prefix...)
+	return append(cmd, strat.Package+"@"+versionSpec(strat.Version))
 }
 
 // NodeBatchUpdateCommand builds one install command that updates several @latest
 // packages at once under a single manager.
 func NodeBatchUpdateCommand(kind string, pkgs []string) []string {
-	args := []string{}
-	switch kind {
-	case agents.KindNpm:
-		args = append(args, "npm", "install", "-g")
-	case agents.KindPnpm:
-		args = append(args, "pnpm", "add", "-g")
-	case agents.KindYarn:
-		args = append(args, "yarn", "global", "add")
-	case agents.KindBun:
-		args = append(args, "bun", "add", "-g")
-	default:
+	prefix, ok := nodeInstallArgv[kind]
+	if !ok {
 		return nil
 	}
+	args := make([]string, 0, len(prefix)+len(pkgs))
+	args = append(args, prefix...)
 	for _, pkg := range pkgs {
 		if strings.TrimSpace(pkg) == "" {
 			continue
@@ -119,7 +116,8 @@ type Resolved struct {
 	// Pkg is the package/formula identifier the update targets, used by --check to
 	// look up the latest version. Empty when latest is not knowable.
 	Pkg string
-	// Version is the pinned version for the resolved strategy (empty = @latest).
+	// Version is the pinned version for a resolved node strategy (empty means
+	// @latest). Only node kinds populate it; a uv pin is baked directly into Cmd.
 	Version string
 }
 
@@ -142,7 +140,6 @@ func nativeVersionCmd(agent agents.Agent, strat agents.UpdateStrategy) []string 
 // a reason it was skipped).
 func Resolve(agent agents.Agent, env Env) Resolved {
 	codeMissing := false
-	detail := ""
 	nativeIdentityMiss := ""
 	// The node-manager match is computed lazily on the first node strategy, so
 	// agents that resolve natively (or have no node strategies at all) never
@@ -175,11 +172,10 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 				nativeIdentityMiss = fmt.Sprintf("binary %s found but help text did not identify %s", binary, strat.HelpContains)
 				continue
 			}
-			detail = fmt.Sprintf("binary %s found; using built-in update", binary)
 			return Resolved{
 				Cmd:        strat.Command,
 				Method:     strat.Kind,
-				Detail:     detail,
+				Detail:     fmt.Sprintf("binary %s found; using built-in update", binary),
 				VersionCmd: nativeVersionCmd(agent, strat),
 			}
 		case agents.KindBun, agents.KindNpm, agents.KindPnpm, agents.KindYarn:
@@ -190,31 +186,30 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 				continue
 			}
 			resolveManagers()
-			if nodeManager != "" {
+			switch {
+			case nodeManager != "":
 				if nodeManager != strat.Kind {
 					continue
 				}
-				detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
-				return Resolved{Cmd: NodeUpdateCommand(strat), Method: strat.Kind, Detail: detail, Pkg: strat.Package, Version: strat.Version}
-			}
-			if packageManager != "" {
+			case packageManager != "":
 				if packageManager != strat.Kind {
 					continue
 				}
-				detail = fmt.Sprintf("%s global package %s installed; matched by package list; updating via %s", strat.Kind, strat.Package, strat.Kind)
-				return Resolved{Cmd: NodeUpdateCommand(strat), Method: strat.Kind, Detail: detail, Pkg: strat.Package, Version: strat.Version}
+				detail := fmt.Sprintf("%s global package %s installed; matched by package list; updating via %s", strat.Kind, strat.Package, strat.Kind)
+				return Resolved{Cmd: nodeUpdateCommand(strat), Method: strat.Kind, Detail: detail, Pkg: strat.Package, Version: strat.Version}
+			default:
+				if !env.NodeBinHasBinary(strat.Kind, agent.Binary) {
+					continue
+				}
 			}
-			if !env.NodeBinHasBinary(strat.Kind, agent.Binary) {
-				continue
-			}
-			detail = fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
-			return Resolved{Cmd: NodeUpdateCommand(strat), Method: strat.Kind, Detail: detail, Pkg: strat.Package, Version: strat.Version}
+			detail := fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
+			return Resolved{Cmd: nodeUpdateCommand(strat), Method: strat.Kind, Detail: detail, Pkg: strat.Package, Version: strat.Version}
 		case agents.KindBrew:
 			if !env.HasBrew() {
 				continue
 			}
 			if env.BrewHas(strat.Package) {
-				detail = fmt.Sprintf("brew formula %s installed", strat.Package)
+				detail := fmt.Sprintf("brew formula %s installed", strat.Package)
 				return Resolved{Cmd: []string{"brew", "upgrade", strat.Package}, Method: strat.Kind, Detail: detail, Pkg: strat.Package}
 			}
 		case agents.KindPip:
@@ -222,7 +217,7 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 				continue
 			}
 			if env.PipHas(strat.Package) {
-				detail = fmt.Sprintf("pip package %s installed", strat.Package)
+				detail := fmt.Sprintf("pip package %s installed", strat.Package)
 				return Resolved{Cmd: []string{"python3", "-m", "pip", "install", "-U", "--upgrade-strategy", "only-if-needed", strat.Package}, Method: strat.Kind, Detail: detail, Pkg: strat.Package}
 			}
 		case agents.KindUv:
@@ -230,8 +225,8 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 				continue
 			}
 			if env.UvHas(strat.Package) {
-				detail = fmt.Sprintf("uv tool %s installed", strat.Package)
-				return Resolved{Cmd: []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@" + VersionSpec(strat.Version)}, Method: strat.Kind, Detail: detail, Pkg: strat.Package}
+				detail := fmt.Sprintf("uv tool %s installed", strat.Package)
+				return Resolved{Cmd: []string{"uv", "tool", "install", "--force", "--python", "python3.12", "--with", "pip", strat.Package + "@" + versionSpec(strat.Version)}, Method: strat.Kind, Detail: detail, Pkg: strat.Package}
 			}
 		case agents.KindVSCode:
 			if env.CodeCmd() == "" {
@@ -239,7 +234,7 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 				continue
 			}
 			if env.VscodeHas(strat.ExtensionID) {
-				detail = fmt.Sprintf("VS Code extension %s installed (via %s)", strat.ExtensionID, env.CodeCmd())
+				detail := fmt.Sprintf("VS Code extension %s installed (via %s)", strat.ExtensionID, env.CodeCmd())
 				// Pkg carries the extension ID: the marketplace lookup key.
 				return Resolved{Cmd: []string{env.CodeCmd(), "--install-extension", strat.ExtensionID, "--force"}, Method: strat.Kind, Detail: detail, Pkg: strat.ExtensionID}
 			}

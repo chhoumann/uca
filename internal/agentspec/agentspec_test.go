@@ -8,14 +8,14 @@ import (
 )
 
 func TestNodeUpdateCommandPinnedVersion(t *testing.T) {
-	got := NodeUpdateCommand(agents.UpdateStrategy{Kind: agents.KindNpm, Package: "pkg", Version: "1.2.3"})
+	got := nodeUpdateCommand(agents.UpdateStrategy{Kind: agents.KindNpm, Package: "pkg", Version: "1.2.3"})
 	want := []string{"npm", "install", "-g", "pkg@1.2.3"}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("pinned NodeUpdateCommand = %#v, want %#v", got, want)
+		t.Fatalf("pinned nodeUpdateCommand = %#v, want %#v", got, want)
 	}
-	got = NodeUpdateCommand(agents.UpdateStrategy{Kind: agents.KindBun, Package: "pkg"})
+	got = nodeUpdateCommand(agents.UpdateStrategy{Kind: agents.KindBun, Package: "pkg"})
 	if !reflect.DeepEqual(got, []string{"bun", "add", "-g", "pkg@latest"}) {
-		t.Fatalf("unpinned NodeUpdateCommand = %#v", got)
+		t.Fatalf("unpinned nodeUpdateCommand = %#v", got)
 	}
 }
 
@@ -32,8 +32,8 @@ func TestNodeUpdateCommandUsesLatestTag(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := NodeUpdateCommand(tt.strat); !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("NodeUpdateCommand() = %#v, want %#v", got, tt.want)
+			if got := nodeUpdateCommand(tt.strat); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("nodeUpdateCommand() = %#v, want %#v", got, tt.want)
 			}
 		})
 	}

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os/exec"
 	"time"
 )
@@ -29,40 +30,18 @@ const waitDelay = 5 * time.Second
 
 // Run executes a command capturing combined stdout+stderr.
 func Run(ctx context.Context, args []string, timeout time.Duration) (string, int, time.Duration, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	start := time.Now()
-	cmdCtx := ctx
-	cancel := func() {}
-	if timeout > 0 {
-		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
-	}
-	defer cancel()
-
-	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-	cmd.Stdin = nil
-	cmd.WaitDelay = waitDelay
-	configureProcessGroup(cmd)
-	err := cmd.Run()
-	duration := time.Since(start)
-	if err == nil {
-		trace(args, start, duration, 0)
-		return buf.String(), 0, duration, nil
-	}
-	code := classify(cmdCtx, ctx, cmd, err)
-	trace(args, start, duration, code)
-	if code == 0 {
-		return buf.String(), 0, duration, nil
-	}
-	return buf.String(), code, duration, err
+	return run(ctx, args, timeout, true)
 }
 
 // RunStdout executes a command capturing stdout only (stderr discarded).
 func RunStdout(ctx context.Context, args []string, timeout time.Duration) (string, int, time.Duration, error) {
+	return run(ctx, args, timeout, false)
+}
+
+// run executes a command with the shared timeout, cancellation, process-group,
+// trace, and exit-code classification handling. combined selects whether stderr
+// is captured alongside stdout or discarded.
+func run(ctx context.Context, args []string, timeout time.Duration, combined bool) (string, int, time.Duration, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -75,22 +54,26 @@ func RunStdout(ctx context.Context, args []string, timeout time.Duration) (strin
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if combined {
+		cmd.Stderr = &out
+	} else {
+		cmd.Stderr = io.Discard
+	}
 	cmd.WaitDelay = waitDelay
 	configureProcessGroup(cmd)
-	out, err := cmd.Output()
+	err := cmd.Run()
 	duration := time.Since(start)
-	if err == nil {
-		trace(args, start, duration, 0)
-		return string(out), 0, duration, nil
+	code := 0
+	if err != nil {
+		code = classify(cmdCtx, ctx, cmd, err)
 	}
-	code := classify(cmdCtx, ctx, cmd, err)
 	trace(args, start, duration, code)
 	if code == 0 {
-		return string(out), 0, duration, nil
+		return out.String(), 0, duration, nil
 	}
-	return string(out), code, duration, err
+	return out.String(), code, duration, err
 }
 
 // classify maps a finished command's error to an exit code, preferring the

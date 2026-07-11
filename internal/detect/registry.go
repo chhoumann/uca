@@ -26,64 +26,55 @@ const defaultNpmRegistry = "https://registry.npmjs.org"
 
 var registryHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
-var npmRegistryConfig struct {
+// npmRegistryConfig resolves the registry URL(s) the way npm does for the
+// subset that matters here: the npm_config_registry environment variable and
+// the user-level ~/.npmrc (registry= and @scope:registry= keys). Anything more
+// exotic (per-project .npmrc, auth) is served by the CLI fallback instead.
+// One instance lives on Env so tests get a fresh, presettable config per Env.
+type npmRegistryConfig struct {
 	once   sync.Once
 	def    string            // default registry (empty = npmjs)
 	scoped map[string]string // "@scope" -> registry URL
 }
 
-// loadNpmRegistryConfig resolves the registry URL(s) the way npm does for the
-// subset that matters here: the npm_config_registry environment variable and the
-// user-level ~/.npmrc (registry= and @scope:registry= keys). Anything more
-// exotic (per-project .npmrc, auth) is served by the CLI fallback instead.
-func loadNpmRegistryConfig() {
-	cfg := &npmRegistryConfig
-	cfg.scoped = map[string]string{}
+func (c *npmRegistryConfig) load() {
+	c.scoped = map[string]string{}
 	if home, err := os.UserHomeDir(); err == nil {
-		parseNpmrcRegistries(filepath.Join(home, ".npmrc"), cfg.scoped, &cfg.def)
+		parseNpmrcRegistries(filepath.Join(home, ".npmrc"), c.scoped, &c.def)
 	}
 	if v := strings.TrimSpace(os.Getenv("npm_config_registry")); v != "" {
-		cfg.def = v
+		c.def = v
 	}
 }
 
+// parseNpmrcRegistries collects registry= (into def, last one wins, as npm
+// does) and @scope:registry= keys from an npmrc file. Registry URLs are used
+// verbatim, without expansion.
 func parseNpmrcRegistries(path string, scoped map[string]string, def *string) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
+	eachNpmrcEntry(path, func(key, value string) {
 		if value == "" {
-			continue
+			return
 		}
 		if key == "registry" {
 			*def = value
-			continue
+			return
 		}
 		if scope, rest, ok := strings.Cut(key, ":"); ok && rest == "registry" && strings.HasPrefix(scope, "@") {
 			scoped[scope] = value
 		}
-	}
+	})
 }
 
-func registryForPackage(pkg string) (string, bool) {
-	// Kill switch (also keeps tests hermetic): fall back to the manager CLI.
-	// Checked per call, not once, so tests can toggle it.
+// registryForPackage returns the registry base URL to query for pkg. The bool
+// means "the HTTP fast path is enabled": it is false only under the
+// UCA_NO_REGISTRY_HTTP kill switch (checked per call, not once, so tests can
+// toggle it); otherwise a registry is always returned, defaulting to npmjs.
+func (e *Env) registryForPackage(pkg string) (string, bool) {
 	if os.Getenv("UCA_NO_REGISTRY_HTTP") != "" {
 		return "", false
 	}
-	npmRegistryConfig.once.Do(loadNpmRegistryConfig)
-	cfg := &npmRegistryConfig
+	cfg := &e.npmRegistry
+	cfg.once.Do(cfg.load)
 	if strings.HasPrefix(pkg, "@") {
 		if scope, _, ok := strings.Cut(pkg, "/"); ok {
 			if reg, found := cfg.scoped[scope]; found {
@@ -100,8 +91,8 @@ func registryForPackage(pkg string) (string, bool) {
 // registryLatestVersion returns dist-tags.latest for pkg straight from the
 // registry, or "" when the fast path does not apply (caller falls back to the
 // manager CLI).
-func registryLatestVersion(ctx context.Context, pkg string) string {
-	registry, ok := registryForPackage(pkg)
+func (e *Env) registryLatestVersion(ctx context.Context, pkg string) string {
+	registry, ok := e.registryForPackage(pkg)
 	if !ok {
 		return ""
 	}

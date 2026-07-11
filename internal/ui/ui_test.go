@@ -17,7 +17,7 @@ func TestFormatRowUpdatingShowsTargetVersion(t *testing.T) {
 		Start:  time.Now(),
 	}
 	r := &Renderer{Width: 200, UseColor: false, UseUnicode: true}
-	got := formatRow(row, len(row.Name), false, r)
+	got := r.formatRow(row, len(row.Name), false)
 	if !strings.Contains(got, "codex-cli 0.90.0-alpha.5 → codex-cli 0.98.0") {
 		t.Fatalf("formatRow() did not include target version; got %q", got)
 	}
@@ -27,7 +27,7 @@ func TestRecolorIconDoesNotCorruptName(t *testing.T) {
 	// droid in dry-run: ASCII icon is "dr", which also starts the name "droid".
 	row := Row{Name: "droid", Status: agents.StatusUpdated, Reason: agents.ReasonDryRun, Before: "1.0.0", After: "1.0.0"}
 	r := &Renderer{Width: 200, UseColor: true, UseUnicode: false}
-	line := formatRow(row, len(row.Name), false, r)
+	line := r.formatRow(row, len(row.Name), false)
 	if !strings.Contains(line, "droid \x1b[35mdr\x1b[0m") {
 		t.Fatalf("formatRow() did not color the icon at its position; got %q", line)
 	}
@@ -36,10 +36,45 @@ func TestRecolorIconDoesNotCorruptName(t *testing.T) {
 	}
 }
 
+func TestFormatRowColorsIconBySemanticStatus(t *testing.T) {
+	r := &Renderer{Width: 200, UseColor: true, UseUnicode: false}
+
+	// Unchanged rows render the "same" label but must still color the icon gray.
+	unchanged := Row{Name: "codex", Status: agents.StatusUnchanged, Before: "1.0.0", After: "1.0.0"}
+	line := r.formatRow(unchanged, len(unchanged.Name), false)
+	if !strings.Contains(line, "codex \x1b[90m=\x1b[0m") {
+		t.Fatalf("formatRow() unchanged row icon should be gray; got %q", line)
+	}
+
+	// Manual-install skipped rows render the "manual" label but must keep the
+	// skipped yellow on the icon.
+	manual := Row{Name: "amp", Status: agents.StatusSkipped, Reason: agents.ReasonManualInstall}
+	line = r.formatRow(manual, len(manual.Name), false)
+	if !strings.Contains(line, "amp \x1b[33mo\x1b[0m") {
+		t.Fatalf("formatRow() manual-install row icon should be yellow; got %q", line)
+	}
+}
+
+func TestShouldUseUnicodeLocalePrecedence(t *testing.T) {
+	// LC_ALL wins: LC_ALL=C must disable unicode even when LANG is UTF-8.
+	t.Setenv("LC_ALL", "C")
+	t.Setenv("LC_CTYPE", "")
+	t.Setenv("LANG", "en_US.UTF-8")
+	if shouldUseUnicode() {
+		t.Fatal("shouldUseUnicode() = true with LC_ALL=C, want false despite LANG=en_US.UTF-8")
+	}
+
+	// With LC_ALL and LC_CTYPE unset, LANG decides.
+	t.Setenv("LC_ALL", "")
+	if !shouldUseUnicode() {
+		t.Fatal("shouldUseUnicode() = false with LANG=en_US.UTF-8, want true")
+	}
+}
+
 func TestFormatRowUsesAsciiArrowWithoutUnicode(t *testing.T) {
 	row := Row{Name: "codex", Status: agents.StatusUpdated, Before: "1.0.0", After: "1.1.0"}
 	r := &Renderer{Width: 200, UseColor: false, UseUnicode: false}
-	line := formatRow(row, len(row.Name), false, r)
+	line := r.formatRow(row, len(row.Name), false)
 	if !strings.Contains(line, "1.0.0 -> 1.1.0") {
 		t.Fatalf("formatRow() ASCII should use '->'; got %q", line)
 	}

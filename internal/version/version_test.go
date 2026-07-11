@@ -13,6 +13,10 @@ func TestParseOutput(t *testing.T) {
 		{name: "version_only_with_v", out: "v2.0.1\n", want: "v2.0.1"},
 		{name: "first_line_default", out: "claude 2.1.19\n", want: "claude 2.1.19"},
 		{name: "selects_last_version_only_line", out: "INFO something\n1.1.36\n", want: "1.1.36"},
+		{name: "last_version_only_line_wins", out: "1.0.0\nnpm notice\n2.0.0\n", want: "2.0.0"},
+		{name: "banner_then_prerelease_line", out: "npm warn using safe-chain\n1.2.3-rc.1\n", want: "1.2.3-rc.1"},
+		{name: "four_component_version_line", out: "INFO something\n1.2.3.4\n", want: "1.2.3.4"},
+		{name: "v_prefixed_prerelease_line", out: "banner text\nv0.90.0-alpha.5\n", want: "v0.90.0-alpha.5"},
 		{name: "skips_blank_lines", out: "\n\n1.4.0\n\n", want: "1.4.0"},
 	}
 	for _, tt := range tests {
@@ -158,6 +162,18 @@ func TestCompare(t *testing.T) {
 		{"0.142.0-rc.1", "0.141.0", 1},
 		{"1.2.0-rc.1", "1.2.0", -1},
 		{"1.4.9", "1.5.0", -1},
+		// SemVer prerelease precedence (spec item 11): numeric identifiers
+		// compare numerically (rc.9 < rc.10 despite lexical order), numeric
+		// sorts below alphanumeric, and a shorter identifier set sorts below
+		// a longer one when the shared prefix is equal.
+		{"1.0.0-rc.9", "1.0.0-rc.10", -1},
+		{"1.0.0-alpha", "1.0.0-alpha.1", -1},
+		{"1.0.0-alpha.1", "1.0.0-alpha.beta", -1},
+		{"1.0.0-alpha.beta", "1.0.0-beta", -1},
+		{"1.0.0-beta.2", "1.0.0-beta.11", -1},
+		{"1.0.0-beta.11", "1.0.0-rc.1", -1},
+		{"1.0.0-rc.1", "1.0.0-rc.1", 0},
+		{"1.0.0-rc.1+build.5", "1.0.0-rc.1", 0},
 	}
 	sign := func(n int) int {
 		switch {

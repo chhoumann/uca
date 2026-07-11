@@ -75,9 +75,41 @@ func parseConfigAgents(data []byte, path string) ([]agents.Agent, error) {
 			if !agents.ValidKind(s.Kind) {
 				return nil, fmt.Errorf("parse config %s: agent %q strategy #%d has unknown kind %q", path, a.Name, j+1, s.Kind)
 			}
+			if err := validateStrategy(a, s); err != nil {
+				return nil, fmt.Errorf("parse config %s: agent %q strategy #%d (%s): %w", path, a.Name, j+1, s.Kind, err)
+			}
 		}
 	}
 	return cfg.Agents, nil
+}
+
+// validateStrategy rejects a strategy missing the field its kind cannot work
+// without, so a config mistake fails at load time instead of surfacing as a
+// permanently "missing" agent. Requirements mirror agentspec.Resolve: node
+// strategies additionally need the agent-level binary for bin-dir matching.
+func validateStrategy(a agents.Agent, s agents.UpdateStrategy) error {
+	switch s.Kind {
+	case agents.KindNative:
+		if len(s.Command) == 0 {
+			return errors.New(`missing "command"`)
+		}
+	case agents.KindBrew, agents.KindPip, agents.KindUv:
+		if strings.TrimSpace(s.Package) == "" {
+			return errors.New(`missing "package"`)
+		}
+	case agents.KindVSCode:
+		if strings.TrimSpace(s.ExtensionID) == "" {
+			return errors.New(`missing "extensionId"`)
+		}
+	case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun:
+		if strings.TrimSpace(s.Package) == "" {
+			return errors.New(`missing "package"`)
+		}
+		if strings.TrimSpace(a.Binary) == "" {
+			return errors.New(`node strategies require the agent "binary" for bin-dir matching`)
+		}
+	}
+	return nil
 }
 
 // mergeAgents appends user-defined agents to the built-ins; a user agent whose

@@ -22,25 +22,13 @@ var marketplaceURL = "https://marketplace.visualstudio.com/_apis/public/gallery/
 
 // VSCodeMarketplaceLatest returns the latest stable version of an extension,
 // deduplicated per extension ID (a prefetch and an on-demand caller share one
-// request).
+// request). Failed lookups are retried on the next call, successes memoized.
 func (e *Env) VSCodeMarketplaceLatest(ctx context.Context, extID string) string {
 	extID = strings.TrimSpace(extID)
 	if extID == "" || os.Getenv("UCA_NO_REGISTRY_HTTP") != "" {
 		return ""
 	}
-	key := "vscode\x00" + extID
-	e.mu.Lock()
-	if e.latestFlight == nil {
-		e.latestFlight = map[string]*latestFlight{}
-	}
-	f, ok := e.latestFlight[key]
-	if !ok {
-		f = &latestFlight{}
-		e.latestFlight[key] = f
-	}
-	e.mu.Unlock()
-	f.once.Do(func() { f.v = queryMarketplaceLatest(ctx, extID) })
-	return f.v
+	return e.lookupFlight("vscode\x00"+extID, func() string { return queryMarketplaceLatest(ctx, extID) })
 }
 
 // PrefetchMarketplaceLatest starts marketplace lookups in the background so the
@@ -115,8 +103,10 @@ func queryMarketplaceLatest(ctx context.Context, extID string) string {
 		if preRelease {
 			continue
 		}
+		// A malformed version string on one entry shouldn't abort the lookup;
+		// an older stable entry may still be usable.
 		if _, ok := version.ExtractToken(v.Version); !ok {
-			return ""
+			continue
 		}
 		return v.Version
 	}

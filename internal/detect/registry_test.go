@@ -7,7 +7,51 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// registryStubEnv returns an Env whose npm registry config points at a stub
+// server answering every package lookup with the given manifest version.
+func registryStubEnv(t *testing.T, version string) *Env {
+	t.Helper()
+	t.Setenv("UCA_NO_REGISTRY_HTTP", "")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"version":"` + version + `"}`))
+	}))
+	t.Cleanup(srv.Close)
+	env := New(context.Background())
+	env.npmRegistry.once.Do(func() {
+		env.npmRegistry.def = srv.URL
+		env.npmRegistry.scoped = map[string]string{}
+	})
+	return env
+}
+
+func TestPeekLatestSeesCompletedPrefetch(t *testing.T) {
+	env := registryStubEnv(t, "1.2.3")
+	env.PrefetchLatest(context.Background(), []string{"pkg"})
+	// The prefetch runs in a background goroutine; poll until its result is
+	// visible. The stub answers instantly, so well before the deadline.
+	deadline := time.Now().Add(2 * time.Second)
+	for env.PeekLatest("pkg") != "1.2.3" {
+		if time.Now().After(deadline) {
+			t.Fatalf("PeekLatest = %q after completed prefetch, want 1.2.3", env.PeekLatest("pkg"))
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func TestFailedRegistryLookupRetries(t *testing.T) {
+	env := registryStubEnv(t, "2.0.0")
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := env.registryLatestOnce(canceled, "pkg"); got != "" {
+		t.Fatalf("canceled lookup = %q, want empty", got)
+	}
+	if got := env.registryLatestOnce(context.Background(), "pkg"); got != "2.0.0" {
+		t.Fatalf("lookup after failed flight = %q, want 2.0.0 (a failed flight must not be cached)", got)
+	}
+}
 
 func TestParseNpmrcRegistries(t *testing.T) {
 	dir := t.TempDir()
@@ -103,42 +147,8 @@ func TestFetchRegistryLatest(t *testing.T) {
 
 func TestRegistryForPackageKillSwitch(t *testing.T) {
 	t.Setenv("UCA_NO_REGISTRY_HTTP", "1")
-	if _, ok := registryForPackage("anything"); ok {
+	if _, ok := New(context.Background()).registryForPackage("anything"); ok {
 		t.Fatal("kill switch must disable the HTTP fast path")
-	}
-}
-
-func TestCellarFormulae(t *testing.T) {
-	cellar := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(cellar, "omp", "16.4.0"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(filepath.Join(cellar, "empty-formula"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(cellar, "stray-file"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	formulae := cellarFormulae(cellar)
-	if formulae == nil {
-		t.Fatal("cellarFormulae = nil, want map")
-	}
-	if !formulae["omp"] {
-		t.Fatal("omp (with a version dir) must be detected")
-	}
-	if formulae["empty-formula"] {
-		t.Fatal("a formula dir without version dirs must not be detected")
-	}
-	if formulae["stray-file"] {
-		t.Fatal("a plain file must not be detected")
-	}
-
-	if got := cellarFormulae(""); got != nil {
-		t.Fatalf("cellarFormulae(\"\") = %v, want nil", got)
-	}
-	if got := cellarFormulae(filepath.Join(cellar, "does-not-exist")); got != nil {
-		t.Fatalf("cellarFormulae(missing) = %v, want nil (fall back to brew list)", got)
 	}
 }
 
@@ -158,6 +168,24 @@ func TestQueryMarketplaceLatest(t *testing.T) {
 
 	if got := queryMarketplaceLatest(context.Background(), "pub.ext"); got != "4.0.7" {
 		t.Fatalf("queryMarketplaceLatest = %q, want 4.0.7 (first stable, skipping pre-release)", got)
+	}
+}
+
+func TestQueryMarketplaceLatestSkipsMalformedVersion(t *testing.T) {
+	body := `{"results":[{"extensions":[{"versions":[
+	 {"version":"see release notes","properties":[]},
+	 {"version":"3.1.0","properties":[]}
+	]}]}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	old := marketplaceURL
+	marketplaceURL = srv.URL
+	defer func() { marketplaceURL = old }()
+
+	if got := queryMarketplaceLatest(context.Background(), "pub.ext"); got != "3.1.0" {
+		t.Fatalf("queryMarketplaceLatest = %q, want 3.1.0 (a malformed entry must not abort the lookup)", got)
 	}
 }
 

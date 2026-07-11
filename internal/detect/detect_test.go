@@ -2,6 +2,8 @@ package detect
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -36,7 +38,7 @@ func fakeEnv(t *testing.T, scripts map[string]string) *Env {
 
 func TestNodeLatestVersionCaches(t *testing.T) {
 	env := New(context.Background())
-	env.latestCache = map[string]string{"pkg": "9.9.9"}
+	env.latestCache["pkg"] = "9.9.9"
 	// A cached value is returned without running any command, regardless of the
 	// manager kind (the registry answer is manager-independent).
 	if got := env.NodeLatestVersion(context.Background(), agents.KindNpm, "pkg"); got != "9.9.9" {
@@ -48,23 +50,35 @@ func TestNodeLatestVersionCaches(t *testing.T) {
 }
 
 func TestLatestVersionDispatch(t *testing.T) {
+	// Hermetic: nothing here may reach a live registry (node answers come from
+	// the pre-seeded cache, the marketplace from a local stub).
+	t.Setenv("UCA_NO_REGISTRY_HTTP", "")
 	env := New(context.Background())
-	for _, m := range []string{agents.KindNative, agents.KindPip, agents.KindUv, agents.KindVSCode} {
+
+	// native/pip/uv (and unknown methods) are documented as not cheaply
+	// knowable: always empty, no I/O.
+	for _, m := range []string{agents.KindNative, agents.KindPip, agents.KindUv, "unknown"} {
 		if got := env.LatestVersion(context.Background(), m, "pkg"); got != "" {
 			t.Fatalf("LatestVersion(%q) = %q, want empty", m, got)
 		}
 	}
-}
 
-func TestBrewLatestLivePath(t *testing.T) {
-	env := fakeEnv(t, map[string]string{
-		"brew": "#!/bin/sh\necho '{\"formulae\":[{\"versions\":{\"stable\":\"1.2.3\"}}]}'\n",
-	})
-	if got := env.brewLatest(context.Background(), "copilot-cli"); got != "1.2.3" {
-		t.Fatalf("brewLatest = %q, want 1.2.3", got)
+	// Node kinds dispatch to the memoized node lookup.
+	env.latestCache["pkg"] = "9.9.9"
+	if got := env.LatestVersion(context.Background(), agents.KindNpm, "pkg"); got != "9.9.9" {
+		t.Fatalf("LatestVersion(npm) = %q, want 9.9.9", got)
 	}
-	if got := env.LatestVersion(context.Background(), agents.KindBrew, "copilot-cli"); got != "1.2.3" {
-		t.Fatalf("LatestVersion(brew) = %q, want 1.2.3", got)
+
+	// vscode dispatches to the marketplace lookup (pkg is the extension ID).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"results":[{"extensions":[{"versions":[{"version":"4.0.7","properties":[]}]}]}]}`))
+	}))
+	defer srv.Close()
+	old := marketplaceURL
+	marketplaceURL = srv.URL
+	defer func() { marketplaceURL = old }()
+	if got := env.LatestVersion(context.Background(), agents.KindVSCode, "pub.ext"); got != "4.0.7" {
+		t.Fatalf("LatestVersion(vscode) = %q, want 4.0.7", got)
 	}
 }
 
@@ -87,11 +101,11 @@ func TestNodeManagerForBinary(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, binName), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatalf("write fake binary: %v", err)
 	}
-	origPath := os.Getenv("PATH")
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+origPath)
+	t.Setenv("PATH", dir)
 
-	env := &Env{hasNpm: true, binPathCache: map[string]string{}, npmBin: dir}
-	env.npmBinOnce.Do(func() {})
+	env := New(context.Background())
+	env.node[agents.KindNpm].installed = true
+	env.node[agents.KindNpm].binDir.set(dir)
 
 	if got := env.NodeManagerForBinary(binName); got != agents.KindNpm {
 		t.Fatalf("NodeManagerForBinary() = %q, want %q", got, agents.KindNpm)
@@ -112,11 +126,11 @@ func TestNodeManagerForBinarySymlink(t *testing.T) {
 	if err := os.Symlink(targetPath, filepath.Join(binDir, binName)); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	origPath := os.Getenv("PATH")
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath)
+	t.Setenv("PATH", binDir)
 
-	env := &Env{hasNpm: true, binPathCache: map[string]string{}, npmBin: targetDir}
-	env.npmBinOnce.Do(func() {})
+	env := New(context.Background())
+	env.node[agents.KindNpm].installed = true
+	env.node[agents.KindNpm].binDir.set(targetDir)
 
 	if got := env.NodeManagerForBinary(binName); got != agents.KindNpm {
 		t.Fatalf("NodeManagerForBinary() = %q, want %q", got, agents.KindNpm)

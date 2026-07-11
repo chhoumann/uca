@@ -62,7 +62,9 @@ func Same(a, b string) bool {
 }
 
 // ParseOutput parses a `--version` command's combined output into a clean
-// version string, preferring a line that is just a version.
+// version string, preferring a line that is just a version. When several lines
+// qualify the last one wins: tools that emit noise around the version print
+// banners or log lines first and the version last.
 func ParseOutput(out string) string {
 	trimmed := strings.TrimSpace(out)
 	if trimmed == "" {
@@ -92,13 +94,22 @@ func ParseOutput(out string) string {
 	return "unknown"
 }
 
+// isVersionOnlyLine reports whether line is nothing but a version. The primary
+// predicate is the same one ParseLatest uses: ExtractToken consumes the whole
+// line, which covers prerelease and build-metadata forms like "1.2.3-rc.1".
+// The dotted-numeric fallback keeps four-plus-component versions such as
+// "1.2.3.4", which the semver token regex would truncate to "1.2.3".
 func isVersionOnlyLine(line string) bool {
-	if strings.ContainsAny(line, " \t") {
-		return false
+	if token, ok := ExtractToken(line); ok && token == line {
+		return true
 	}
-	if strings.HasPrefix(line, "v") {
-		line = line[1:]
-	}
+	return isDottedNumeric(line)
+}
+
+// isDottedNumeric reports whether line is dot-separated decimal components
+// (at least two), optionally prefixed with "v".
+func isDottedNumeric(line string) bool {
+	line = strings.TrimPrefix(line, "v")
 	parts := strings.Split(line, ".")
 	if len(parts) < 2 {
 		return false
@@ -117,8 +128,8 @@ func isVersionOnlyLine(line string) bool {
 }
 
 // ParseLatest pulls the version out of a registry query's stdout. It prefers a
-// line whose entire content is a single version token — the normal single-field
-// output of `npm view dist-tags.latest` and friends — so advisory banner lines
+// line whose entire content is a single version token - the normal single-field
+// output of `npm view dist-tags.latest` and friends - so advisory banner lines
 // are ignored whether the tool prints them before or after the version. It only
 // falls back to an embedded token when no standalone line exists.
 func ParseLatest(out string) string {
@@ -188,8 +199,9 @@ func ParseBrewLatest(out string) string {
 
 // Compare orders two version tokens: <0 if a is older, 0 if equal, >0 if a is
 // newer. It compares numeric base components (missing trailing components are
-// zero, so "1.2" == "1.2.0"); on an equal base, a release outranks a prerelease.
-// Build metadata is ignored. Intentionally lightweight (no semver dependency).
+// zero, so "1.2" == "1.2.0"); on an equal base, a release outranks a prerelease
+// and prerelease tails follow SemVer precedence (spec item 11). Build metadata
+// is ignored. Intentionally lightweight (no semver dependency).
 func Compare(a, b string) int {
 	abase, apre := splitVersion(a)
 	bbase, bpre := splitVersion(b)
@@ -216,12 +228,8 @@ func Compare(a, b string) int {
 		return 1
 	case bpre == "": // a is a prerelease, b the released version -> a older
 		return -1
-	case apre == bpre:
-		return 0
-	case apre < bpre:
-		return -1
 	default:
-		return 1
+		return comparePrerelease(apre, bpre)
 	}
 }
 
@@ -239,12 +247,72 @@ func splitVersion(v string) (base, pre string) {
 	return v, ""
 }
 
+// comparePrerelease orders two non-empty prerelease tails per SemVer spec item
+// 11: dot-separated identifiers compare left to right, numeric identifiers
+// compare numerically (so "rc.9" < "rc.10"), a numeric identifier always sorts
+// below an alphanumeric one, alphanumeric identifiers compare ASCII-lexically,
+// and when every shared identifier is equal the shorter tail sorts first.
+func comparePrerelease(a, b string) int {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) && i < len(bs); i++ {
+		x, y := as[i], bs[i]
+		if x == y {
+			continue
+		}
+		xn, xok := numericIdentifier(x)
+		yn, yok := numericIdentifier(y)
+		switch {
+		case xok && yok:
+			if xn < yn {
+				return -1
+			}
+			return 1
+		case xok:
+			return -1
+		case yok:
+			return 1
+		case x < y:
+			return -1
+		default:
+			return 1
+		}
+	}
+	switch {
+	case len(as) < len(bs):
+		return -1
+	case len(as) > len(bs):
+		return 1
+	default:
+		return 0
+	}
+}
+
+// numericIdentifier parses a prerelease identifier as a decimal number,
+// reporting false for alphanumeric identifiers (and empty ones).
+func numericIdentifier(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 func numericComponents(base string) []int {
 	parts := strings.Split(base, ".")
 	out := make([]int, 0, len(parts))
 	for _, p := range parts {
 		n, err := strconv.Atoi(p)
 		if err != nil {
+			// Deliberate: a malformed component ("1.x.3") maps to 0 so Compare
+			// stays total over arbitrary tool output instead of failing.
 			n = 0
 		}
 		out = append(out, n)

@@ -33,7 +33,7 @@ func (e *Env) NodeInstalledVersion(kind, pkg string) string {
 		}
 		nodeModules = globalNodeModulesDir(prefix)
 	case agents.KindBun:
-		nodeModules = bunGlobalNodeModulesDir(e.bunGlobalBinDir())
+		nodeModules = bunGlobalNodeModulesDir(e.nodeBinDir(agents.KindBun))
 	default:
 		return ""
 	}

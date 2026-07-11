@@ -1,7 +1,7 @@
 // Package detect probes the environment to decide how each agent is installed:
 // which package managers are present, what their global bin dirs and package
 // lists contain, installed VS Code extensions, and the latest available versions.
-// Results are cached behind sync.Once loaders and are safe for concurrent use.
+// Results are cached behind per-Env lazy loaders and are safe for concurrent use.
 package detect
 
 import (
@@ -27,68 +27,173 @@ const (
 	nativeHelpCheckTimeout  = 2 * time.Second
 )
 
+// lazy memoizes one value: the first get runs the loader bound at
+// construction, every later get returns that same value.
+type lazy[T any] struct {
+	once sync.Once
+	load func() T
+	v    T
+}
+
+func (l *lazy[T]) get() T {
+	l.once.Do(func() {
+		l.v = l.load()
+		l.load = nil
+	})
+	return l.v
+}
+
+// set forces the value without running the loader. Test hook; call before get.
+func (l *lazy[T]) set(v T) {
+	l.once.Do(func() {
+		l.v = v
+		l.load = nil
+	})
+}
+
+// nodeManager is one global node package manager's per-Env state.
+type nodeManager struct {
+	installed bool
+	binDir    lazy[string]
+	pkgs      lazy[map[string]bool]
+}
+
+// nodeManagerDefs drives every per-kind dispatch for the global node package
+// managers - install probe, global bin dir, global package list, and the
+// latest-version CLI query - in resolution order. Adding a manager is one row
+// here instead of a switch per operation. The probed binary is the kind itself.
+var nodeManagerDefs = []struct {
+	kind        string
+	binDir      func(*Env) string
+	packages    func(*Env) map[string]bool
+	latestArgs  func(pkg string) []string
+	parseLatest func(out string) string
+}{
+	{
+		kind:        agents.KindNpm,
+		binDir:      (*Env).loadNpmBin,
+		packages:    (*Env).loadNpmPkgs,
+		latestArgs:  func(pkg string) []string { return []string{"npm", "view", pkg, "dist-tags.latest"} },
+		parseLatest: version.ParseLatest,
+	},
+	{
+		kind:        agents.KindPnpm,
+		binDir:      cmdBinDir("pnpm", "bin", "-g"),
+		packages:    (*Env).loadPnpmPkgs,
+		latestArgs:  func(pkg string) []string { return []string{"pnpm", "view", pkg, "dist-tags.latest", "--silent"} },
+		parseLatest: version.ParseLatest,
+	},
+	{
+		kind:        agents.KindYarn,
+		binDir:      cmdBinDir("yarn", "global", "bin"),
+		packages:    cmdPackageList("yarn", "global", "list", "--depth=0"),
+		latestArgs:  func(pkg string) []string { return []string{"yarn", "info", pkg, "dist-tags.latest", "--silent"} },
+		parseLatest: version.ParseLatest,
+	},
+	{
+		kind:     agents.KindBun,
+		binDir:   cmdBinDir("bun", "pm", "bin", "-g"),
+		packages: cmdPackageList("bun", "pm", "ls", "-g"),
+		// `bun info` needs `-g` to work outside of a JS project.
+		latestArgs: func(pkg string) []string { return []string{"bun", "info", "-g", pkg, "version", "--json"} },
+		// bun emits JSON: a scalar ("6.0.3") or the full manifest object. Parse
+		// the top-level version explicitly so a dependency's version isn't
+		// mistaken for it.
+		parseLatest: func(out string) string {
+			if v := version.ParseBunJSON(out); v != "" {
+				return v
+			}
+			return version.ParseLatest(out)
+		},
+	},
+}
+
+// cmdBinDir builds a bin-dir loader that runs one command and trims its output.
+func cmdBinDir(args ...string) func(*Env) string {
+	return func(e *Env) string {
+		out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), args, detectCmdTimeout)
+		if exitCode != 0 {
+			return ""
+		}
+		return strings.TrimSpace(out)
+	}
+}
+
+// cmdPackageList builds a package-list loader that runs one command and parses
+// "<name>@<version>" tokens from its output.
+func cmdPackageList(args ...string) func(*Env) map[string]bool {
+	return func(e *Env) map[string]bool {
+		out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), args, detectCmdTimeout)
+		if exitCode != 0 {
+			return nil
+		}
+		return parsePackageListOutput(out)
+	}
+}
+
 // Env holds detected environment state. Construct it with New; its methods are
 // safe for concurrent use.
 type Env struct {
 	ctx context.Context
 
-	hasBun    bool
 	hasBrew   bool
-	hasNpm    bool
-	hasPnpm   bool
-	hasYarn   bool
 	hasUv     bool
 	hasPython bool
 	codeCmd   string
 
-	mu            sync.Mutex
-	binPathCache  map[string]string
-	npmPrefixOnce sync.Once
-	npmPrefixVal  string
-	npmBinOnce    sync.Once
-	npmBin        string
-	npmPkgOnce    sync.Once
-	npmPkgs       map[string]bool
-	pnpmBinOnce   sync.Once
-	pnpmBin       string
-	pnpmPkgOnce   sync.Once
-	pnpmPkgs      map[string]bool
-	yarnBinOnce   sync.Once
-	yarnBin       string
-	yarnPkgOnce   sync.Once
-	yarnPkgs      map[string]bool
-	bunBinOnce    sync.Once
-	bunGlobalBin  string
-	bunPkgOnce    sync.Once
-	bunPkgs       map[string]bool
-	uvOnce        sync.Once
-	uvTools       map[string]bool
-	codeOnce      sync.Once
-	codeExts      map[string]string
-	helpChecks    map[string]bool
-	latestCache   map[string]string
-	latestFlight  map[string]*latestFlight
-	brewOnce      sync.Once
-	brewFormulae  map[string]bool
-	pipOnce       sync.Once
-	pipPkgs       map[string]bool
+	node map[string]*nodeManager // keyed by kind, see nodeManagerDefs
+
+	npmPrefixVal lazy[string]
+	uvTools      lazy[map[string]bool]
+	brewFormulae lazy[map[string]bool]
+	pipPkgs      lazy[map[string]bool]
+	codeExts     lazy[map[string]string]
+
+	npmRegistry npmRegistryConfig
+
+	mu           sync.Mutex
+	binPathCache map[string]string
+	helpChecks   map[string]bool
+	latestCache  map[string]string
+	latestFlight map[string]*latestFlight
 }
 
 // New probes which managers/tools are installed and returns a ready Env.
 func New(ctx context.Context) *Env {
-	return &Env{
+	e := &Env{
 		ctx:          ctx,
-		hasBun:       hasBinary("bun"),
 		hasBrew:      hasBinary("brew"),
-		hasNpm:       hasBinary("npm"),
-		hasPnpm:      hasBinary("pnpm"),
-		hasYarn:      hasBinary("yarn"),
 		hasUv:        hasBinary("uv"),
 		hasPython:    hasBinary("python3"),
 		codeCmd:      detectCodeCmd(),
+		node:         make(map[string]*nodeManager, len(nodeManagerDefs)),
 		binPathCache: map[string]string{},
 		helpChecks:   map[string]bool{},
+		latestCache:  map[string]string{},
+		latestFlight: map[string]*latestFlight{},
 	}
+	e.npmPrefixVal.load = e.loadNpmPrefix
+	e.uvTools.load = e.loadUvTools
+	e.brewFormulae.load = e.loadBrewFormulae
+	e.pipPkgs.load = e.loadPipPkgs
+	e.codeExts.load = e.loadCodeExtensions
+	for _, def := range nodeManagerDefs {
+		m := &nodeManager{installed: hasBinary(def.kind)}
+		m.binDir.load = func() string {
+			if !m.installed {
+				return ""
+			}
+			return def.binDir(e)
+		}
+		m.pkgs.load = func() map[string]bool {
+			if !m.installed {
+				return nil
+			}
+			return def.packages(e)
+		}
+		e.node[def.kind] = m
+	}
+	return e
 }
 
 // PrewarmNeeds selects which detection loaders Prewarm should kick off, so
@@ -102,30 +207,26 @@ type PrewarmNeeds struct {
 }
 
 // Prewarm kicks off the requested detection loaders concurrently so later
-// lookups are already populated (the sync.Once loaders dedupe with on-demand
+// lookups are already populated (the lazy loaders dedupe with on-demand
 // callers).
 func (e *Env) Prewarm(needs PrewarmNeeds) {
 	if needs.Node {
-		go func() { e.npmBinOnce.Do(e.loadNpmBin) }()
-		go func() { e.npmPkgOnce.Do(e.loadNpmPkgs) }()
-		go func() { e.pnpmBinOnce.Do(e.loadPnpmBin) }()
-		go func() { e.pnpmPkgOnce.Do(e.loadPnpmPkgs) }()
-		go func() { e.yarnBinOnce.Do(e.loadYarnBin) }()
-		go func() { e.yarnPkgOnce.Do(e.loadYarnPkgs) }()
-		go func() { e.bunBinOnce.Do(e.loadBunGlobalBin) }()
-		go func() { e.bunPkgOnce.Do(e.loadBunPkgs) }()
+		for _, m := range e.node {
+			go m.binDir.get()
+			go m.pkgs.get()
+		}
 	}
 	if needs.Uv {
-		go func() { e.uvOnce.Do(e.loadUvTools) }()
+		go e.uvTools.get()
 	}
 	if needs.Brew {
-		go func() { e.brewOnce.Do(e.loadBrewFormulae) }()
+		go e.brewFormulae.get()
 	}
 	if needs.Pip {
-		go func() { e.pipOnce.Do(e.loadPipPkgs) }()
+		go e.pipPkgs.get()
 	}
 	if needs.VSCode {
-		go func() { e.codeOnce.Do(e.loadCodeExtensions) }()
+		go e.codeExts.get()
 	}
 }
 
@@ -145,7 +246,7 @@ func detectCodeCmd() string {
 }
 
 func (e *Env) baseCtx() context.Context {
-	if e == nil || e.ctx == nil {
+	if e.ctx == nil {
 		return context.Background()
 	}
 	return e.ctx
@@ -185,43 +286,55 @@ func (e *Env) binaryPath(name string) string {
 
 // HasNodeManager reports whether the given node manager kind is installed.
 func (e *Env) HasNodeManager(kind string) bool {
-	switch kind {
-	case agents.KindNpm:
-		return e.hasNpm
-	case agents.KindPnpm:
-		return e.hasPnpm
-	case agents.KindYarn:
-		return e.hasYarn
-	case agents.KindBun:
-		return e.hasBun
-	default:
-		return false
+	m := e.node[kind]
+	return m != nil && m.installed
+}
+
+func (e *Env) nodeBinDir(kind string) string {
+	if m := e.node[kind]; m != nil {
+		return m.binDir.get()
 	}
+	return ""
+}
+
+func (e *Env) nodeManagerHasPackage(kind, pkg string) bool {
+	if m := e.node[kind]; m != nil {
+		return m.pkgs.get()[pkg]
+	}
+	return false
 }
 
 // NodeManagerForBinary returns the node manager whose global bin dir contains
-// name, or "" when it is absent or ambiguous.
+// name. When several managers' bin dirs match (nested or symlinked layouts),
+// the longest bin dir path wins as the most specific; an exact tie or no match
+// returns "".
 func (e *Env) NodeManagerForBinary(name string) string {
 	binPath := e.binaryPath(name)
 	if binPath == "" {
 		return ""
 	}
+	// Canonicalize the binary's location once: its dir as PATH names it, plus
+	// the dir of the fully resolved binary (a manager shim is usually a symlink
+	// into the manager's store). Each manager dir is then resolved at most once
+	// instead of per comparison.
 	binDir := filepath.Dir(binPath)
 	resolvedBinDir := ""
 	if resolvedPath := resolveSymlinkPath(binPath); resolvedPath != "" {
 		resolvedBinDir = filepath.Dir(resolvedPath)
+	} else {
+		resolvedBinDir = resolveSymlinkPath(binDir)
 	}
 	matches := []string{}
-	for _, kind := range []string{agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun} {
-		if !e.HasNodeManager(kind) {
+	for _, def := range nodeManagerDefs {
+		if !e.HasNodeManager(def.kind) {
 			continue
 		}
-		dir := e.nodeBinDir(kind)
+		dir := e.nodeBinDir(def.kind)
 		if dir == "" {
 			continue
 		}
-		if samePath(dir, binDir) || (resolvedBinDir != "" && samePath(dir, resolvedBinDir)) {
-			matches = append(matches, kind)
+		if binDirMatches(dir, binDir, resolvedBinDir) {
+			matches = append(matches, def.kind)
 		}
 	}
 	if len(matches) == 1 {
@@ -250,24 +363,23 @@ func (e *Env) NodeManagerForBinary(name string) string {
 	return ""
 }
 
+// binDirMatches reports whether a manager bin dir names the same directory as
+// the binary's dir (binDir, as PATH looked it up) or its symlink-resolved form.
+func binDirMatches(dir, binDir, resolvedBinDir string) bool {
+	dir = filepath.Clean(dir)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(dir, binDir) || (resolvedBinDir != "" && strings.EqualFold(dir, resolvedBinDir))
+	}
+	if dir == binDir || dir == resolvedBinDir {
+		return true
+	}
+	resolvedDir := resolveSymlinkPath(dir)
+	return resolvedDir != "" && (resolvedDir == binDir || resolvedDir == resolvedBinDir)
+}
+
 // NodeBinHasBinary reports whether the manager's global bin dir contains name.
 func (e *Env) NodeBinHasBinary(kind, name string) bool {
 	return binDirHasBinary(e.nodeBinDir(kind), name)
-}
-
-func (e *Env) nodeBinDir(kind string) string {
-	switch kind {
-	case agents.KindNpm:
-		return e.npmBinDir()
-	case agents.KindPnpm:
-		return e.pnpmBinDir()
-	case agents.KindYarn:
-		return e.yarnBinDir()
-	case agents.KindBun:
-		return e.bunGlobalBinDir()
-	default:
-		return ""
-	}
 }
 
 // NodeManagerForPackage returns the unique node manager whose global package list
@@ -277,12 +389,12 @@ func (e *Env) NodeManagerForPackage(pkg string) string {
 		return ""
 	}
 	matches := []string{}
-	for _, kind := range []string{agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun} {
-		if !e.HasNodeManager(kind) {
+	for _, def := range nodeManagerDefs {
+		if !e.HasNodeManager(def.kind) {
 			continue
 		}
-		if e.nodeManagerHasPackage(kind, pkg) {
-			matches = append(matches, kind)
+		if e.nodeManagerHasPackage(def.kind, pkg) {
+			matches = append(matches, def.kind)
 		}
 	}
 	if len(matches) == 1 {
@@ -291,216 +403,91 @@ func (e *Env) NodeManagerForPackage(pkg string) string {
 	return ""
 }
 
-func (e *Env) nodeManagerHasPackage(kind, pkg string) bool {
-	switch kind {
-	case agents.KindNpm:
-		return e.npmHas(pkg)
-	case agents.KindPnpm:
-		return e.pnpmHas(pkg)
-	case agents.KindYarn:
-		return e.yarnHas(pkg)
-	case agents.KindBun:
-		return e.bunHas(pkg)
-	default:
-		return false
-	}
-}
-
 // npmPrefix resolves npm's global prefix: from the environment / ~/.npmrc /
 // the node binary's location when confidently derivable (see npmfs.go), else
 // from `npm prefix -g`.
 func (e *Env) npmPrefix() string {
-	e.npmPrefixOnce.Do(func() {
-		e.npmPrefixVal = npmPrefixFast()
-		if e.npmPrefixVal != "" {
-			return
-		}
-		out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"npm", "prefix", "-g"}, detectCmdTimeout)
-		if exitCode != 0 {
-			return
-		}
-		e.npmPrefixVal = strings.TrimSpace(out)
-	})
-	return e.npmPrefixVal
+	return e.npmPrefixVal.get()
 }
 
-func (e *Env) npmBinDir() string {
-	e.npmBinOnce.Do(e.loadNpmBin)
-	return e.npmBin
-}
-
-func (e *Env) loadNpmBin() {
-	e.npmBin = ""
-	if !e.hasNpm {
-		return
+func (e *Env) loadNpmPrefix() string {
+	if prefix := npmPrefixFast(); prefix != "" {
+		return prefix
 	}
+	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"npm", "prefix", "-g"}, detectCmdTimeout)
+	if exitCode != 0 {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+func (e *Env) loadNpmBin() string {
 	prefix := e.npmPrefix()
 	if prefix == "" {
-		return
+		return ""
 	}
 	// On Unix-like systems, global binaries are installed under <prefix>/bin.
 	// On Windows, global binaries are typically installed directly under <prefix>.
 	if runtime.GOOS == "windows" {
 		bin := filepath.Join(prefix, "bin")
 		if info, err := os.Stat(bin); err == nil && info.IsDir() {
-			e.npmBin = bin
-			return
+			return bin
 		}
-		e.npmBin = prefix
-		return
+		return prefix
 	}
-	e.npmBin = filepath.Join(prefix, "bin")
+	return filepath.Join(prefix, "bin")
 }
 
-func (e *Env) npmHas(pkg string) bool {
-	e.npmPkgOnce.Do(e.loadNpmPkgs)
-	return e.npmPkgs[pkg]
-}
-
-func (e *Env) loadNpmPkgs() {
-	e.npmPkgs = map[string]bool{}
-	if !e.hasNpm {
-		return
-	}
+func (e *Env) loadNpmPkgs() map[string]bool {
 	// Fast path: a directory listing of the global node_modules answers "is this
 	// package installed" without a ~200ms `npm list` startup.
 	if prefix := e.npmPrefix(); prefix != "" {
 		if pkgs := listGlobalNodePackages(globalNodeModulesDir(prefix)); pkgs != nil {
-			e.npmPkgs = pkgs
-			return
+			return pkgs
 		}
 	}
+	// `npm list` exits nonzero for dependency problems (extraneous, invalid,
+	// missing peers) while still printing the full JSON tree, so the exit code
+	// is deliberately ignored; JSON parsing decides.
 	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{"npm", "list", "-g", "--depth=0", "--json"}, detectCmdTimeout)
 	var payload struct {
 		Dependencies map[string]any `json:"dependencies"`
 	}
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
-		return
+		return nil
 	}
+	pkgs := make(map[string]bool, len(payload.Dependencies))
 	for name := range payload.Dependencies {
-		e.npmPkgs[name] = true
+		pkgs[name] = true
 	}
+	return pkgs
 }
 
-func (e *Env) pnpmBinDir() string {
-	e.pnpmBinOnce.Do(e.loadPnpmBin)
-	return e.pnpmBin
-}
-
-func (e *Env) loadPnpmBin() {
-	e.pnpmBin = ""
-	if !e.hasPnpm {
-		return
-	}
-	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"pnpm", "bin", "-g"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	e.pnpmBin = strings.TrimSpace(out)
-}
-
-func (e *Env) pnpmHas(pkg string) bool {
-	e.pnpmPkgOnce.Do(e.loadPnpmPkgs)
-	return e.pnpmPkgs[pkg]
-}
-
-func (e *Env) loadPnpmPkgs() {
-	e.pnpmPkgs = map[string]bool{}
-	if !e.hasPnpm {
-		return
-	}
+func (e *Env) loadPnpmPkgs() map[string]bool {
+	// Like npm, `pnpm list` can exit nonzero yet still print usable JSON, so
+	// the exit code is deliberately ignored; JSON parsing decides.
 	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{"pnpm", "list", "-g", "--depth=0", "--json"}, detectCmdTimeout)
 	type pnpmPayload struct {
 		Dependencies map[string]any `json:"dependencies"`
 	}
+	pkgs := map[string]bool{}
 	var list []pnpmPayload
 	if err := json.Unmarshal([]byte(out), &list); err == nil {
 		for _, entry := range list {
 			for name := range entry.Dependencies {
-				e.pnpmPkgs[name] = true
+				pkgs[name] = true
 			}
 		}
-		return
+		return pkgs
 	}
 	var single pnpmPayload
 	if err := json.Unmarshal([]byte(out), &single); err != nil {
-		return
+		return nil
 	}
 	for name := range single.Dependencies {
-		e.pnpmPkgs[name] = true
+		pkgs[name] = true
 	}
-}
-
-func (e *Env) yarnBinDir() string {
-	e.yarnBinOnce.Do(e.loadYarnBin)
-	return e.yarnBin
-}
-
-func (e *Env) loadYarnBin() {
-	e.yarnBin = ""
-	if !e.hasYarn {
-		return
-	}
-	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"yarn", "global", "bin"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	e.yarnBin = strings.TrimSpace(out)
-}
-
-func (e *Env) yarnHas(pkg string) bool {
-	e.yarnPkgOnce.Do(e.loadYarnPkgs)
-	return e.yarnPkgs[pkg]
-}
-
-func (e *Env) loadYarnPkgs() {
-	e.yarnPkgs = map[string]bool{}
-	if !e.hasYarn {
-		return
-	}
-	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"yarn", "global", "list", "--depth=0"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	for name := range parsePackageListOutput(out) {
-		e.yarnPkgs[name] = true
-	}
-}
-
-func (e *Env) bunGlobalBinDir() string {
-	e.bunBinOnce.Do(e.loadBunGlobalBin)
-	return e.bunGlobalBin
-}
-
-func (e *Env) loadBunGlobalBin() {
-	e.bunGlobalBin = ""
-	if !e.hasBun {
-		return
-	}
-	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"bun", "pm", "bin", "-g"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	e.bunGlobalBin = strings.TrimSpace(out)
-}
-
-func (e *Env) bunHas(pkg string) bool {
-	e.bunPkgOnce.Do(e.loadBunPkgs)
-	return e.bunPkgs[pkg]
-}
-
-func (e *Env) loadBunPkgs() {
-	e.bunPkgs = map[string]bool{}
-	if !e.hasBun {
-		return
-	}
-	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"bun", "pm", "ls", "-g"}, detectCmdTimeout)
-	if exitCode != 0 {
-		return
-	}
-	for name := range parsePackageListOutput(out) {
-		e.bunPkgs[name] = true
-	}
+	return pkgs
 }
 
 func fileExists(path string) bool {
@@ -524,32 +511,6 @@ func binDirHasBinary(binDir, name string) bool {
 		if fileExists(candidate) {
 			return true
 		}
-	}
-	return false
-}
-
-func samePath(a, b string) bool {
-	if a == "" || b == "" {
-		return false
-	}
-	a = filepath.Clean(a)
-	b = filepath.Clean(b)
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(a, b)
-	}
-	if a == b {
-		return true
-	}
-	ra := resolveSymlinkPath(a)
-	rb := resolveSymlinkPath(b)
-	if ra != "" && rb != "" {
-		return ra == rb
-	}
-	if ra != "" && ra == b {
-		return true
-	}
-	if rb != "" && rb == a {
-		return true
 	}
 	return false
 }
@@ -601,16 +562,15 @@ func parsePackageFromToken(token string) string {
 
 // UvHas reports whether a uv tool is installed.
 func (e *Env) UvHas(pkg string) bool {
-	e.uvOnce.Do(e.loadUvTools)
-	return e.uvTools[pkg]
+	return e.uvTools.get()[pkg]
 }
 
-func (e *Env) loadUvTools() {
-	e.uvTools = map[string]bool{}
+func (e *Env) loadUvTools() map[string]bool {
 	if !e.hasUv {
-		return
+		return nil
 	}
 	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{"uv", "tool", "list"}, detectCmdTimeout)
+	tools := map[string]bool{}
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -621,81 +581,38 @@ func (e *Env) loadUvTools() {
 		if len(fields) == 0 {
 			continue
 		}
-		e.uvTools[fields[0]] = true
+		tools[fields[0]] = true
 	}
+	return tools
 }
 
 // BrewHas reports whether a brew formula is installed.
 func (e *Env) BrewHas(formula string) bool {
-	if !e.hasBrew {
-		return false
-	}
-	e.brewOnce.Do(e.loadBrewFormulae)
-	return e.brewFormulae[formula]
+	return e.hasBrew && e.brewFormulae.get()[formula]
 }
 
-func (e *Env) loadBrewFormulae() {
-	e.brewFormulae = map[string]bool{}
+func (e *Env) loadBrewFormulae() map[string]bool {
 	if !e.hasBrew {
-		return
+		return nil
 	}
 	// Fast path: an installed formula is a non-empty directory under the Cellar
 	// (each subdirectory is an installed version), so one directory listing
-	// replaces a `brew list` subprocess (~0.5s of Ruby startup).
+	// replaces a `brew list` subprocess (~0.5s of Ruby startup). See brewfs.go.
 	if formulae := cellarFormulae(brewCellarDir()); formulae != nil {
-		e.brewFormulae = formulae
-		return
+		return formulae
 	}
 	// One `brew list` instead of a `brew list <formula>` per agent (brew is slow
 	// to cold-start); each line is "<formula> <version> [more versions]".
 	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"brew", "list", "--formula", "--versions"}, detectCmdTimeout)
 	if exitCode != 0 {
-		return
-	}
-	scanner := bufio.NewScanner(strings.NewReader(out))
-	for scanner.Scan() {
-		if fields := strings.Fields(scanner.Text()); len(fields) > 0 {
-			e.brewFormulae[fields[0]] = true
-		}
-	}
-}
-
-// brewCellarDir resolves the Cellar location: $HOMEBREW_CELLAR, else
-// <prefix>/Cellar with the prefix derived from the brew binary's location
-// (unresolved, since e.g. /usr/local/bin/brew symlinks into the Homebrew
-// repository while the Cellar stays under /usr/local).
-func brewCellarDir() string {
-	if dir := strings.TrimSpace(os.Getenv("HOMEBREW_CELLAR")); dir != "" {
-		return dir
-	}
-	brewPath, err := exec.LookPath("brew")
-	if err != nil {
-		return ""
-	}
-	prefix := filepath.Dir(filepath.Dir(brewPath))
-	return filepath.Join(prefix, "Cellar")
-}
-
-// cellarFormulae lists installed formulae by reading the Cellar directory.
-// Returns nil when the Cellar can't be read (caller falls back to `brew list`).
-func cellarFormulae(cellar string) map[string]bool {
-	if cellar == "" {
-		return nil
-	}
-	entries, err := os.ReadDir(cellar)
-	if err != nil {
 		return nil
 	}
 	formulae := map[string]bool{}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		if fields := strings.Fields(scanner.Text()); len(fields) > 0 {
+			formulae[fields[0]] = true
 		}
-		versions, err := os.ReadDir(filepath.Join(cellar, entry.Name()))
-		if err != nil || len(versions) == 0 {
-			continue
-		}
-		formulae[entry.Name()] = true
 	}
 	return formulae
 }
@@ -706,58 +623,53 @@ func normalizePipName(name string) string {
 
 // PipHas reports whether a pip package is installed (name-normalized).
 func (e *Env) PipHas(pkg string) bool {
-	if !e.hasPython {
-		return false
-	}
-	e.pipOnce.Do(e.loadPipPkgs)
-	return e.pipPkgs[normalizePipName(pkg)]
+	return e.hasPython && e.pipPkgs.get()[normalizePipName(pkg)]
 }
 
-func (e *Env) loadPipPkgs() {
-	e.pipPkgs = map[string]bool{}
+func (e *Env) loadPipPkgs() map[string]bool {
 	if !e.hasPython {
-		return
+		return nil
 	}
 	// One `pip list` instead of a `pip show <pkg>` per agent. Names are normalized
-	// (lowercase, "_"->"-") to match pip's own canonicalization.
+	// (lowercase, "_"->"-") to match pip's own canonicalization. Unlike npm/pnpm,
+	// a nonzero exit means pip itself failed, so it is treated as "no answer".
 	out, exitCode, _, _ := runner.RunStdout(e.baseCtx(), []string{"python3", "-m", "pip", "list", "--format", "freeze"}, detectCmdTimeout)
 	if exitCode != 0 {
-		return
+		return nil
 	}
+	pkgs := map[string]bool{}
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if i := strings.Index(line, "=="); i > 0 {
-			e.pipPkgs[normalizePipName(line[:i])] = true
+			pkgs[normalizePipName(line[:i])] = true
 		}
 	}
+	return pkgs
 }
 
 // VscodeHas reports whether a VS Code extension is installed.
 func (e *Env) VscodeHas(extID string) bool {
-	e.codeOnce.Do(e.loadCodeExtensions)
-	_, ok := e.codeExts[extID]
+	_, ok := e.codeExts.get()[extID]
 	return ok
 }
 
 // VscodeVersion returns the installed version of a VS Code extension, or "".
 func (e *Env) VscodeVersion(extID string) string {
-	e.codeOnce.Do(e.loadCodeExtensions)
-	return e.codeExts[extID]
+	return e.codeExts.get()[extID]
 }
 
-func (e *Env) loadCodeExtensions() {
-	e.codeExts = map[string]string{}
+func (e *Env) loadCodeExtensions() map[string]string {
 	if e.codeCmd == "" {
-		return
+		return nil
 	}
 	// Fast path: read the extensions manifest VS Code itself maintains instead
 	// of spawning its CLI (see vscodeext.go).
 	if exts := readCodeExtensions(codeExtensionsDir(e.codeCmd)); exts != nil {
-		e.codeExts = exts
-		return
+		return exts
 	}
 	out, _, _, _ := runner.RunStdout(e.baseCtx(), []string{e.codeCmd, "--list-extensions", "--show-versions"}, detectCmdTimeout)
+	exts := map[string]string{}
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -768,10 +680,9 @@ func (e *Env) loadCodeExtensions() {
 		if idx <= 0 {
 			continue
 		}
-		id := line[:idx]
-		ver := line[idx+1:]
-		e.codeExts[id] = ver
+		exts[line[:idx]] = line[idx+1:]
 	}
+	return exts
 }
 
 // HelpMatches reports whether `<binary> --help` succeeds and contains the given
@@ -786,13 +697,9 @@ func (e *Env) HelpMatches(binary, contains string) bool {
 	path := e.binaryPath(binary)
 	cacheKey := binary + "\x00" + path + "\x00" + contains
 	e.mu.Lock()
-	if e.helpChecks != nil {
-		if ok, found := e.helpChecks[cacheKey]; found {
-			e.mu.Unlock()
-			return ok
-		}
-	} else {
-		e.helpChecks = map[string]bool{}
+	if ok, found := e.helpChecks[cacheKey]; found {
+		e.mu.Unlock()
+		return ok
 	}
 	e.mu.Unlock()
 
@@ -808,7 +715,7 @@ func (e *Env) HelpMatches(binary, contains string) bool {
 // PrefetchLatest starts registry latest-version lookups for the given packages
 // in the background, so the answers are (mostly) ready by the time resolution
 // finishes and asks for them. Results land in the same memoized store
-// NodeLatestVersion reads.
+// NodeLatestVersion and PeekLatest read.
 func (e *Env) PrefetchLatest(ctx context.Context, pkgs []string) {
 	for _, pkg := range pkgs {
 		if pkg = strings.TrimSpace(pkg); pkg != "" {
@@ -817,27 +724,50 @@ func (e *Env) PrefetchLatest(ctx context.Context, pkgs []string) {
 	}
 }
 
-// registryLatestOnce queries the registry over HTTP for a package's latest
-// version, deduplicated per package (a prefetch and an on-demand caller share
-// one request; the loser of the race just waits for the same result).
-func (e *Env) registryLatestOnce(ctx context.Context, pkg string) string {
-	e.mu.Lock()
-	if e.latestFlight == nil {
-		e.latestFlight = map[string]*latestFlight{}
-	}
-	f, ok := e.latestFlight[pkg]
-	if !ok {
-		f = &latestFlight{}
-		e.latestFlight[pkg] = f
-	}
-	e.mu.Unlock()
-	f.once.Do(func() { f.v = registryLatestVersion(ctx, pkg) })
-	return f.v
-}
-
 type latestFlight struct {
 	once sync.Once
 	v    string
+}
+
+// lookupFlight deduplicates concurrent lookups per key: the first caller runs
+// query while concurrent callers wait for that same result. A successful
+// (non-empty) flight stays memoized; a failed one is removed - identity-checked
+// under the mutex so a newer retry flight is left alone - and a later call runs
+// query again (a canceled prefetch must not poison the on-demand path).
+func (e *Env) lookupFlight(key string, query func() string) string {
+	e.mu.Lock()
+	f, ok := e.latestFlight[key]
+	if !ok {
+		f = &latestFlight{}
+		e.latestFlight[key] = f
+	}
+	e.mu.Unlock()
+	f.once.Do(func() {
+		f.v = query()
+		if f.v == "" {
+			e.mu.Lock()
+			if e.latestFlight[key] == f {
+				delete(e.latestFlight, key)
+			}
+			e.mu.Unlock()
+		}
+	})
+	return f.v
+}
+
+// registryLatestOnce queries the registry over HTTP for a package's latest
+// version, deduplicated per package (a prefetch and an on-demand caller share
+// one request; the loser of the race just waits for the same result). A
+// successful answer lands in latestCache so PeekLatest sees completed
+// prefetches.
+func (e *Env) registryLatestOnce(ctx context.Context, pkg string) string {
+	v := e.lookupFlight(pkg, func() string { return e.registryLatestVersion(ctx, pkg) })
+	if v != "" {
+		e.mu.Lock()
+		e.latestCache[pkg] = v
+		e.mu.Unlock()
+	}
+	return v
 }
 
 // PeekLatest returns a node package's latest version only if a lookup has
@@ -859,26 +789,20 @@ func (e *Env) NodeLatestVersion(ctx context.Context, kind, pkg string) string {
 		return ""
 	}
 	e.mu.Lock()
-	if e.latestCache != nil {
-		if v, ok := e.latestCache[pkg]; ok {
-			e.mu.Unlock()
-			return v
-		}
-	}
+	v := e.latestCache[pkg]
 	e.mu.Unlock()
-
+	if v != "" {
+		return v
+	}
 	// Fast path: ask the registry directly (no manager-CLI startup); usually
 	// already in flight via PrefetchLatest. The CLI query remains as fallback
 	// for registries the HTTP path can't serve.
-	v := e.registryLatestOnce(ctx, pkg)
-	if v == "" {
-		v = queryNodeLatestVersion(ctx, kind, pkg)
+	if v := e.registryLatestOnce(ctx, pkg); v != "" {
+		return v // already memoized by registryLatestOnce
 	}
+	v = queryNodeLatestVersion(ctx, kind, pkg)
 	if v != "" {
 		e.mu.Lock()
-		if e.latestCache == nil {
-			e.latestCache = map[string]string{}
-		}
 		e.latestCache[pkg] = v
 		e.mu.Unlock()
 	}
@@ -886,33 +810,17 @@ func (e *Env) NodeLatestVersion(ctx context.Context, kind, pkg string) string {
 }
 
 func queryNodeLatestVersion(ctx context.Context, kind, pkg string) string {
-	var args []string
-	switch kind {
-	case agents.KindNpm:
-		args = []string{"npm", "view", pkg, "dist-tags.latest"}
-	case agents.KindPnpm:
-		args = []string{"pnpm", "view", pkg, "dist-tags.latest", "--silent"}
-	case agents.KindYarn:
-		args = []string{"yarn", "info", pkg, "dist-tags.latest", "--silent"}
-	case agents.KindBun:
-		// `bun info` needs `-g` to work outside of a JS project.
-		args = []string{"bun", "info", "-g", pkg, "version", "--json"}
-	default:
-		return ""
-	}
-
-	out, exitCode, _, _ := runner.RunStdout(ctx, args, latestVersionCmdTimeout)
-	if exitCode != 0 {
-		return ""
-	}
-	// bun emits JSON: a scalar ("6.0.3") or the full manifest object. Parse the
-	// top-level version explicitly so a dependency's version isn't mistaken for it.
-	if kind == agents.KindBun {
-		if v := version.ParseBunJSON(out); v != "" {
-			return v
+	for _, def := range nodeManagerDefs {
+		if def.kind != kind {
+			continue
 		}
+		out, exitCode, _, _ := runner.RunStdout(ctx, def.latestArgs(pkg), latestVersionCmdTimeout)
+		if exitCode != 0 {
+			return ""
+		}
+		return def.parseLatest(out)
 	}
-	return version.ParseLatest(out)
+	return ""
 }
 
 // LatestVersion returns the latest available version for an update method, or ""
@@ -929,94 +837,4 @@ func (e *Env) LatestVersion(ctx context.Context, method, pkg string) string {
 	default:
 		return ""
 	}
-}
-
-func (e *Env) brewLatest(ctx context.Context, formula string) string {
-	if formula == "" {
-		return ""
-	}
-	// Fast path: tap formulae are local .rb files, and release-pipeline-generated
-	// ones (GoReleaser etc.) carry an explicit `version "x"` literal. `brew info`
-	// reads the same clone, so this is the same data without ~0.7s of Ruby
-	// startup. Anything ambiguous or literal-less falls through to brew info.
-	if v := tapFormulaVersion(brewTapsDirs(), formula); v != "" {
-		return v
-	}
-	out, exitCode, _, _ := runner.RunStdout(ctx, []string{"brew", "info", "--json=v2", formula}, latestVersionCmdTimeout)
-	if exitCode != 0 {
-		return ""
-	}
-	return version.ParseBrewLatest(out)
-}
-
-// brewTapsDirs returns candidate Library/Taps directories: the configured
-// repository, the prefix itself (Apple Silicon layout), and <prefix>/Homebrew
-// (Intel macOS layout).
-func brewTapsDirs() []string {
-	roots := []string{}
-	if repo := strings.TrimSpace(os.Getenv("HOMEBREW_REPOSITORY")); repo != "" {
-		roots = append(roots, repo)
-	}
-	if brewPath, err := exec.LookPath("brew"); err == nil {
-		prefix := filepath.Dir(filepath.Dir(brewPath))
-		roots = append(roots, prefix, filepath.Join(prefix, "Homebrew"))
-	}
-	dirs := make([]string, 0, len(roots))
-	seen := map[string]bool{}
-	for _, root := range roots {
-		dir := filepath.Join(root, "Library", "Taps")
-		if !seen[dir] {
-			seen[dir] = true
-			dirs = append(dirs, dir)
-		}
-	}
-	return dirs
-}
-
-// tapFormulaVersion finds formula .rb files across locally-cloned taps and
-// extracts an explicit version literal. Empty when the formula is absent,
-// present in more than one tap (ambiguous), or has no literal (version derived
-// from its url, e.g. most homebrew/core formulae).
-func tapFormulaVersion(tapsDirs []string, formula string) string {
-	matches := []string{}
-	for _, dir := range tapsDirs {
-		for _, pattern := range []string{
-			filepath.Join(dir, "*", "*", "Formula", formula+".rb"),
-			filepath.Join(dir, "*", "*", formula+".rb"),
-		} {
-			found, err := filepath.Glob(pattern)
-			if err != nil {
-				continue
-			}
-			matches = append(matches, found...)
-		}
-	}
-	if len(matches) != 1 {
-		return ""
-	}
-	data, err := os.ReadFile(matches[0])
-	if err != nil {
-		return ""
-	}
-	return formulaVersionLiteral(string(data))
-}
-
-// formulaVersionLiteral extracts the first `version "x"` literal from formula
-// source, or "".
-func formulaVersionLiteral(src string) string {
-	for _, line := range strings.Split(src, "\n") {
-		line = strings.TrimSpace(line)
-		rest, ok := strings.CutPrefix(line, "version ")
-		if !ok {
-			continue
-		}
-		rest = strings.TrimSpace(rest)
-		if len(rest) < 2 || rest[0] != '"' {
-			continue
-		}
-		if end := strings.IndexByte(rest[1:], '"'); end > 0 {
-			return rest[1 : 1+end]
-		}
-	}
-	return ""
 }

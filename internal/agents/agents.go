@@ -1,5 +1,9 @@
 package agents
 
+// UpdateStrategy is one candidate way to update an agent, tried in order by
+// the resolver. Kind selects the mechanism (see the Kind* constants); the
+// other fields configure it. Like Agent, it is part of the user-facing JSON
+// config schema (see cmd/uca loadConfigAgents).
 type UpdateStrategy struct {
 	Kind         string   `json:"kind"`
 	Command      []string `json:"command,omitempty"`

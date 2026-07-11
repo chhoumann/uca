@@ -47,13 +47,14 @@ func npmPrefixFast() string {
 	return ""
 }
 
-// npmrcPrefix reads a `prefix=` key from an npmrc file. found=false means the
-// key is absent (try the next source); found=true with an empty prefix means
-// the key is set but needs npm's own env-var interpolation (ask the npm CLI).
-func npmrcPrefix(path string) (string, bool) {
+// eachNpmrcEntry visits every key=value pair in an npmrc file (keys and values
+// whitespace-trimmed, comments and malformed lines skipped); an unreadable file
+// visits nothing. Values are passed through verbatim; any expansion (~, ${...})
+// is the caller's business.
+func eachNpmrcEntry(path string, visit func(key, value string)) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", false
+		return
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -61,16 +62,28 @@ func npmrcPrefix(path string) (string, bool) {
 			continue
 		}
 		key, value, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) != "prefix" {
+		if !ok {
 			continue
 		}
-		value = strings.TrimSpace(value)
-		if value == "" || strings.Contains(value, "${") {
-			return "", true // set, but needs npm's own expansion
-		}
-		return expandHome(value), true
+		visit(strings.TrimSpace(key), strings.TrimSpace(value))
 	}
-	return "", false
+}
+
+// npmrcPrefix reads the `prefix=` key from an npmrc file. found=false means the
+// key is absent (try the next source); found=true with an empty prefix means
+// the key is set but needs npm's own env-var interpolation (ask the npm CLI).
+func npmrcPrefix(path string) (prefix string, found bool) {
+	eachNpmrcEntry(path, func(key, value string) {
+		if found || key != "prefix" {
+			return
+		}
+		found = true
+		if value == "" || strings.Contains(value, "${") {
+			return // set, but needs npm's own expansion
+		}
+		prefix = expandHome(value)
+	})
+	return prefix, found
 }
 
 func expandHome(path string) string {

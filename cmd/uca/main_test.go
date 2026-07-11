@@ -237,6 +237,33 @@ func TestParseConfigAgents(t *testing.T) {
 	}
 }
 
+func TestParseConfigAgentsRejectsUnusableStrategies(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want string // substring of the expected error
+	}{
+		{"native without command", `{"agents":[{"name":"x","binary":"x","strategies":[{"kind":"native"}]}]}`, `"command"`},
+		{"npm without package", `{"agents":[{"name":"x","binary":"x","strategies":[{"kind":"npm"}]}]}`, `"package"`},
+		{"node without agent binary", `{"agents":[{"name":"x","strategies":[{"kind":"bun","package":"p"}]}]}`, `"binary"`},
+		{"brew without package", `{"agents":[{"name":"x","binary":"x","strategies":[{"kind":"brew"}]}]}`, `"package"`},
+		{"pip without package", `{"agents":[{"name":"x","binary":"x","strategies":[{"kind":"pip"}]}]}`, `"package"`},
+		{"uv without package", `{"agents":[{"name":"x","binary":"x","strategies":[{"kind":"uv"}]}]}`, `"package"`},
+		{"vscode without extension id", `{"agents":[{"name":"x","strategies":[{"kind":"vscode"}]}]}`, `"extensionId"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseConfigAgents([]byte(tt.json), "cfg")
+			if err == nil {
+				t.Fatalf("parseConfigAgents(%s) accepted an unusable strategy", tt.json)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error %q does not name the missing field %s", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestFilterAgentsUserAgentUppercaseTargetable(t *testing.T) {
 	all := append(agents.Default(), agents.Agent{Name: "MyTool", Binary: "mytool"})
 	selected, unknown := filterAgents(all, "mytool", "")
@@ -322,6 +349,18 @@ func TestParseFlagsReportsUnknownFlag(t *testing.T) {
 	}
 	if !opts.Serial || !opts.DryRun || opts.Only != "claude" {
 		t.Fatalf("parseFlags() parsed = %#v, want Serial/DryRun/Only=claude", opts)
+	}
+}
+
+func TestParseFlagsRejectsPositionalArgs(t *testing.T) {
+	// flag.Parse stops at the first positional, so without an explicit check
+	// `uca claude --dry-run` would silently drop BOTH arguments and run a full
+	// live update. Positionals must be a hard error.
+	if _, err := parseFlags([]string{"claude", "--dry-run"}); err == nil {
+		t.Fatal("parseFlags() with positional arg returned nil error, want error")
+	}
+	if _, err := parseFlags([]string{"--only", "claude", "extra"}); err == nil {
+		t.Fatal("parseFlags() with trailing positional returned nil error, want error")
 	}
 }
 
