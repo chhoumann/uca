@@ -34,8 +34,11 @@ Options:
 - `--json` emit machine-readable JSON
 - `--only <list>` comma-separated agent list to include (e.g. `claude,codex`)
 - `--skip <list>` comma-separated agent list to exclude
+- `--version` show version
 - `-h, --help` show usage
 
+Agents are selected with `--only`/`--skip`; positional arguments are rejected
+(`uca claude` exits with an error instead of silently updating everything).
 `agent` is accepted as an alias for `cursor` in `--only` and `--skip`.
 
 When uca can prove an agent is already at the latest version from the package
@@ -93,6 +96,27 @@ uca --explain
 ## Live output
 
 When `uca` is run in a TTY, it shows a live status dashboard with progress, versions, and timings for installed agents. It also prints an instant boot line and streams agents into the dashboard as they’re detected. When output is piped (or `--quiet`), it prints only completed lines and the summary.
+
+
+## Custom agents (config)
+
+Define extra agents in `<user-config-dir>/uca/config.json` (or `$UCA_CONFIG`).
+Entries with the same name override built-ins:
+
+```json
+{"agents": [{
+  "name": "mytool",
+  "binary": "mytool",
+  "versionCmd": ["mytool", "--version"],
+  "strategies": [{"kind": "npm", "package": "mytool"}]
+}]}
+```
+
+A strategy is one update mechanism, tried in order. Each kind requires the
+field it cannot work without, validated at load time: `native` needs
+`command`; `npm`/`pnpm`/`yarn`/`bun` need `package` (plus the agent-level
+`binary` for bin-dir matching, one strategy per manager you use);
+`brew`/`pip`/`uv` need `package`; `vscode` needs `extensionId`.
 
 ## Detection strategy
 
