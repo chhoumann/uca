@@ -5,11 +5,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/chhoumann/uca/internal/agents"
+	"github.com/chhoumann/uca/internal/vercache"
 )
 
 func TestRunAllDryRunCursorUsesSelectedVersionCommand(t *testing.T) {
@@ -30,6 +32,58 @@ func TestRunAllDryRunCursorUsesSelectedVersionCommand(t *testing.T) {
 	}
 	if results[0].Before != "2026.6.15" || results[0].After != "2026.6.15" {
 		t.Fatalf("Before/After = %q/%q, want selected agent version", results[0].Before, results[0].After)
+	}
+}
+
+func TestRunAllMuseUpdatesDetectedCustomInstallation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Muse launcher is only available on macOS and Linux")
+	}
+	installDir := filepath.Join(t.TempDir(), "custom-muse-bin")
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(installDir, ".muse-version")
+	if err := os.WriteFile(state, []byte("0.1.0-R708.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeExec(t, installDir, "muse", `#!/bin/sh
+set -eu
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+state="$dir/.muse-version"
+if [ "${MUSE_SYNC_UPDATE:-0}" = 1 ]; then
+  printf '%s\n' '0.1.0-R709.1' > "$state"
+fi
+if [ "${1:-}" = "--version" ]; then
+  printf 'Muse Code 0.1.0 (%s)\n' "$(cat "$state")"
+fi
+`)
+	originalPath := os.Getenv("PATH")
+	t.Setenv("PATH", installDir+string(os.PathListSeparator)+originalPath)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("UCA_NO_VERSION_CACHE", "")
+	previousCache := verCache
+	verCache = vercache.Open()
+	t.Cleanup(func() { verCache = previousCache })
+
+	results := runAllWithEvents(context.Background(), []agents.Agent{defaultAgent(t, "muse")}, newTestEnv(), options{}, nil)
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	res := results[0]
+	if res.Status != agents.StatusUpdated {
+		t.Fatalf("status = %q, want updated", res.Status)
+	}
+	if res.Before != "Muse Code 0.1.0 (0.1.0-R708.1)" || res.After != "Muse Code 0.1.0 (0.1.0-R709.1)" {
+		t.Fatalf("Before/After = %q/%q, want Muse release change", res.Before, res.After)
+	}
+	if got := strings.TrimSpace(string(mustRead(t, state))); got != "0.1.0-R709.1" {
+		t.Fatalf("active Muse state = %q, want 0.1.0-R709.1", got)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local", "bin", "muse")); !os.IsNotExist(err) {
+		t.Fatalf("update created a second default Muse installation: %v", err)
 	}
 }
 

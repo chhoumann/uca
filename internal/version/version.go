@@ -47,18 +47,27 @@ func FormatWithToken(before, newVersion string) string {
 }
 
 // Same reports whether two parsed `--version` outputs denote the same version.
-// Exact string equality counts; otherwise both must contain a version token and
-// the tokens must be identical. Tools decorate the version with state that
-// toggles between invocations (e.g. grok appends " [stable]" only while its
-// update-check cache is fresh), so raw output equality would misreport an
-// unchanged agent as updated.
+// Exact string equality counts; otherwise both must contain the same sequence
+// of version tokens. Tools decorate the version with state that toggles between
+// invocations (e.g. grok appends " [stable]" only while its update-check cache
+// is fresh), so raw output equality would misreport an unchanged agent as
+// updated. Comparing every token also preserves release identifiers emitted as
+// a second version, such as Muse Code's 0.1.0-R708.1.
 func Same(a, b string) bool {
 	if a == b {
 		return true
 	}
-	at, aok := ExtractToken(a)
-	bt, bok := ExtractToken(b)
-	return aok && bok && at == bt
+	at := semverTokenRe.FindAllString(a, -1)
+	bt := semverTokenRe.FindAllString(b, -1)
+	if len(at) == 0 || len(at) != len(bt) {
+		return false
+	}
+	for i := range at {
+		if at[i] != bt[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ParseOutput parses a `--version` command's combined output into a clean

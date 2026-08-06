@@ -20,12 +20,13 @@ type UpdateStrategy struct {
 // Agent defines how to update and version a CLI tool. The JSON tags let users
 // describe their own agents in a config file (see cmd/uca loadConfigAgents).
 type Agent struct {
-	Name        string           `json:"name"`
-	Binary      string           `json:"binary,omitempty"`
-	VersionCmd  []string         `json:"versionCmd,omitempty"`
-	ExtensionID string           `json:"extensionId,omitempty"`
-	Aliases     []string         `json:"aliases,omitempty"`
-	Strategies  []UpdateStrategy `json:"strategies,omitempty"`
+	Name                string           `json:"name"`
+	Binary              string           `json:"binary,omitempty"`
+	VersionCmd          []string         `json:"versionCmd,omitempty"`
+	DisableVersionCache bool             `json:"disableVersionCache,omitempty"`
+	ExtensionID         string           `json:"extensionId,omitempty"`
+	Aliases             []string         `json:"aliases,omitempty"`
+	Strategies          []UpdateStrategy `json:"strategies,omitempty"`
 }
 
 // Update result status vocabulary, shared by the resolver, the renderer, and the
@@ -216,10 +217,11 @@ func Default() []Agent {
 			Strategies: append(nodePackageStrategies("@xai-official/grok"), UpdateStrategy{Kind: KindNative, Command: []string{"grok", "update"}}),
 		},
 		{
-			Name:       "muse",
-			Binary:     "muse",
-			VersionCmd: []string{"muse", "--version"},
-			Strategies: []UpdateStrategy{{Kind: KindNative, Command: []string{"bash", "-c", "curl -fsS https://dev.meta.ai/install.sh | bash"}}},
+			Name:                "muse",
+			Binary:              "muse",
+			VersionCmd:          []string{"env", "MUSE_NO_AUTO_UPDATE=1", "muse", "--version"},
+			DisableVersionCache: true,
+			Strategies:          []UpdateStrategy{{Kind: KindNative, Command: []string{"env", "MUSE_SYNC_UPDATE=1", "muse", "--version"}}},
 		},
 	}
 }

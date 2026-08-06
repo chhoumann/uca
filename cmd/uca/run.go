@@ -668,11 +668,11 @@ func getVersion(ctx context.Context, agent agents.Agent, env *detect.Env, method
 		}
 	}
 	if len(versionCmd) > 0 {
-		return runVersionCmd(ctx, versionCmd)
+		return runVersionCmd(ctx, versionCmd, !agent.DisableVersionCache)
 	}
 	if len(agent.VersionCmd) > 0 {
 		if agent.Binary == "" || env.HasBinary(agent.Binary) {
-			return runVersionCmd(ctx, agent.VersionCmd)
+			return runVersionCmd(ctx, agent.VersionCmd, !agent.DisableVersionCache)
 		}
 	}
 	if agent.ExtensionID != "" {
@@ -683,19 +683,23 @@ func getVersion(ctx context.Context, agent agents.Agent, env *detect.Env, method
 	return "unknown"
 }
 
-func runVersionCmd(ctx context.Context, args []string) string {
+func runVersionCmd(ctx context.Context, args []string, useCache bool) string {
 	if len(args) == 0 {
 		return "unknown"
 	}
-	if v, ok := verCache.Get(args); ok {
-		return v
+	if useCache {
+		if v, ok := verCache.Get(args); ok {
+			return v
+		}
 	}
 	out, code, _, _ := runner.Run(ctx, args, versionCmdTimeout)
 	if code != 0 {
 		return "unknown"
 	}
 	v := version.ParseOutput(out)
-	verCache.Put(args, v)
+	if useCache {
+		verCache.Put(args, v)
+	}
 	return v
 }
 

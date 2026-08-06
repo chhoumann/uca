@@ -53,6 +53,7 @@ func TestSame(t *testing.T) {
 		want bool
 	}{
 		{a: "grok 0.2.91 (39d0c6872354)", b: "grok 0.2.91 (39d0c6872354) [stable]", want: true},
+		{a: "Muse Code 0.1.0 (0.1.0-R708.1)", b: "Muse Code 0.1.0 (0.1.0-R709.1)", want: false},
 		{a: "codex-cli 0.90.0", b: "codex-cli 0.90.0", want: true},
 		{a: "codex-cli 0.90.0", b: "codex-cli 0.98.0", want: false},
 		{a: "2026.07.01-41b2de7", b: "2026.07.02-9c1f0aa", want: false},

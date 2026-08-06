@@ -23,12 +23,31 @@ func TestDefaultIncludesExpectedAgents(t *testing.T) {
 	}
 	want := []string{
 		"amp", "gemini", "claude", "codex", "opencode", "droid", "cursor",
-		"copilot", "cline", "roocode", "aider", "pi", "omp", "grok",
+		"copilot", "cline", "roocode", "aider", "pi", "omp", "grok", "muse",
 	}
 	for _, name := range want {
 		if !present[name] {
 			t.Errorf("Default() is missing %s", name)
 		}
+	}
+}
+
+func TestMuseUsesActiveLauncher(t *testing.T) {
+	muse := agentByName(t, "muse")
+	if muse.Binary != "muse" {
+		t.Fatalf("Binary = %q, want muse", muse.Binary)
+	}
+	if !muse.DisableVersionCache {
+		t.Fatal("Muse version cache must be disabled for its stable launcher")
+	}
+	wantVersion := []string{"env", "MUSE_NO_AUTO_UPDATE=1", "muse", "--version"}
+	if !reflect.DeepEqual(muse.VersionCmd, wantVersion) {
+		t.Fatalf("VersionCmd = %#v, want %#v", muse.VersionCmd, wantVersion)
+	}
+	wantUpdate := []string{"env", "MUSE_SYNC_UPDATE=1", "muse", "--version"}
+	if len(muse.Strategies) != 1 || muse.Strategies[0].Kind != KindNative ||
+		!reflect.DeepEqual(muse.Strategies[0].Command, wantUpdate) {
+		t.Fatalf("Strategies = %#v, want native %#v", muse.Strategies, wantUpdate)
 	}
 }
 
