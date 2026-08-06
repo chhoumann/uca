@@ -215,5 +215,11 @@ func Default() []Agent {
 			VersionCmd: []string{"grok", "--version"},
 			Strategies: append(nodePackageStrategies("@xai-official/grok"), UpdateStrategy{Kind: KindNative, Command: []string{"grok", "update"}}),
 		},
+		{
+			Name:       "muse",
+			Binary:     "muse",
+			VersionCmd: []string{"muse", "--version"},
+			Strategies: []UpdateStrategy{{Kind: KindNative, Command: []string{"bash", "-c", "curl -fsS https://dev.meta.ai/install.sh | bash"}}},
+		},
 	}
 }

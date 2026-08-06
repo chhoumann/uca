@@ -92,6 +92,7 @@ uca --explain
 - pi (npm/pnpm/yarn/bun `@earendil-works/pi-coding-agent`)
 - omp (Homebrew `omp`, bun `@oh-my-pi/pi-coding-agent`, or `omp update`)
 - grok (npm/pnpm/yarn/bun `@xai-official/grok` or `grok update`)
+- muse (`curl -fsS https://dev.meta.ai/install.sh | bash`)
 
 ## Live output
 
