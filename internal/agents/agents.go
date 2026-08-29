@@ -134,6 +134,17 @@ func Default() []Agent {
 			Strategies: nodePackageStrategies("opencode-ai"),
 		},
 		{
+			Name:       "opencode2",
+			Binary:     "opencode2",
+			VersionCmd: []string{"opencode2", "--version"},
+			Strategies: []UpdateStrategy{
+				{Kind: KindNpm, Package: "@opencode-ai/cli", Version: "beta"},
+				{Kind: KindPnpm, Package: "@opencode-ai/cli", Version: "beta", Command: []string{"pnpm", "add", "-g", "--allow-build=@opencode-ai/cli", "@opencode-ai/cli@beta"}},
+				{Kind: KindYarn, Package: "@opencode-ai/cli", Version: "beta"},
+				{Kind: KindBun, Package: "@opencode-ai/cli", Version: "beta", Command: []string{"bun", "add", "-g", "--trust", "@opencode-ai/cli@beta"}},
+			},
+		},
+		{
 			Name:       "droid",
 			Binary:     "droid",
 			VersionCmd: []string{"droid", "--version"},
