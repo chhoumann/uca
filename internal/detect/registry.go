@@ -17,8 +17,8 @@ import (
 
 // Latest-version lookups hit the package registry directly over HTTP instead of
 // spawning `npm view` / `bun info` (a Node/manager startup plus its own HTTP
-// round-trip, ~600-900ms each). The GET {registry}/{pkg}/latest endpoint returns
-// the dist-tags.latest manifest, which is exactly what those CLI queries read.
+// round-trip, ~600-900ms each). The GET {registry}/{pkg}/{spec} endpoint returns
+// the manifest selected by an npm tag or exact version.
 // Any failure (custom registry needing auth, offline, non-JSON response) falls
 // back to the manager CLI, so this is purely a fast path.
 
@@ -88,21 +88,16 @@ func (e *Env) registryForPackage(pkg string) (string, bool) {
 	return defaultNpmRegistry, true
 }
 
-// registryLatestVersion returns dist-tags.latest for pkg straight from the
-// registry, or "" when the fast path does not apply (caller falls back to the
-// manager CLI).
-func (e *Env) registryLatestVersion(ctx context.Context, pkg string) string {
+func (e *Env) registryLatestVersion(ctx context.Context, pkg, spec string) string {
 	registry, ok := e.registryForPackage(pkg)
 	if !ok {
 		return ""
 	}
-	return fetchRegistryLatest(ctx, registry, pkg)
+	return fetchRegistryLatest(ctx, registry, pkg, spec)
 }
 
-// fetchRegistryLatest GETs {registry}/{pkg}/latest and extracts the manifest
-// version. Empty on any failure.
-func fetchRegistryLatest(ctx context.Context, registry, pkg string) string {
-	endpoint := strings.TrimRight(registry, "/") + "/" + url.PathEscape(pkg) + "/latest"
+func fetchRegistryLatest(ctx context.Context, registry, pkg, spec string) string {
+	endpoint := strings.TrimRight(registry, "/") + "/" + url.PathEscape(pkg) + "/" + url.PathEscape(versionSpec(spec))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return ""

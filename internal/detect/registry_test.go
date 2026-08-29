@@ -27,17 +27,44 @@ func registryStubEnv(t *testing.T, version string) *Env {
 	return env
 }
 
-func TestPeekLatestSeesCompletedPrefetch(t *testing.T) {
-	env := registryStubEnv(t, "1.2.3")
-	env.PrefetchLatest(context.Background(), []string{"pkg"})
-	// The prefetch runs in a background goroutine; poll until its result is
-	// visible. The stub answers instantly, so well before the deadline.
+func TestLatestCacheSeparatesPackageSpecs(t *testing.T) {
+	t.Setenv("UCA_NO_REGISTRY_HTTP", "")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/pkg/latest":
+			w.Write([]byte(`{"version":"1.2.3"}`))
+		case "/pkg/beta":
+			w.Write([]byte(`{"version":"2.0.0-beta.1"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	env := New(context.Background())
+	env.npmRegistry.once.Do(func() {
+		env.npmRegistry.def = srv.URL
+		env.npmRegistry.scoped = map[string]string{}
+	})
+	env.PrefetchLatest(context.Background(), []PackageQuery{
+		{Package: "pkg"},
+		{Package: "pkg", Spec: "beta"},
+	})
 	deadline := time.Now().Add(2 * time.Second)
-	for env.PeekLatest("pkg") != "1.2.3" {
+	for env.PeekLatest("pkg", "") != "1.2.3" || env.PeekLatest("pkg", "beta") != "2.0.0-beta.1" {
 		if time.Now().After(deadline) {
-			t.Fatalf("PeekLatest = %q after completed prefetch, want 1.2.3", env.PeekLatest("pkg"))
+			t.Fatalf(
+				"PeekLatest latest/beta = %q/%q, want 1.2.3/2.0.0-beta.1",
+				env.PeekLatest("pkg", ""),
+				env.PeekLatest("pkg", "beta"),
+			)
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+	if got := env.PeekLatest("pkg", "latest"); got != "1.2.3" {
+		t.Fatalf("explicit latest = %q, want 1.2.3", got)
+	}
+	if got := env.NodeLatestVersion(context.Background(), "missing-manager", "pkg", "beta"); got != "2.0.0-beta.1" {
+		t.Fatalf("NodeLatestVersion beta = %q, want cached 2.0.0-beta.1", got)
 	}
 }
 
@@ -45,10 +72,10 @@ func TestFailedRegistryLookupRetries(t *testing.T) {
 	env := registryStubEnv(t, "2.0.0")
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if got := env.registryLatestOnce(canceled, "pkg"); got != "" {
+	if got := env.registryLatestOnce(canceled, "pkg", ""); got != "" {
 		t.Fatalf("canceled lookup = %q, want empty", got)
 	}
-	if got := env.registryLatestOnce(context.Background(), "pkg"); got != "2.0.0" {
+	if got := env.registryLatestOnce(context.Background(), "pkg", ""); got != "2.0.0" {
 		t.Fatalf("lookup after failed flight = %q, want 2.0.0 (a failed flight must not be cached)", got)
 	}
 }
@@ -94,6 +121,7 @@ func TestFetchRegistryLatest(t *testing.T) {
 	tests := []struct {
 		name    string
 		pkg     string
+		spec    string
 		status  int
 		body    string
 		want    string
@@ -108,6 +136,11 @@ func TestFetchRegistryLatest(t *testing.T) {
 			name: "scoped package is path-escaped", pkg: "@openai/codex",
 			status: http.StatusOK, body: `{"version":"0.44.1"}`,
 			want: "0.44.1", wantURL: "/@openai%2Fcodex/latest",
+		},
+		{
+			name: "tag", pkg: "pkg", spec: "beta",
+			status: http.StatusOK, body: `{"version":"2.0.0-beta.1"}`,
+			want: "2.0.0-beta.1", wantURL: "/pkg/beta",
 		},
 		{
 			name: "not found", pkg: "missing",
@@ -134,7 +167,7 @@ func TestFetchRegistryLatest(t *testing.T) {
 				w.Write([]byte(tt.body))
 			}))
 			defer srv.Close()
-			got := fetchRegistryLatest(context.Background(), srv.URL, tt.pkg)
+			got := fetchRegistryLatest(context.Background(), srv.URL, tt.pkg, tt.spec)
 			if got != tt.want {
 				t.Fatalf("fetchRegistryLatest = %q, want %q", got, tt.want)
 			}

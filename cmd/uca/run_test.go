@@ -318,3 +318,14 @@ func TestRunAllSkipsPinnedNodeUpdateOnlyAtExactPin(t *testing.T) {
 		t.Fatalf("pin mismatch must run the pinned install; npm calls = %q", calls)
 	}
 }
+
+func TestRunAllSkipsTaggedNodeUpdateWhenAtTagVersion(t *testing.T) {
+	record, env, list := npmSkipFixture(t, "2.0.0-beta.1", "2.0.0-beta.1", "beta")
+	results := runAllWithEvents(context.Background(), list, env, options{}, nil)
+	if calls := recordedCalls(t, record); calls != "" {
+		t.Fatalf("tagged package at target must skip; npm calls = %q", calls)
+	}
+	if results[0].Status != agents.StatusUnchanged {
+		t.Fatalf("status = %q, want unchanged", results[0].Status)
+	}
+}

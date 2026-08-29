@@ -66,28 +66,34 @@ var nodeManagerDefs = []struct {
 	kind        string
 	binDir      func(*Env) string
 	packages    func(*Env) map[string]bool
-	latestArgs  func(pkg string) []string
+	latestArgs  func(pkg, spec string) []string
 	parseLatest func(out string) string
 }{
 	{
-		kind:        agents.KindNpm,
-		binDir:      (*Env).loadNpmBin,
-		packages:    (*Env).loadNpmPkgs,
-		latestArgs:  func(pkg string) []string { return []string{"npm", "view", pkg, "dist-tags.latest"} },
+		kind:     agents.KindNpm,
+		binDir:   (*Env).loadNpmBin,
+		packages: (*Env).loadNpmPkgs,
+		latestArgs: func(pkg, spec string) []string {
+			return []string{"npm", "view", pkg + "@" + versionSpec(spec), "version"}
+		},
 		parseLatest: version.ParseLatest,
 	},
 	{
-		kind:        agents.KindPnpm,
-		binDir:      cmdBinDir("pnpm", "bin", "-g"),
-		packages:    (*Env).loadPnpmPkgs,
-		latestArgs:  func(pkg string) []string { return []string{"pnpm", "view", pkg, "dist-tags.latest", "--silent"} },
+		kind:     agents.KindPnpm,
+		binDir:   cmdBinDir("pnpm", "bin", "-g"),
+		packages: (*Env).loadPnpmPkgs,
+		latestArgs: func(pkg, spec string) []string {
+			return []string{"pnpm", "view", pkg + "@" + versionSpec(spec), "version", "--silent"}
+		},
 		parseLatest: version.ParseLatest,
 	},
 	{
-		kind:        agents.KindYarn,
-		binDir:      cmdBinDir("yarn", "global", "bin"),
-		packages:    cmdPackageList("yarn", "global", "list", "--depth=0"),
-		latestArgs:  func(pkg string) []string { return []string{"yarn", "info", pkg, "dist-tags.latest", "--silent"} },
+		kind:     agents.KindYarn,
+		binDir:   cmdBinDir("yarn", "global", "bin"),
+		packages: cmdPackageList("yarn", "global", "list", "--depth=0"),
+		latestArgs: func(pkg, spec string) []string {
+			return []string{"yarn", "info", pkg + "@" + versionSpec(spec), "version", "--silent"}
+		},
 		parseLatest: version.ParseLatest,
 	},
 	{
@@ -95,7 +101,9 @@ var nodeManagerDefs = []struct {
 		binDir:   cmdBinDir("bun", "pm", "bin", "-g"),
 		packages: cmdPackageList("bun", "pm", "ls", "-g"),
 		// `bun info` needs `-g` to work outside of a JS project.
-		latestArgs: func(pkg string) []string { return []string{"bun", "info", "-g", pkg, "version", "--json"} },
+		latestArgs: func(pkg, spec string) []string {
+			return []string{"bun", "info", "-g", pkg + "@" + versionSpec(spec), "version", "--json"}
+		},
 		// bun emits JSON: a scalar ("6.0.3") or the full manifest object. Parse
 		// the top-level version explicitly so a dependency's version isn't
 		// mistaken for it.
@@ -712,14 +720,31 @@ func (e *Env) HelpMatches(binary, contains string) bool {
 	return ok
 }
 
+// PackageQuery identifies one node package version lookup.
+type PackageQuery struct {
+	Package string
+	Spec    string // Empty means latest.
+}
+
+func versionSpec(spec string) string {
+	if spec = strings.TrimSpace(spec); spec != "" {
+		return spec
+	}
+	return "latest"
+}
+
+func packageQueryKey(pkg, spec string) string {
+	return strings.TrimSpace(pkg) + "\x00" + versionSpec(spec)
+}
+
 // PrefetchLatest starts registry latest-version lookups for the given packages
 // in the background, so the answers are (mostly) ready by the time resolution
 // finishes and asks for them. Results land in the same memoized store
 // NodeLatestVersion and PeekLatest read.
-func (e *Env) PrefetchLatest(ctx context.Context, pkgs []string) {
-	for _, pkg := range pkgs {
-		if pkg = strings.TrimSpace(pkg); pkg != "" {
-			go e.registryLatestOnce(ctx, pkg)
+func (e *Env) PrefetchLatest(ctx context.Context, queries []PackageQuery) {
+	for _, query := range queries {
+		if pkg := strings.TrimSpace(query.Package); pkg != "" {
+			go e.registryLatestOnce(ctx, pkg, query.Spec)
 		}
 	}
 }
@@ -755,66 +780,57 @@ func (e *Env) lookupFlight(key string, query func() string) string {
 	return f.v
 }
 
-// registryLatestOnce queries the registry over HTTP for a package's latest
-// version, deduplicated per package (a prefetch and an on-demand caller share
-// one request; the loser of the race just waits for the same result). A
-// successful answer lands in latestCache so PeekLatest sees completed
-// prefetches.
-func (e *Env) registryLatestOnce(ctx context.Context, pkg string) string {
-	v := e.lookupFlight(pkg, func() string { return e.registryLatestVersion(ctx, pkg) })
+func (e *Env) registryLatestOnce(ctx context.Context, pkg, spec string) string {
+	key := packageQueryKey(pkg, spec)
+	v := e.lookupFlight(key, func() string { return e.registryLatestVersion(ctx, pkg, spec) })
 	if v != "" {
 		e.mu.Lock()
-		e.latestCache[pkg] = v
+		e.latestCache[key] = v
 		e.mu.Unlock()
 	}
 	return v
 }
 
-// PeekLatest returns a node package's latest version only if a lookup has
-// already completed, never blocking or spawning. Used where waiting would cost
-// more than the update command it might skip (bun's no-op install is faster
-// than a registry round-trip).
-func (e *Env) PeekLatest(pkg string) string {
+// PeekLatest returns a node package spec's resolved version only if a lookup has
+// already completed, never blocking or spawning.
+func (e *Env) PeekLatest(pkg, spec string) string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.latestCache[strings.TrimSpace(pkg)]
+	return e.latestCache[packageQueryKey(pkg, spec)]
 }
 
-// NodeLatestVersion returns the registry "latest" for a node package, memoized
-// per package (the answer is manager-independent). Only successful (non-empty)
-// results are cached.
-func (e *Env) NodeLatestVersion(ctx context.Context, kind, pkg string) string {
+// NodeLatestVersion resolves a node package spec, memoized independently of the
+// manager kind. Only successful results are cached.
+func (e *Env) NodeLatestVersion(ctx context.Context, kind, pkg, spec string) string {
 	pkg = strings.TrimSpace(pkg)
 	if pkg == "" {
 		return ""
 	}
+	key := packageQueryKey(pkg, spec)
 	e.mu.Lock()
-	v := e.latestCache[pkg]
+	v := e.latestCache[key]
 	e.mu.Unlock()
 	if v != "" {
 		return v
 	}
-	// Fast path: ask the registry directly (no manager-CLI startup); usually
-	// already in flight via PrefetchLatest. The CLI query remains as fallback
-	// for registries the HTTP path can't serve.
-	if v := e.registryLatestOnce(ctx, pkg); v != "" {
-		return v // already memoized by registryLatestOnce
+	if v := e.registryLatestOnce(ctx, pkg, spec); v != "" {
+		return v
 	}
-	v = queryNodeLatestVersion(ctx, kind, pkg)
+	v = queryNodeLatestVersion(ctx, kind, pkg, spec)
 	if v != "" {
 		e.mu.Lock()
-		e.latestCache[pkg] = v
+		e.latestCache[key] = v
 		e.mu.Unlock()
 	}
 	return v
 }
 
-func queryNodeLatestVersion(ctx context.Context, kind, pkg string) string {
+func queryNodeLatestVersion(ctx context.Context, kind, pkg, spec string) string {
 	for _, def := range nodeManagerDefs {
 		if def.kind != kind {
 			continue
 		}
-		out, exitCode, _, _ := runner.RunStdout(ctx, def.latestArgs(pkg), latestVersionCmdTimeout)
+		out, exitCode, _, _ := runner.RunStdout(ctx, def.latestArgs(pkg, spec), latestVersionCmdTimeout)
 		if exitCode != 0 {
 			return ""
 		}
@@ -826,10 +842,10 @@ func queryNodeLatestVersion(ctx context.Context, kind, pkg string) string {
 // LatestVersion returns the latest available version for an update method, or ""
 // when it is not cheaply/reliably knowable (native/pip/uv). Used by --check.
 // For vscode, pkg is the extension ID.
-func (e *Env) LatestVersion(ctx context.Context, method, pkg string) string {
+func (e *Env) LatestVersion(ctx context.Context, method, pkg, spec string) string {
 	switch method {
 	case agents.KindNpm, agents.KindPnpm, agents.KindYarn, agents.KindBun:
-		return e.NodeLatestVersion(ctx, method, pkg)
+		return e.NodeLatestVersion(ctx, method, pkg, spec)
 	case agents.KindBrew:
 		return e.brewLatest(ctx, pkg)
 	case agents.KindVSCode:

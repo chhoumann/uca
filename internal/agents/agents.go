@@ -12,8 +12,8 @@ type UpdateStrategy struct {
 	Binary       string   `json:"binary,omitempty"`
 	VersionCmd   []string `json:"versionCmd,omitempty"`
 	HelpContains string   `json:"helpContains,omitempty"`
-	// Version pins a specific version for node/uv strategies instead of @latest
-	// (e.g. to hold a 0.x CLI back from a breaking release). Empty means @latest.
+	// Version is an npm/uv version spec, such as a tag or exact version.
+	// Empty means latest.
 	Version string `json:"version,omitempty"`
 }
 

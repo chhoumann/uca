@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/chhoumann/uca/internal/agents"
-	"github.com/chhoumann/uca/internal/agentspec"
 	"github.com/chhoumann/uca/internal/detect"
 )
 
@@ -138,16 +137,28 @@ func prewarmNeeds(selected []agents.Agent) detect.PrewarmNeeds {
 	return needs
 }
 
-// nodePackages returns the distinct node package names the selected agents
+// nodePackages returns the distinct node package specs the selected agents
 // reference, in selection order.
-func nodePackages(selected []agents.Agent) []string {
-	pkgs := []string{}
+func nodePackages(selected []agents.Agent) []detect.PackageQuery {
+	pkgs := []detect.PackageQuery{}
 	seen := map[string]bool{}
 	for _, agent := range selected {
-		pkg := agentspec.NodePackageName(agent.Strategies)
-		if pkg != "" && !seen[pkg] {
-			seen[pkg] = true
-			pkgs = append(pkgs, pkg)
+		for _, strat := range agent.Strategies {
+			pkg := strings.TrimSpace(strat.Package)
+			if !agents.IsNodeKind(strat.Kind) || pkg == "" {
+				continue
+			}
+			spec := strings.TrimSpace(strat.Version)
+			keySpec := spec
+			if keySpec == "" {
+				keySpec = "latest"
+			}
+			key := pkg + "\x00" + keySpec
+			if !seen[key] {
+				seen[key] = true
+				pkgs = append(pkgs, detect.PackageQuery{Package: pkg, Spec: spec})
+			}
+			break
 		}
 	}
 	return pkgs

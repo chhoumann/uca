@@ -68,8 +68,8 @@ type agentWork struct {
 	// targets (used for latest-version lookups and skip-if-current).
 	pkg             string
 	nodePackageName string
-	// nodePackageVersion is the pinned version (empty = @latest). A pinned node
-	// agent is excluded from batching, since the batch assumes a uniform @latest.
+	// nodePackageVersion is the version spec (empty = @latest). A non-empty spec
+	// is excluded from batching, since the batch assumes a uniform @latest.
 	nodePackageVersion string
 	// updateCmd is the final command to run (may be a batch command).
 	updateCmd []string
@@ -229,7 +229,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 					work.previewLatest = latest
 					go func(work agentWork) {
 						if agents.IsNodeKind(work.method) {
-							latest <- env.NodeLatestVersion(previewCtx, work.method, work.nodePackageName)
+							latest <- env.NodeLatestVersion(previewCtx, work.method, work.nodePackageName, work.nodePackageVersion)
 							return
 						}
 						latest <- ""
@@ -273,9 +273,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 		batchIndexes := make([]int, 0, len(indexes))
 		for _, idx := range indexes {
 			pkg := strings.TrimSpace(works[idx].nodePackageName)
-			// A version-pinned agent can't join the @latest batch - run it on its
-			// own with its pinned single command.
-			if pkg == "" || works[idx].nodePackageVersion != "" {
+			if pkg == "" || strings.TrimSpace(works[idx].nodePackageVersion) != "" {
 				works[idx].updateCmd = works[idx].updateCmdSingle
 				tasks = append(tasks, updateTask{kind: kind, cmd: works[idx].updateCmd, agents: []agentWork{works[idx]}})
 				continue
@@ -428,10 +426,11 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 				continue
 			}
 			before := prepared[i].Before
+			spec := work.nodePackageVersion
 			wg.Add(1)
-			go func(i int, before, pkg string) {
+			go func(i int, before, pkg, spec string) {
 				defer wg.Done()
-				latest := env.NodeLatestVersion(previewCtx, kind, pkg)
+				latest := env.NodeLatestVersion(previewCtx, kind, pkg, spec)
 				if latest == "" {
 					return
 				}
@@ -440,7 +439,7 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 					after = latest
 				}
 				prepared[i].After = after
-			}(i, before, pkg)
+			}(i, before, pkg, spec)
 		}
 		wg.Wait()
 		cancel()
@@ -540,7 +539,7 @@ func runTask(ctx context.Context, task updateTask, env *detect.Env, opts options
 // taskUpToDate reports whether every agent in the task is provably already at
 // its target version, using only exact metadata: the manager's own installed
 // records (global package.json, extensions manifest) against an authoritative
-// latest (npm registry, marketplace). Any gap in either side fails open (run
+// target (npm registry, marketplace). Any gap in either side fails open (run
 // the update command). pnpm/yarn global package dirs are not confidently
 // derivable; native/pip/uv have no cheap authoritative latest; and brew's
 // locally-cloned tap formula has no freshness guarantee (only `brew update`,
@@ -554,9 +553,10 @@ func taskUpToDate(ctx context.Context, task updateTask, env *detect.Env) bool {
 			if installed == "" {
 				return false
 			}
-			if pin := strings.TrimSpace(work.nodePackageVersion); pin != "" {
+			spec := strings.TrimSpace(work.nodePackageVersion)
+			if token, ok := version.ExtractToken(spec); ok && token == spec {
 				// A pin can be a downgrade target, so only exact equality skips.
-				if version.Compare(installed, pin) != 0 {
+				if version.Compare(installed, spec) != 0 {
 					return false
 				}
 				continue
@@ -565,9 +565,9 @@ func taskUpToDate(ctx context.Context, task updateTask, env *detect.Env) bool {
 			if work.method == agents.KindBun {
 				// bun's no-op install is faster than a registry round-trip, so
 				// only use an answer that has already arrived.
-				latest = env.PeekLatest(work.nodePackageName)
+				latest = env.PeekLatest(work.nodePackageName, spec)
 			} else {
-				latest = env.NodeLatestVersion(ctx, work.method, work.nodePackageName)
+				latest = env.NodeLatestVersion(ctx, work.method, work.nodePackageName, spec)
 			}
 			if compareVersions(installed, latest) != checkUpToDate {
 				return false

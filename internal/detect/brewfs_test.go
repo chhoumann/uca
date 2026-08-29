@@ -18,7 +18,7 @@ func TestBrewLatestCLIFallback(t *testing.T) {
 	if got := env.brewLatest(context.Background(), "copilot-cli"); got != "1.2.3" {
 		t.Fatalf("brewLatest = %q, want 1.2.3", got)
 	}
-	if got := env.LatestVersion(context.Background(), agents.KindBrew, "copilot-cli"); got != "1.2.3" {
+	if got := env.LatestVersion(context.Background(), agents.KindBrew, "copilot-cli", "ignored"); got != "1.2.3" {
 		t.Fatalf("LatestVersion(brew) = %q, want 1.2.3", got)
 	}
 }
