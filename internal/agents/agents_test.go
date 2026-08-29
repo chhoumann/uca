@@ -2,6 +2,7 @@ package agents
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -22,12 +23,51 @@ func TestDefaultIncludesExpectedAgents(t *testing.T) {
 		present[a.Name] = true
 	}
 	want := []string{
-		"amp", "gemini", "claude", "codex", "opencode", "droid", "cursor",
+		"amp", "gemini", "claude", "codex", "opencode", "opencode2", "droid", "cursor",
 		"copilot", "cline", "roocode", "aider", "pi", "omp", "grok", "muse",
 	}
 	for _, name := range want {
 		if !present[name] {
 			t.Errorf("Default() is missing %s", name)
+		}
+	}
+}
+
+func TestOpenCode2UsesBetaChannel(t *testing.T) {
+	agent := agentByName(t, "opencode2")
+	if agent.Name != "opencode2" {
+		t.Fatalf("Name = %q, want opencode2", agent.Name)
+	}
+	if agent.Binary != "opencode2" {
+		t.Fatalf("Binary = %q, want opencode2", agent.Binary)
+	}
+	wantVersion := []string{"opencode2", "--version"}
+	if !reflect.DeepEqual(agent.VersionCmd, wantVersion) {
+		t.Fatalf("VersionCmd = %#v, want %#v", agent.VersionCmd, wantVersion)
+	}
+	wantKinds := []string{KindNpm, KindPnpm, KindYarn, KindBun}
+	if len(agent.Strategies) != len(wantKinds) {
+		t.Fatalf("Strategies count = %d, want %d", len(agent.Strategies), len(wantKinds))
+	}
+	for i, s := range agent.Strategies {
+		if s.Kind != wantKinds[i] {
+			t.Fatalf("Strategies[%d].Kind = %q, want %q", i, s.Kind, wantKinds[i])
+		}
+		if s.Package != "@opencode-ai/cli" {
+			t.Fatalf("Strategies[%d].Package = %q, want @opencode-ai/cli", i, s.Package)
+		}
+		if s.Version != "beta" {
+			t.Fatalf("Strategies[%d].Version = %q, want beta", i, s.Version)
+		}
+		switch s.Kind {
+		case KindPnpm:
+			if !slices.Contains(s.Command, "--allow-build=@opencode-ai/cli") {
+				t.Fatalf("pnpm Command = %#v, want --allow-build=@opencode-ai/cli", s.Command)
+			}
+		case KindBun:
+			if !slices.Contains(s.Command, "--trust") {
+				t.Fatalf("bun Command = %#v, want --trust", s.Command)
+			}
 		}
 	}
 }

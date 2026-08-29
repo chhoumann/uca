@@ -83,6 +83,7 @@ uca --explain
 - claude (`claude update`)
 - codex (npm/pnpm/yarn/bun `@openai/codex`)
 - opencode (npm/pnpm/yarn/bun `opencode-ai`)
+- opencode2 (npm/pnpm/yarn/bun `@opencode-ai/cli@beta`)
 - droid (npm/pnpm/yarn/bun `droid` or `droid update`)
 - cursor (`agent update`, falling back to `cursor-agent update`)
 - copilot (Homebrew `copilot-cli` or npm/pnpm/yarn/bun `@github/copilot`)
