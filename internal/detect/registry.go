@@ -88,8 +88,6 @@ func (e *Env) registryForPackage(pkg string) (string, bool) {
 	return defaultNpmRegistry, true
 }
 
-// registryLatestVersion resolves a package spec straight from the registry, or
-// returns "" when the fast path does not apply.
 func (e *Env) registryLatestVersion(ctx context.Context, pkg, spec string) string {
 	registry, ok := e.registryForPackage(pkg)
 	if !ok {
@@ -98,8 +96,6 @@ func (e *Env) registryLatestVersion(ctx context.Context, pkg, spec string) strin
 	return fetchRegistryLatest(ctx, registry, pkg, spec)
 }
 
-// fetchRegistryLatest GETs {registry}/{pkg}/{spec} and extracts the manifest
-// version. Empty on any failure.
 func fetchRegistryLatest(ctx context.Context, registry, pkg, spec string) string {
 	endpoint := strings.TrimRight(registry, "/") + "/" + url.PathEscape(pkg) + "/" + url.PathEscape(versionSpec(spec))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)

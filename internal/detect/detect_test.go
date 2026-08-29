@@ -40,8 +40,6 @@ func fakeEnv(t *testing.T, scripts map[string]string) *Env {
 func TestNodeLatestVersionCaches(t *testing.T) {
 	env := New(context.Background())
 	env.latestCache[packageQueryKey("pkg", "")] = "9.9.9"
-	// A cached value is returned without running any command, regardless of the
-	// manager kind (the registry answer is manager-independent).
 	if got := env.NodeLatestVersion(context.Background(), agents.KindNpm, "pkg", ""); got != "9.9.9" {
 		t.Fatalf("NodeLatestVersion cached = %q, want 9.9.9", got)
 	}
@@ -74,26 +72,20 @@ func TestNodeManagerLatestArgsUsesVersionSpec(t *testing.T) {
 }
 
 func TestLatestVersionDispatch(t *testing.T) {
-	// Hermetic: nothing here may reach a live registry (node answers come from
-	// the pre-seeded cache, the marketplace from a local stub).
 	t.Setenv("UCA_NO_REGISTRY_HTTP", "")
 	env := New(context.Background())
 
-	// native/pip/uv (and unknown methods) are documented as not cheaply
-	// knowable: always empty, no I/O.
 	for _, m := range []string{agents.KindNative, agents.KindPip, agents.KindUv, "unknown"} {
 		if got := env.LatestVersion(context.Background(), m, "pkg", "beta"); got != "" {
 			t.Fatalf("LatestVersion(%q) = %q, want empty", m, got)
 		}
 	}
 
-	// Node kinds dispatch to the memoized node lookup.
 	env.latestCache[packageQueryKey("pkg", "beta")] = "9.9.9"
 	if got := env.LatestVersion(context.Background(), agents.KindNpm, "pkg", "beta"); got != "9.9.9" {
 		t.Fatalf("LatestVersion(npm) = %q, want 9.9.9", got)
 	}
 
-	// vscode dispatches to the marketplace lookup (pkg is the extension ID).
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"results":[{"extensions":[{"versions":[{"version":"4.0.7","properties":[]}]}]}]}`))
 	}))

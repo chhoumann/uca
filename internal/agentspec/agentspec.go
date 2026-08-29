@@ -43,8 +43,6 @@ var nodeInstallArgv = map[string][]string{
 	agents.KindBun:  {"bun", "add", "-g"},
 }
 
-// nodeUpdateCommand builds the single-package update command for a node strategy
-// using its Version spec, or @latest when empty.
 func nodeUpdateCommand(strat agents.UpdateStrategy) []string {
 	if len(strat.Command) > 0 {
 		return strat.Command

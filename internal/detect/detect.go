@@ -780,8 +780,6 @@ func (e *Env) lookupFlight(key string, query func() string) string {
 	return f.v
 }
 
-// registryLatestOnce queries the registry over HTTP, deduplicated per package
-// spec. A prefetch and an on-demand caller share one request.
 func (e *Env) registryLatestOnce(ctx context.Context, pkg, spec string) string {
 	key := packageQueryKey(pkg, spec)
 	v := e.lookupFlight(key, func() string { return e.registryLatestVersion(ctx, pkg, spec) })
@@ -794,9 +792,7 @@ func (e *Env) registryLatestOnce(ctx context.Context, pkg, spec string) string {
 }
 
 // PeekLatest returns a node package spec's resolved version only if a lookup has
-// already completed, never blocking or spawning. Used where waiting would cost
-// more than the update command it might skip (bun's no-op install is faster
-// than a registry round-trip).
+// already completed, never blocking or spawning.
 func (e *Env) PeekLatest(pkg, spec string) string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -817,11 +813,8 @@ func (e *Env) NodeLatestVersion(ctx context.Context, kind, pkg, spec string) str
 	if v != "" {
 		return v
 	}
-	// Fast path: ask the registry directly (no manager-CLI startup); usually
-	// already in flight via PrefetchLatest. The CLI query remains as fallback
-	// for registries the HTTP path can't serve.
 	if v := e.registryLatestOnce(ctx, pkg, spec); v != "" {
-		return v // already memoized by registryLatestOnce
+		return v
 	}
 	v = queryNodeLatestVersion(ctx, kind, pkg, spec)
 	if v != "" {

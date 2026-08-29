@@ -87,8 +87,6 @@ func runCheck(ctx context.Context, selected []agents.Agent, env *detect.Env) []c
 				results[i] = res
 				return
 			}
-			// Current (a CLI startup) and latest (registry/manager query) are
-			// independent lookups; fetch them concurrently.
 			latestCh := make(chan string, 1)
 			go func() { latestCh <- env.LatestVersion(checkCtx, resolved.Method, resolved.Pkg, resolved.Version) }()
 			res.Current = getVersion(checkCtx, agent, env, resolved.Method, resolved.VersionCmd)
