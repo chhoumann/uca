@@ -149,3 +149,18 @@ func TestPrewarmNeeds(t *testing.T) {
 		})
 	}
 }
+
+func TestNodePackagesIncludesVersionSpec(t *testing.T) {
+	selected := []agents.Agent{
+		{Strategies: []agents.UpdateStrategy{{Kind: agents.KindNative}, {Kind: agents.KindNpm, Package: "pkg", Version: "beta"}}},
+		{Strategies: []agents.UpdateStrategy{{Kind: agents.KindBun, Package: "pkg"}}},
+		{Strategies: []agents.UpdateStrategy{{Kind: agents.KindYarn, Package: "pkg", Version: "beta"}}},
+	}
+	want := []detect.PackageQuery{
+		{Package: "pkg", Spec: "beta"},
+		{Package: "pkg"},
+	}
+	if got := nodePackages(selected); !reflect.DeepEqual(got, want) {
+		t.Fatalf("nodePackages = %#v, want %#v", got, want)
+	}
+}

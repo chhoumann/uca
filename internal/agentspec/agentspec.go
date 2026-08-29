@@ -23,8 +23,8 @@ func ShouldLockKind(kind string) bool {
 	}
 }
 
-// versionSpec returns the version selector for a package spec: a pinned version
-// when set, otherwise "latest" (forced to avoid getting stuck on old
+// versionSpec returns the version selector for a package spec: a tag or exact
+// version when set, otherwise "latest" (forced to avoid getting stuck on old
 // minor/prerelease versions, common for 0.x CLIs).
 func versionSpec(v string) string {
 	if s := strings.TrimSpace(v); s != "" {
@@ -44,7 +44,7 @@ var nodeInstallArgv = map[string][]string{
 }
 
 // nodeUpdateCommand builds the single-package update command for a node strategy
-// (honoring a pinned Version, else @latest).
+// using its Version spec, or @latest when empty.
 func nodeUpdateCommand(strat agents.UpdateStrategy) []string {
 	if len(strat.Command) > 0 {
 		return strat.Command
@@ -116,8 +116,8 @@ type Resolved struct {
 	// Pkg is the package/formula identifier the update targets, used by --check to
 	// look up the latest version. Empty when latest is not knowable.
 	Pkg string
-	// Version is the pinned version for a resolved node strategy (empty means
-	// @latest). Only node kinds populate it; a uv pin is baked directly into Cmd.
+	// Version is the version spec for a resolved node strategy (empty means
+	// @latest). Only node kinds populate it; a uv spec is baked directly into Cmd.
 	Version string
 }
 

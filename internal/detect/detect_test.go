@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 
@@ -38,14 +39,37 @@ func fakeEnv(t *testing.T, scripts map[string]string) *Env {
 
 func TestNodeLatestVersionCaches(t *testing.T) {
 	env := New(context.Background())
-	env.latestCache["pkg"] = "9.9.9"
+	env.latestCache[packageQueryKey("pkg", "")] = "9.9.9"
 	// A cached value is returned without running any command, regardless of the
 	// manager kind (the registry answer is manager-independent).
-	if got := env.NodeLatestVersion(context.Background(), agents.KindNpm, "pkg"); got != "9.9.9" {
+	if got := env.NodeLatestVersion(context.Background(), agents.KindNpm, "pkg", ""); got != "9.9.9" {
 		t.Fatalf("NodeLatestVersion cached = %q, want 9.9.9", got)
 	}
-	if got := env.NodeLatestVersion(context.Background(), agents.KindBun, "pkg"); got != "9.9.9" {
+	if got := env.NodeLatestVersion(context.Background(), agents.KindBun, "pkg", ""); got != "9.9.9" {
 		t.Fatalf("NodeLatestVersion cached (other kind) = %q, want 9.9.9", got)
+	}
+}
+
+func TestNodeManagerLatestArgsUsesVersionSpec(t *testing.T) {
+	betaWant := map[string][]string{
+		agents.KindNpm:  {"npm", "view", "pkg@beta", "version"},
+		agents.KindPnpm: {"pnpm", "view", "pkg@beta", "version", "--silent"},
+		agents.KindYarn: {"yarn", "info", "pkg@beta", "version", "--silent"},
+		agents.KindBun:  {"bun", "info", "-g", "pkg@beta", "version", "--json"},
+	}
+	latestWant := map[string][]string{
+		agents.KindNpm:  {"npm", "view", "pkg@latest", "version"},
+		agents.KindPnpm: {"pnpm", "view", "pkg@latest", "version", "--silent"},
+		agents.KindYarn: {"yarn", "info", "pkg@latest", "version", "--silent"},
+		agents.KindBun:  {"bun", "info", "-g", "pkg@latest", "version", "--json"},
+	}
+	for _, def := range nodeManagerDefs {
+		if got := def.latestArgs("pkg", "beta"); !reflect.DeepEqual(got, betaWant[def.kind]) {
+			t.Errorf("%s beta args = %#v, want %#v", def.kind, got, betaWant[def.kind])
+		}
+		if got := def.latestArgs("pkg", ""); !reflect.DeepEqual(got, latestWant[def.kind]) {
+			t.Errorf("%s latest args = %#v, want %#v", def.kind, got, latestWant[def.kind])
+		}
 	}
 }
 
@@ -58,14 +82,14 @@ func TestLatestVersionDispatch(t *testing.T) {
 	// native/pip/uv (and unknown methods) are documented as not cheaply
 	// knowable: always empty, no I/O.
 	for _, m := range []string{agents.KindNative, agents.KindPip, agents.KindUv, "unknown"} {
-		if got := env.LatestVersion(context.Background(), m, "pkg"); got != "" {
+		if got := env.LatestVersion(context.Background(), m, "pkg", "beta"); got != "" {
 			t.Fatalf("LatestVersion(%q) = %q, want empty", m, got)
 		}
 	}
 
 	// Node kinds dispatch to the memoized node lookup.
-	env.latestCache["pkg"] = "9.9.9"
-	if got := env.LatestVersion(context.Background(), agents.KindNpm, "pkg"); got != "9.9.9" {
+	env.latestCache[packageQueryKey("pkg", "beta")] = "9.9.9"
+	if got := env.LatestVersion(context.Background(), agents.KindNpm, "pkg", "beta"); got != "9.9.9" {
 		t.Fatalf("LatestVersion(npm) = %q, want 9.9.9", got)
 	}
 
@@ -77,7 +101,7 @@ func TestLatestVersionDispatch(t *testing.T) {
 	old := marketplaceURL
 	marketplaceURL = srv.URL
 	defer func() { marketplaceURL = old }()
-	if got := env.LatestVersion(context.Background(), agents.KindVSCode, "pub.ext"); got != "4.0.7" {
+	if got := env.LatestVersion(context.Background(), agents.KindVSCode, "pub.ext", "ignored"); got != "4.0.7" {
 		t.Fatalf("LatestVersion(vscode) = %q, want 4.0.7", got)
 	}
 }
