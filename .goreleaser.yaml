@@ -28,8 +28,19 @@ checksum:
 
 # Homebrew distribution is a cask (the formula-based `brews` section is
 # deprecated since GoReleaser v2.10). The binaries are unsigned, so the
-# post-install hook strips the Gatekeeper quarantine bit on macOS; without it
+# post-install step strips the Gatekeeper quarantine bit on macOS; without it
 # the installed binary dies with "uca is damaged and cannot be opened".
+#
+# Homebrew deprecated the `postflight` stanza in favour of `postflight_steps`,
+# which takes its declarative install-steps DSL instead of raw Ruby. GoReleaser's
+# `hooks.post.install` still emits `postflight` (goreleaser/goreleaser#6870), so
+# the stanza is written via `custom_block` until `hooks.post.install_steps`
+# ships (goreleaser/goreleaser#6873). The `{{ "..." }}` wrapper escapes
+# Homebrew's `{{staged_path}}` token from GoReleaser's template pass.
+#
+# `run` aborts the install on a non-zero exit, and `xattr -d` exits 1 when the
+# attribute is absent; `-r` turns that into a no-op, which keeps
+# `brew install --no-quarantine` working.
 homebrew_casks:
   - name: uca
     homepage: "https://github.com/chhoumann/uca"
@@ -38,9 +49,9 @@ homebrew_casks:
       owner: chhoumann
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    hooks:
-      post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/uca"]
-          end
+    custom_block: |
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/uca"]
+        end
+      end
