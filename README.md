@@ -82,8 +82,8 @@ uca --explain
 - gemini (npm/pnpm/yarn/bun `@google/gemini-cli`)
 - claude (`claude update`)
 - codex (npm/pnpm/yarn/bun `@openai/codex`)
-- opencode (npm/pnpm/yarn/bun `opencode-ai`)
-- opencode2 (npm/pnpm/yarn/bun `@opencode-ai/cli@beta`)
+- opencode (npm/pnpm/yarn/bun `opencode-ai` or `@opencode/cli`, selected from the package that owns the executable)
+- opencode2 (npm/pnpm/yarn/bun `@opencode/cli`; existing `@opencode-ai/cli@beta` installations keep their beta channel)
 - droid (npm/pnpm/yarn/bun `droid` or `droid update`)
 - cursor (`agent update`, falling back to `cursor-agent update`)
 - copilot (Homebrew `copilot-cli` or npm/pnpm/yarn/bun `@github/copilot`)
@@ -94,6 +94,8 @@ uca --explain
 - omp (Homebrew `omp`, bun `@oh-my-pi/pi-coding-agent`, or `omp update`)
 - grok (npm/pnpm/yarn/bun `@xai-official/grok` or `grok update`)
 - muse (Muse launcher self-update)
+
+When `opencode` and `opencode2` belong to the same package, UCA updates that package once.
 
 ## Live output
 

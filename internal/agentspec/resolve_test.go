@@ -14,6 +14,7 @@ type fakeEnv struct {
 	bins      map[string]bool
 	nodeMgrs  map[string]bool
 	mgrForBin map[string]string
+	pkgForBin map[string]string
 	mgrForPkg map[string]string
 	binInMgr  map[string]bool // key: kind+"|"+name
 	brew      bool
@@ -27,6 +28,7 @@ type fakeEnv struct {
 	help      map[string]bool // key: binary+"|"+contains
 }
 
+func (f fakeEnv) NodePackageForBinary(n string) string  { return f.pkgForBin[n] }
 func (f fakeEnv) HasBinary(n string) bool               { return f.bins[n] }
 func (f fakeEnv) HasNodeManager(k string) bool          { return f.nodeMgrs[k] }
 func (f fakeEnv) NodeManagerForBinary(n string) string  { return f.mgrForBin[n] }
@@ -246,5 +248,39 @@ func TestResolveNodeBinDirFallbackKeepsPin(t *testing.T) {
 	}
 	if !reflect.DeepEqual(r.Cmd, []string{"npm", "install", "-g", "pkg-one@1.2.3"}) || r.Method != agents.KindNpm || r.Pkg != "pkg-one" {
 		t.Fatalf("resolve = %#v", r)
+	}
+}
+
+func TestResolveOpenCodePreservesPackageOwner(t *testing.T) {
+	for _, tt := range []struct{ name, owner, pkg, spec string }{
+		{"opencode", "opencode-ai", "opencode-ai", ""},
+		{"opencode", "@opencode/cli", "@opencode/cli", ""},
+		{"opencode2", "@opencode/cli", "@opencode/cli", ""},
+		{"opencode2", "@opencode-ai/cli", "@opencode-ai/cli", "beta"},
+		{"opencode", "unrelated", "", ""},
+	} {
+		t.Run(tt.name+"/"+tt.owner, func(t *testing.T) {
+			env := fakeEnv{
+				bins:      map[string]bool{tt.name: true},
+				nodeMgrs:  map[string]bool{agents.KindBun: true},
+				mgrForBin: map[string]string{tt.name: agents.KindBun},
+				pkgForBin: map[string]string{tt.name: tt.owner},
+			}
+			got := Resolve(agentByName(t, tt.name), env)
+			if got.Pkg != tt.pkg || got.Version != tt.spec {
+				t.Fatalf("resolved = %#v", got)
+			}
+			if tt.pkg == "" && got.Cmd != nil {
+				t.Fatalf("unrecognized owner gets update: %#v", got)
+			}
+		})
+	}
+}
+
+func TestResolveOpenCodeFindsAlternativePackageWithoutBinary(t *testing.T) {
+	env := fakeEnv{nodeMgrs: map[string]bool{agents.KindNpm: true}, mgrForPkg: map[string]string{"@opencode/cli": agents.KindNpm}}
+	got := Resolve(agentByName(t, "opencode"), env)
+	if got.Pkg != "@opencode/cli" {
+		t.Fatalf("resolved = %#v", got)
 	}
 }
