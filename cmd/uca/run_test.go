@@ -329,3 +329,42 @@ func TestRunAllSkipsTaggedNodeUpdateWhenAtTagVersion(t *testing.T) {
 		t.Fatalf("status = %q, want unchanged", results[0].Status)
 	}
 }
+
+func TestRunAllOpenCodeAliasesUpdateOwningPackageOnce(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink fixtures are POSIX-only")
+	}
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	pkg := filepath.Join(root, "install", "global", "node_modules", "@opencode", "cli")
+	for _, dir := range []string{bin, filepath.Join(pkg, "bin")} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeExec(t, filepath.Join(pkg, "bin"), "opencode.exe", "#!/bin/sh\necho 2.0.11\n")
+	if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte(`{"name":"@opencode/cli","version":"2.0.11","bin":{"opencode":"bin/opencode.exe","opencode2":"bin/opencode.exe"}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"opencode", "opencode2"} {
+		if err := os.Symlink(filepath.Join(pkg, "bin", "opencode.exe"), filepath.Join(bin, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record := filepath.Join(root, "calls")
+	fakePathEnv(t, nil)
+	writeExec(t, bin, "bun", "#!/bin/sh\ncase \"$1 $2\" in\n'pm bin') echo "+shellQuote(bin)+" ;;\n'add -g') echo \"$@\" >> "+shellQuote(record)+" ;;\nesac\n")
+	t.Setenv("PATH", bin)
+	selected := []agents.Agent{defaultAgent(t, "opencode"), defaultAgent(t, "opencode2")}
+	for _, dry := range []bool{true, false} {
+		results := runAllWithEvents(context.Background(), selected, newTestEnv(), options{DryRun: dry, Force: true}, nil)
+		for _, got := range results {
+			if got.UpdateCmd != "bun add -g @opencode/cli@latest" {
+				t.Fatalf("dry=%v update = %q", dry, got.UpdateCmd)
+			}
+		}
+	}
+	if got := strings.TrimSpace(string(mustRead(t, record))); got != "add -g @opencode/cli@latest" {
+		t.Fatalf("manager calls = %q", got)
+	}
+}

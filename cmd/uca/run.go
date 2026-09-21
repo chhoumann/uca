@@ -209,7 +209,7 @@ func runAllWithEvents(ctx context.Context, selected []agents.Agent, env *detect.
 				updateCmdSingle: resolved.Cmd,
 			}
 			if agents.IsNodeKind(resolved.Method) {
-				work.nodePackageName = agentspec.NodePackageName(agent.Strategies)
+				work.nodePackageName = resolved.Pkg
 				work.nodePackageVersion = resolved.Version
 			}
 			if work.updateCmdSingle != nil {

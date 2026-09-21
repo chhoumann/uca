@@ -9,6 +9,40 @@ import (
 	"github.com/chhoumann/uca/internal/agents"
 )
 
+// NodePackageForBinary identifies the package that declares the resolved executable.
+// A bin directory identifies a manager, but several packages can publish the same command.
+func (e *Env) NodePackageForBinary(name string) string {
+	path := resolveSymlinkPath(e.binaryPath(name))
+	if path == "" {
+		return ""
+	}
+	for dir := filepath.Dir(path); dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+		data, err := os.ReadFile(filepath.Join(dir, "package.json"))
+		if err != nil {
+			continue
+		}
+		var manifest struct {
+			Name string          `json:"name"`
+			Bin  json.RawMessage `json:"bin"`
+		}
+		if json.Unmarshal(data, &manifest) != nil || manifest.Name == "" {
+			continue
+		}
+		var bins map[string]string
+		if json.Unmarshal(manifest.Bin, &bins) != nil {
+			var bin string
+			if json.Unmarshal(manifest.Bin, &bin) != nil {
+				continue
+			}
+			bins = map[string]string{filepath.Base(manifest.Name): bin}
+		}
+		if bin := bins[name]; bin != "" && resolveSymlinkPath(filepath.Join(dir, bin)) == path {
+			return manifest.Name
+		}
+	}
+	return ""
+}
+
 // Exact installed-version reads from the metadata each package manager itself
 // maintains. These let the update path prove "already at latest" and skip the
 // manager's update command entirely (a no-op `npm install -g` still costs

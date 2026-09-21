@@ -33,7 +33,7 @@ func TestDefaultIncludesExpectedAgents(t *testing.T) {
 	}
 }
 
-func TestOpenCode2UsesBetaChannel(t *testing.T) {
+func TestOpenCode2SupportsStableAndBetaPackages(t *testing.T) {
 	agent := agentByName(t, "opencode2")
 	if agent.Name != "opencode2" {
 		t.Fatalf("Name = %q, want opencode2", agent.Name)
@@ -45,13 +45,19 @@ func TestOpenCode2UsesBetaChannel(t *testing.T) {
 	if !reflect.DeepEqual(agent.VersionCmd, wantVersion) {
 		t.Fatalf("VersionCmd = %#v, want %#v", agent.VersionCmd, wantVersion)
 	}
-	wantKinds := []string{KindNpm, KindPnpm, KindYarn, KindBun}
+	wantKinds := []string{KindNpm, KindPnpm, KindYarn, KindBun, KindNpm, KindPnpm, KindYarn, KindBun}
 	if len(agent.Strategies) != len(wantKinds) {
 		t.Fatalf("Strategies count = %d, want %d", len(agent.Strategies), len(wantKinds))
 	}
 	for i, s := range agent.Strategies {
 		if s.Kind != wantKinds[i] {
 			t.Fatalf("Strategies[%d].Kind = %q, want %q", i, s.Kind, wantKinds[i])
+		}
+		if i >= 4 {
+			if s.Package != "@opencode/cli" || s.Version != "" {
+				t.Fatalf("stable strategy = %#v", s)
+			}
+			continue
 		}
 		if s.Package != "@opencode-ai/cli" {
 			t.Fatalf("Strategies[%d].Package = %q, want @opencode-ai/cli", i, s.Package)

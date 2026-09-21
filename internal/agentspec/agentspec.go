@@ -74,22 +74,13 @@ func NodeBatchUpdateCommand(kind string, pkgs []string) []string {
 	return args
 }
 
-// NodePackageName returns the package name from an agent's first node strategy.
-func NodePackageName(strategies []agents.UpdateStrategy) string {
-	for _, strat := range strategies {
-		if agents.IsNodeKind(strat.Kind) && strat.Package != "" {
-			return strat.Package
-		}
-	}
-	return ""
-}
-
 // Env is the minimal environment-capability surface Resolve needs. *detect.Env
 // satisfies it structurally, so cmd passes the concrete type without an adapter.
 type Env interface {
 	HasBinary(name string) bool
 	HasNodeManager(kind string) bool
 	NodeManagerForBinary(name string) string
+	NodePackageForBinary(name string) string
 	NodeBinHasBinary(kind, name string) bool
 	NodeManagerForPackage(pkg string) string
 	HasBrew() bool
@@ -143,8 +134,7 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 	// agents that resolve natively (or have no node strategies at all) never
 	// trigger the node bin-dir / package-list probes.
 	nodeManager := ""
-	packageManager := ""
-	packageName := NodePackageName(agent.Strategies)
+	packageOwner := ""
 	managersResolved := false
 	resolveManagers := func() {
 		if managersResolved {
@@ -153,9 +143,7 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 		managersResolved = true
 		if agent.Binary != "" {
 			nodeManager = env.NodeManagerForBinary(agent.Binary)
-		}
-		if nodeManager == "" && packageName != "" {
-			packageManager = env.NodeManagerForPackage(packageName)
+			packageOwner = env.NodePackageForBinary(agent.Binary)
 		}
 	}
 
@@ -184,6 +172,13 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 				continue
 			}
 			resolveManagers()
+			if packageOwner != "" && packageOwner != strat.Package {
+				continue
+			}
+			packageManager := ""
+			if nodeManager == "" {
+				packageManager = env.NodeManagerForPackage(strat.Package)
+			}
 			switch {
 			case nodeManager != "":
 				if nodeManager != strat.Kind {
@@ -200,7 +195,7 @@ func Resolve(agent agents.Agent, env Env) Resolved {
 					continue
 				}
 			}
-			detail := fmt.Sprintf("%s global bin has %s; matched by bin dir; updating via %s", strat.Kind, agent.Binary, strat.Kind)
+			detail := fmt.Sprintf("%s global bin has %s; updating package %s via %s", strat.Kind, agent.Binary, strat.Package, strat.Kind)
 			return Resolved{Cmd: nodeUpdateCommand(strat), Method: strat.Kind, Detail: detail, Pkg: strat.Package, Version: strat.Version}
 		case agents.KindBrew:
 			if !env.HasBrew() {

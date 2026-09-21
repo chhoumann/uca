@@ -67,13 +67,3 @@ func TestShouldLockKind(t *testing.T) {
 		t.Fatal("ShouldLockKind wrong")
 	}
 }
-
-func TestNodePackageName(t *testing.T) {
-	a := agents.Agent{Strategies: []agents.UpdateStrategy{{Kind: agents.KindNative}, {Kind: agents.KindBun, Package: "pkg"}}}
-	if got := NodePackageName(a.Strategies); got != "pkg" {
-		t.Fatalf("NodePackageName = %q, want pkg", got)
-	}
-	if got := NodePackageName([]agents.UpdateStrategy{{Kind: agents.KindNative}}); got != "" {
-		t.Fatalf("NodePackageName(no node) = %q, want empty", got)
-	}
-}
