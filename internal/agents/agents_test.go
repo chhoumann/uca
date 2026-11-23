@@ -24,7 +24,7 @@ func TestDefaultIncludesExpectedAgents(t *testing.T) {
 	}
 	want := []string{
 		"amp", "gemini", "claude", "codex", "opencode", "opencode2", "droid", "cursor",
-		"copilot", "cline", "roocode", "aider", "pi", "omp", "grok", "muse",
+		"copilot", "cline", "roocode", "aider", "pi", "omp", "grok", "muse", "antigravity",
 	}
 	for _, name := range want {
 		if !present[name] {
@@ -75,6 +75,25 @@ func TestOpenCode2SupportsStableAndBetaPackages(t *testing.T) {
 				t.Fatalf("bun Command = %#v, want --trust", s.Command)
 			}
 		}
+	}
+}
+
+func TestAntigravityUsesNativeUpdater(t *testing.T) {
+	agy := agentByName(t, "antigravity")
+	if agy.Binary != "agy" {
+		t.Fatalf("Binary = %q, want agy", agy.Binary)
+	}
+	wantVersion := []string{"agy", "--version"}
+	if !reflect.DeepEqual(agy.VersionCmd, wantVersion) {
+		t.Fatalf("VersionCmd = %#v, want %#v", agy.VersionCmd, wantVersion)
+	}
+	if !reflect.DeepEqual(agy.Aliases, []string{"agy"}) {
+		t.Fatalf("Aliases = %#v, want [agy]", agy.Aliases)
+	}
+	wantUpdate := []string{"agy", "update"}
+	if len(agy.Strategies) != 1 || agy.Strategies[0].Kind != KindNative ||
+		!reflect.DeepEqual(agy.Strategies[0].Command, wantUpdate) {
+		t.Fatalf("Strategies = %#v, want native %#v", agy.Strategies, wantUpdate)
 	}
 }
 

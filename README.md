@@ -39,7 +39,8 @@ Options:
 
 Agents are selected with `--only`/`--skip`; positional arguments are rejected
 (`uca claude` exits with an error instead of silently updating everything).
-`agent` is accepted as an alias for `cursor` in `--only` and `--skip`.
+`agent` is accepted as an alias for `cursor`, and `agy` for `antigravity`, in
+`--only` and `--skip`.
 
 When uca can prove an agent is already at the latest version from the package
 manager's own metadata (global `package.json` vs the npm registry, VS Code's
@@ -94,6 +95,7 @@ uca --explain
 - omp (Homebrew `omp`, bun `@oh-my-pi/pi-coding-agent`, or `omp update`)
 - grok (npm/pnpm/yarn/bun `@xai-official/grok` or `grok update`)
 - muse (Muse launcher self-update)
+- antigravity (`agy update`)
 
 When `opencode` and `opencode2` belong to the same package, UCA updates that package once.
 

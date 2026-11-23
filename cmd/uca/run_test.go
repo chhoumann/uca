@@ -35,6 +35,24 @@ func TestRunAllDryRunCursorUsesSelectedVersionCommand(t *testing.T) {
 	}
 }
 
+func TestRunAllDryRunAntigravityUsesAgy(t *testing.T) {
+	antigravity := defaultAgent(t, "antigravity")
+	withFakeCommands(t, map[string]fakeCommand{
+		"agy": {version: "1.4.2"},
+	})
+
+	results := runAllWithEvents(context.Background(), []agents.Agent{antigravity}, newTestEnv(), options{DryRun: true}, nil)
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	if results[0].UpdateCmd != "agy update" {
+		t.Fatalf("UpdateCmd = %q, want %q", results[0].UpdateCmd, "agy update")
+	}
+	if results[0].Before != "1.4.2" || results[0].After != "1.4.2" {
+		t.Fatalf("Before/After = %q/%q, want 1.4.2", results[0].Before, results[0].After)
+	}
+}
+
 func TestRunAllMuseUpdatesDetectedCustomInstallation(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Muse launcher is only available on macOS and Linux")
