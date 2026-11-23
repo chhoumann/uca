@@ -53,6 +53,27 @@ func TestFilterAgentsAcceptsCursorAgentAlias(t *testing.T) {
 	}
 }
 
+func TestFilterAgentsAcceptsAntigravityAgyAlias(t *testing.T) {
+	defaults := agents.Default()
+	for _, only := range []string{"agy", "antigravity,agy"} {
+		selected, unknown := filterAgents(defaults, only, "")
+		if len(unknown) != 0 {
+			t.Fatalf("--only %s unknown = %#v, want none", only, unknown)
+		}
+		if len(selected) != 1 || selected[0].Name != "antigravity" {
+			t.Fatalf("--only %s selected %#v, want only antigravity", only, agentNames(selected))
+		}
+	}
+
+	selected, unknown := filterAgents(defaults, "", "agy")
+	if len(unknown) != 0 {
+		t.Fatalf("unknown = %#v, want none", unknown)
+	}
+	if hasAgentName(selected, "antigravity") {
+		t.Fatalf("--skip agy selected antigravity in %#v", agentNames(selected))
+	}
+}
+
 func TestFilterAgentsUserAgentUppercaseTargetable(t *testing.T) {
 	all := append(agents.Default(), agents.Agent{Name: "MyTool", Binary: "mytool"})
 	selected, unknown := filterAgents(all, "mytool", "")

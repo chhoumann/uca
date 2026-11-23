@@ -234,5 +234,12 @@ func Default() []Agent {
 			DisableVersionCache: true,
 			Strategies:          []UpdateStrategy{{Kind: KindNative, Command: []string{"env", "MUSE_SYNC_UPDATE=1", "muse", "--version"}}},
 		},
+		{
+			Name:       "antigravity",
+			Binary:     "agy",
+			VersionCmd: []string{"agy", "--version"},
+			Aliases:    []string{"agy"},
+			Strategies: []UpdateStrategy{{Kind: KindNative, Command: []string{"agy", "update"}}},
+		},
 	}
 }

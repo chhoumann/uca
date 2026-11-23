@@ -321,6 +321,6 @@ Config: define extra agents in <user-config-dir>/uca/config.json (or $UCA_CONFIG
   "strategies":[{"kind":"npm","package":"x"}]}]}. Same-name entries override
   built-ins; a node strategy is per-manager, so list each manager you use.
 
-Note: 'agent' is accepted as an alias for cursor in --only/--skip.
+Note: 'agent' (cursor) and 'agy' (antigravity) are accepted as aliases in --only/--skip.
 `)
 }

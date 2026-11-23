@@ -60,6 +60,21 @@ func agentByName(t *testing.T, name string) agents.Agent {
 	return agents.Agent{}
 }
 
+func TestResolveAntigravityUsesAgy(t *testing.T) {
+	r := Resolve(agentByName(t, "antigravity"), fakeEnv{bins: map[string]bool{"agy": true}})
+	if !reflect.DeepEqual(r.Cmd, []string{"agy", "update"}) {
+		t.Fatalf("cmd = %#v", r.Cmd)
+	}
+	if !reflect.DeepEqual(r.VersionCmd, []string{"agy", "--version"}) {
+		t.Fatalf("versionCmd = %#v", r.VersionCmd)
+	}
+
+	r = Resolve(agentByName(t, "antigravity"), fakeEnv{})
+	if r.Cmd != nil || r.Reason != agents.ReasonMissing {
+		t.Fatalf("absent agy: cmd = %#v, reason = %q, want nil/%q", r.Cmd, r.Reason, agents.ReasonMissing)
+	}
+}
+
 func TestResolveCursorPrefersAgentWhenBothInstalled(t *testing.T) {
 	env := fakeEnv{bins: map[string]bool{"agent": true, "cursor-agent": true}, help: map[string]bool{"agent|Cursor Agent": true}}
 	r := Resolve(agentByName(t, "cursor"), env)
